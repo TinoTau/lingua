@@ -1,0 +1,27 @@
+pub mod bootstrap;
+pub mod cache_manager;
+pub mod config_manager;
+pub mod emotion_adapter;
+pub mod error;
+pub mod event_bus;
+pub mod nmt_incremental;
+pub mod persona_adapter;
+pub mod telemetry;
+pub mod tts_streaming;
+pub mod types;
+pub mod vad;
+pub mod asr_streaming;
+
+pub use bootstrap::{CoreEngine, CoreEngineBuilder};
+pub use cache_manager::CacheManager;
+pub use config_manager::{ConfigManager, EngineConfig};
+pub use emotion_adapter::{EmotionAdapter, EmotionRequest, EmotionResponse};
+pub use error::{EngineError, EngineResult};
+pub use event_bus::{CoreEvent, EventBus, EventSubscription, EventTopic};
+pub use nmt_incremental::{NmtIncremental, TranslationRequest, TranslationResponse};
+pub use persona_adapter::{PersonaAdapter, PersonaContext};
+pub use telemetry::{TelemetryDatum, TelemetrySink};
+pub use tts_streaming::{TtsRequest, TtsStreamChunk, TtsStreaming};
+pub use types::{AudioFrame, PartialTranscript, StableTranscript};
+pub use vad::{DetectionOutcome, VoiceActivityDetector};
+pub use asr_streaming::{AsrRequest, AsrResult, AsrStreaming};
