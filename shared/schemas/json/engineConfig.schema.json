@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "EngineRuntimeConfig",
+  "type": "object",
+  "required": ["mode", "sourceLanguage", "targetLanguage", "featureFlags"],
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": ["fast", "balanced", "quality"]
+    },
+    "sourceLanguage": {
+      "type": "string",
+      "minLength": 2
+    },
+    "targetLanguage": {
+      "type": "string",
+      "minLength": 2
+    },
+    "featureFlags": {
+      "type": "object",
+      "required": [
+        "enableCloudEnhancements",
+        "enableEmotionAdapter",
+        "enablePersonaAdapter"
+      ],
+      "properties": {
+        "enableCloudEnhancements": {
+          "type": "boolean"
+        },
+        "enableEmotionAdapter": {
+          "type": "boolean"
+        },
+        "enablePersonaAdapter": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
+

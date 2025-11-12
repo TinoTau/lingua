@@ -1,0 +1,2 @@
+Set-ExecutionPolicy -Scope Process Bypass
+.\setup_core_models_all.ps1 -ProjectRoot "D:\Programs\github\lingua"
