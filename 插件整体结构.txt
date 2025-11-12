@@ -1,0 +1,64 @@
+插件整体结构
+Content Scripts (clients/chrome_extension/content/)
+负责在浏览器标签页中采集音频（MediaStream、ScriptProcessor/AudioWorklet）。
+采集到的帧（对应 core/engine 的 AudioFrame 数据结构）通过 chrome.runtime.sendMessage 或 Port API 发送给后台。
+可在页面上注入字幕层或辅助 UI。
+Background Service Worker (clients/chrome_extension/background/)
+插件的中枢，负责加载和驱动核心引擎（WASM 或 FFI 接口）。
+主要逻辑：
+接收 content script 的音频帧。
+调用 CoreEngineBridge 把音频传给 core/engine 引擎。
+订阅引擎事件（BoundaryDetected、AsrPartial、NmtPartial 等）并转发给 UI、content script。
+维护配置、遥测、生命周期（boot/shutdown）。
+UI（Popup / Options / Overlay）
+使用 clients/chrome_extension/ui 提供的状态管理（UiStateStore）订阅后台事件，实时展示转写、翻译、情绪、TTS 状态。
+可通过 clients/shared_components 中的基础组件实现多终端一致的交互体验。
+Core Engine Bridge
+位于 core/bindings/typescript，负责加载 core/engine 编译出的 WASM 模块并轮询事件。
+插件后台通过它调用 Rust 引擎的接口（VoiceActivityDetector、AsrStreaming、NmtIncremental、EmotionAdapter、PersonaAdapter、TtsStreaming 等 trait 的具体实现）。
+共享资源 (shared/)
+config/defaults.ts、protocols/events、localization 等为插件、PWA、App 提供一致的配置和契约。
+core/engine/models/ 下的模型文件本地存储在扩展包或用户磁盘，用于端侧推理。
+翻译/合成流程（事件驱动结构）
+根据产品文档，Chrome 插件在后台遵循以下流式管线。每个阶段消费前一阶段的事件、产出下一阶段的事件，并在过程中使用对应的模型。
+音频采集 & VAD 边界检测
+Content script 收集音频帧，发送给后台。
+引擎中 VoiceActivityDetector 使用 vad/silero/silero_vad.onnx 检测语音活动，识别自然停顿（约 200~300ms）。
+一旦识别到边界，触发事件 BoundaryDetected，通知 ASR 开始/结束某个短语。
+流式 ASR（语音识别）
+模型：asr/whisper-base/encoder_model_int8.onnx + decoder_model_int8.onnx + decoder_with_past_model_int8.onnx。
+AsrStreaming 模块接受音频帧，输出 AsrPartial（中间结果）和 AsrFinal（完整短语）。
+事件：AsrPartial、AsrFinal；携带文本转写与置信度。
+增量 NMT 翻译
+模型：nmt/marian-*/model.onnx（六个语言对：英↔中、英↔日、英↔西）。
+NmtIncremental 根据当前配置（EngineConfig 中的源/目标语言、wait-k 策略）翻译 AsrPartial 或 AsrFinal。
+输出事件：NmtPartial（临时翻译）和 NmtFinal（稳定翻译）；在 wait-k=3~5 的策略下实现低延迟。
+情感识别
+模型：emotion/xlm-r/model.onnx。
+EmotionAdapter 对 NmtFinal 或 StableTranscript 进行分析（文本 + 音频特征），输出情绪标签。
+事件：EmotionTag，包含情绪类别、置信度。
+Persona/风格调整
+模型：persona/embedding-default/model.onnx（Sentence-Transformers 的嵌入模型，可后续替换为 LoRA 微调版本）。
+PersonaAdapter 结合用户配置（语气、文化偏好）对翻译文本做个性化调整，输出 StableTranscript 或风格化后的文本。
+流式 TTS
+模型：
+tts/fastspeech2-lite/fastspeech2_ljspeech.onnx（英文合成）与 fastspeech2_csmsc_streaming.onnx（中文合成）；
+tts/hifigan-lite/hifigan_ljspeech.onnx 与 hifigan_csmsc.onnx（对应的 HiFi-GAN 声码器）。
+TtsStreaming 接受个性化后的文本，实时生成语音块（TtsChunk），并通过事件发送给 content script / UI 播放。
+支持 streaming + cross-fade 拼接，以满足 <1.5s 的端到端延迟。
+事件总线与 UI 更新
+所有事件通过引擎的 EventBus 分发，后台再转发给 popup/overlay。
+UI 组件订阅 EngineEventTopic：显示实时字幕（AsrPartial、NmtPartial）、终稿翻译（AsrFinal、NmtFinal）、情绪状态（EmotionTag）、语音播放进度（TtsChunk）。
+关键实现要点
+模型加载路径：后台在 boot() 时根据当前模式、语言配置，加载 core/engine/models 下对应的 ONNX 文件。可用 ConfigManager 支持多语言对切换，按需加载/缓存模型。
+WASM 执行：将 Rust 引擎编译为 WASM，Chrome 插件通过 core/bindings/typescript 的 createBridgeRuntimeFactory 加载 WASM 模块，并以轮询方式获取事件。
+本地存储与权限：模型体积较大，可在安装插件时解压到扩展的私有目录或用户级缓存。需要在 manifest.json 中声明相应的 storage 权限。
+音频权限与降级：content script 通过 navigator.mediaDevices.getUserMedia 采集麦克风；需处理用户拒绝授权时的降级方案（仅文本输入等）。
+云端可选能力：若模式设置为云增强，可在后台调用 cloud/gateway API 获取高精度翻译或语音合成结果；事件契约保持一致。
+总结
+按照目前的模型和代码结构，Chrome 插件可以走以下流程完成一次双语实时翻译与语音合成：
+content/audioCapture 采集音频，发送 AudioFrame 给后台。
+后台 CoreEngine 调用 Silero VAD 切分短语 → Whisper INT8 ASR 获得转写 → Marian NMT 翻译 → XLM-R 情感识别 → Persona 嵌入个性化 → FastSpeech2/HiFiGAN 生成 TTS。
+每个步骤生成的事件经 EventBus 分发，后台再通过 UI store 更新 popup/overlay，或把 TtsChunk 推给 content script 播放。
+所有模型均驻留在 core/engine/models 目录，实现隐私优先、本地推理；若云增强功能开启，按需请求云端。
+这样即可在 Chrome 插件中实现文档设定的“自然停顿触发、全链路 ≤1.5s、多语言、多情绪”的实时翻译体验。
