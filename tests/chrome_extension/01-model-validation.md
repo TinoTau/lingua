@@ -9,9 +9,10 @@
 
 | 功能 | 测试要点 | 操作 / 脚本 |
 | --- | --- | --- |
-| 模型存在性 | Whisper、Marian、XLM-R、FastSpeech2、HiFiGAN、Silero 模型及 tokenizer/config 是否完整 | 运行 `npm run test:models:check`（调用 `scripts/checkModels.ts`） |
-| ONNX 加载 | 使用 `onnxruntime-node` 尝试加载每个模型，验证输入/输出维度 | 同上脚本输出中需看到 “✅ loaded” 日志 |
-| 配置一致性 | `configs/env/templates/chrome.dev.json` 中的语言、模型路径、feature flags 是否与模型目录匹配 | 手动比对或使用 `scripts/verifyConfig.ts` |
+| 模型存在性 | Whisper、Marian、XLM-R、FastSpeech2、HiFiGAN、Silero 模型及 tokenizer/config 是否完整 | `npm run test:models:check` （`scripts/checkModels.ts`） |
+| ONNX 加载 | 使用 `onnxruntime-node` 尝试加载每个模型，验证输入/输出维度 | 同上脚本输出需看到 “✅ loaded” |
+| WASM 占位构建 | 生成并验证 stub `engine.wasm`，确保可被 WebAssembly 实例化 | `npm run build:engine:stub` 以及 `npm run test:wasm` |
+| 配置一致性 | `configs/env/templates/chrome.dev.json` 中的语言、模型路径、feature flags 是否与模型目录匹配 | `npx ts-node --project tsconfig.test.json tests/chrome_extension/scripts/verifyConfig.ts` |
 | 依赖检查 | Node.js、npm/pnpm、Rust、wasm32 目标、Chrome 权限是否可用 | `npm run test:env` 调用 `scripts/environmentCheck.ts` |
 
 ## 运行脚本

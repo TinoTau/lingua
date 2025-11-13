@@ -1,4 +1,5 @@
 pub mod bootstrap;
+pub mod asr_whisper;
 pub mod cache_manager;
 pub mod config_manager;
 pub mod emotion_adapter;
@@ -11,6 +12,7 @@ pub mod tts_streaming;
 pub mod types;
 pub mod vad;
 pub mod asr_streaming;
+pub mod onnx_utils;
 
 pub use bootstrap::{CoreEngine, CoreEngineBuilder};
 pub use cache_manager::CacheManager;

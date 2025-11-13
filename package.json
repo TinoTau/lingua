@@ -1,4 +1,8 @@
 {
+  "scripts": {
+    "build:engine:stub": "ts-node --project tsconfig.test.json scripts/build/generate_stub_engine.ts",
+    "test:wasm": "ts-node --project tsconfig.test.json tests/chrome_extension/scripts/wasmLoadTest.ts"
+  },
   "devDependencies": {
     "@types/node": "^24.10.1",
     "onnxruntime-node": "^1.23.2",

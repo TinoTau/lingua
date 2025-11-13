@@ -11,7 +11,7 @@
 
 | 文档 | 目标 | 主要职责 |
 | --- | --- | --- |
-| `01-model-validation.md` | 模型与环境自检 | 确认 ONNX 模型、配置文件和依赖加载正常 |
+| `01-model-validation.md` | 模型与环境自检 | 确认 ONNX 模型、WASM 占位以及依赖加载正常 |
 | `02-engine-integration.md` | 核心引擎集成 | 验证 `CoreEngine` 模块事件流和性能指标 |
 | `03-extension-e2e.md` | 插件端到端 | 浏览器环境下从音频采集到 TTS 播放的完整流程 |
 | `04-ui-ux.md` | UI / 体验 | Popup / Overlay 交互、状态刷新、可访问性 |

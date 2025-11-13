@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::asr_streaming::AsrStreaming;
@@ -6,11 +7,12 @@ use crate::config_manager::ConfigManager;
 use crate::emotion_adapter::EmotionAdapter;
 use crate::error::{EngineError, EngineResult};
 use crate::event_bus::EventBus;
-use crate::nmt_incremental::NmtIncremental;
+use crate::nmt_incremental::{NmtIncremental, MarianNmtStub};
 use crate::persona_adapter::PersonaAdapter;
 use crate::telemetry::{TelemetryDatum, TelemetrySink};
 use crate::tts_streaming::TtsStreaming;
 use crate::vad::VoiceActivityDetector;
+
 
 pub struct CoreEngine {
     event_bus: Arc<dyn EventBus>,
@@ -102,6 +104,26 @@ impl CoreEngineBuilder {
     pub fn telemetry(mut self, telemetry: Arc<dyn TelemetrySink>) -> Self {
         self.telemetry = Some(telemetry);
         self
+    }
+
+    pub fn nmt_with_default_marian_stub(mut self) -> EngineResult<Self> {
+        // 1. 找到 core/engine → 再回到项目根目录
+        let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let project_root = crate_root
+            .parent()  // .../lingua/core
+            .and_then(|p| p.parent())  // .../lingua
+            .ok_or_else(|| EngineError::new("failed to resolve project root for Marian NMT"))?;
+
+        // 2. 约定的 Marian 模型路径
+        let model_path = project_root.join("third_party/nmt/marian-en-zh/model.onnx");
+
+        // 3. 构造 stub 实现
+        let nmt_impl = MarianNmtStub::new(model_path);
+
+        // 4. 存入 builder 的 nmt 字段
+        self.nmt = Some(Arc::new(nmt_impl));
+
+        Ok(self)
     }
 
     pub fn build(self) -> EngineResult<CoreEngine> {
