@@ -2,6 +2,8 @@ import { DefaultWasmModuleLoader, createBridgeRuntimeFactory } from "../../../co
 import { createCoreEngineBridgeFactory } from "./engineBridgeFactory";
 import { BackgroundCommandRouter } from "./commandRouter";
 import { ConsoleLogger } from "./logger";
+import { ChannelHub, ChannelName } from "./channelHub";
+import { EngineEvent } from "../shared/coreTypes";
 
 const logger = new ConsoleLogger();
 const wasmLoader = new DefaultWasmModuleLoader();
@@ -10,6 +12,7 @@ const bridgeFactory = createCoreEngineBridgeFactory({
   runtimeFactory,
   logger,
 });
+const channelHub = new ChannelHub();
 
 const router = new BackgroundCommandRouter({
   bridgeFactory,
@@ -17,6 +20,18 @@ const router = new BackgroundCommandRouter({
     wasmModulePath: chrome.runtime.getURL("core/engine.wasm"),
   },
   logger,
+  onEvent: (event: EngineEvent) => {
+    channelHub.broadcastAll(event);
+  },
+});
+
+chrome.runtime.onConnect.addListener((port) => {
+  const channel = port.name as ChannelName;
+  if (channel !== "content" && channel !== "popup" && channel !== "options") {
+    logger.warn("unknown channel connection", { channel });
+    return;
+  }
+  channelHub.register(channel, port);
 });
 
 chrome.runtime.onMessage.addListener((command, _sender, sendResponse) => {
@@ -30,3 +45,9 @@ chrome.runtime.onMessage.addListener((command, _sender, sendResponse) => {
   return true;
 });
 
+chrome.runtime.onSuspend?.addListener(() => {
+  router.handle({ type: "engine/shutdown", payload: undefined }).catch((error) => {
+    logger.error("failed to shutdown engine on suspend", { error });
+  });
+  channelHub.close();
+});

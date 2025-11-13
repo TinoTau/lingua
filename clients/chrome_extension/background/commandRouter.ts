@@ -18,6 +18,7 @@ interface CommandRouterDeps {
     warn(message: string, meta?: Record<string, unknown>): void;
     error(message: string, meta?: Record<string, unknown>): void;
   };
+  onEvent?: (event: Parameters<CoreEngineBridge["subscribe"]>[1] extends (event: infer T) => void ? T : never) => void;
 }
 
 export class BackgroundCommandRouter {
@@ -73,11 +74,13 @@ export class BackgroundCommandRouter {
       return { ok: false, error: "core engine not booted" };
     }
     const topic = command.payload.topic as EngineEventTopic;
-    const subscription = this.bridge.subscribe(topic, (event) => {
-      this.deps.logger?.info("event forwarded", { topic: event.topic });
-      // Actual channel relay wiring happens elsewhere.
-    });
-    this.subscriptions.set(topic, subscription);
+    if (!this.subscriptions.has(topic)) {
+      const subscription = this.bridge.subscribe(topic, (event) => {
+        this.deps.logger?.info("event received", { topic: event.topic });
+        this.deps.onEvent?.(event);
+      });
+      this.subscriptions.set(topic, subscription);
+    }
     return { ok: true };
   }
 

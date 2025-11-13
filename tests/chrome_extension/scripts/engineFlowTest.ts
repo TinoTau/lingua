@@ -9,42 +9,85 @@
  *   - 该脚本仅提供结构示例，具体实现需根据实际 WASM 接口完成 TODO 部分。
  */
 
-import { resolve } from "path";
-
-interface EngineEvent {
-  topic: string;
-  payload: unknown;
-}
-
-async function loadEngine() {
-  // TODO: 替换为真实的 WASM 加载逻辑 (例如 core/bindings/typescript runtime)
-  throw new Error("TODO: 实现 loadEngine()");
-}
-
-async function pushMockAudio(engine: { submitAudioFrame(frame: unknown): Promise<void> }) {
-  // TODO: 读取测试音频（wav）并转换为 AudioFrame，与项目 codec 对齐
-  console.log("TODO: push mock audio frames");
-  await engine.submitAudioFrame({});
-}
+import { EngineEventTopic, AudioFrame, EngineEvent } from "../../../clients/chrome_extension/shared/coreTypes";
+import { createStubBridge } from "./utils/stubBridge";
 
 async function main() {
   console.log("== CoreEngine 事件流测试 ==");
 
-  const engine = await loadEngine();
-  const events: EngineEvent[] = [];
+  const expectedTopics: EngineEventTopic[] = [
+    "BoundaryDetected",
+    "AsrPartial",
+    "AsrFinal",
+    "NmtPartial",
+    "NmtFinal",
+    "EmotionTag",
+    "TtsChunk",
+  ];
 
-  // TODO: 订阅事件 (engine.subscribe / EventBus)
-  console.log("TODO: 订阅 CoreEngine 事件");
+  const mockEvents: EngineEvent[] = [
+    { topic: "BoundaryDetected", timestampMs: Date.now(), payload: { confidence: 0.9 } },
+    {
+      topic: "AsrPartial",
+      timestampMs: Date.now() + 1,
+      payload: { text: "hello", confidence: 0.8, isFinal: false },
+    },
+    {
+      topic: "AsrFinal",
+      timestampMs: Date.now() + 2,
+      payload: { text: "hello", speakerId: "user", language: "en" },
+    },
+    {
+      topic: "NmtPartial",
+      timestampMs: Date.now() + 3,
+      payload: { translatedText: "你好", isStable: false },
+    },
+    {
+      topic: "NmtFinal",
+      timestampMs: Date.now() + 4,
+      payload: { translatedText: "你好", isStable: true },
+    },
+    {
+      topic: "EmotionTag",
+      timestampMs: Date.now() + 5,
+      payload: { label: "positive", confidence: 0.92 },
+    },
+    {
+      topic: "TtsChunk",
+      timestampMs: Date.now() + 6,
+      payload: { audio: new ArrayBuffer(0), timestampMs: 0, isLast: true },
+    },
+  ];
 
-  await pushMockAudio(engine);
+  const { router, recorded } = createStubBridge([mockEvents]);
 
-  // TODO: 等待事件到齐（可设定超时）
+  await router.handle({ type: "engine/boot", payload: undefined });
 
-  console.log("TODO: 校验事件顺序与 payload");
-  console.log("应包含 BoundaryDetected / AsrPartial / AsrFinal / NmtPartial / NmtFinal / EmotionTag / TtsChunk");
+  for (const topic of expectedTopics) {
+    await router.handle({ type: "engine/subscribe", payload: { topic } });
+  }
 
-  await engine.shutdown?.();
-  console.log("== 测试完成 ==");
+  const mockFrame: AudioFrame = {
+    sampleRate: 16000,
+    channels: 1,
+    data: new Float32Array([0]),
+    timestampMs: 0,
+  };
+
+  await router.handle({ type: "engine/push-audio", payload: mockFrame });
+
+  if (recorded.length !== expectedTopics.length) {
+    throw new Error(`事件数量不匹配，期望 ${expectedTopics.length} 实际 ${recorded.length}`);
+  }
+
+  recorded.forEach((event, index) => {
+    if (event.topic !== expectedTopics[index]) {
+      throw new Error(`事件顺序错误：期望 ${expectedTopics[index]} 实际 ${event.topic}`);
+    }
+  });
+
+  await router.handle({ type: "engine/shutdown", payload: undefined });
+  console.log("✅ 事件流测试通过");
 }
 
 main().catch((error) => {
