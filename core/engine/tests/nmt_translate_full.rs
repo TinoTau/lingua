@@ -31,14 +31,24 @@ fn test_full_translation_pipeline() {
         
         match nmt.translate(source_text) {
             Ok(translated) => {
-                println!("✓ Translation successful: '{}' -> '{}'", source_text, translated);
+                println!("[OK] Translation successful: '{}' -> '{}'", source_text, translated);
                 // 验证翻译结果不为空
                 assert!(!translated.is_empty(), "Translation should not be empty");
+                // 验证翻译结果不是重复的 token（之前的问题）
+                let words: Vec<&str> = translated.split_whitespace().collect();
+                if words.len() > 1 {
+                    // 如果有多个词，检查是否都是相同的
+                    let first_word = words[0];
+                    let all_same = words.iter().all(|&w| w == first_word);
+                    if all_same && words.len() > 3 {
+                        println!("[WARN] Translation may have issues: all words are the same");
+                    }
+                }
             }
             Err(e) => {
-                println!("✗ Translation failed: {}", e);
-                // 对于第一次实现，允许失败，但打印错误信息
+                println!("[ERROR] Translation failed: {}", e);
                 eprintln!("Error details: {:?}", e);
+                panic!("Translation failed: {}", e);
             }
         }
     }

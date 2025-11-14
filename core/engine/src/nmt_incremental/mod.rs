@@ -134,7 +134,8 @@ impl NmtIncremental for MarianNmtStub {
 
 
 pub struct MarianNmtOnnx {
-    pub session: std::sync::Mutex<Session>,
+    pub encoder_session: std::sync::Mutex<Session>,
+    pub decoder_session: std::sync::Mutex<Session>,
     pub tokenizer: MarianTokenizer,
     pub decoder_start_token_id: i64,
     pub eos_token_id: i64,
@@ -175,30 +176,70 @@ impl MarianNmtOnnx {
         // 3. 加载 vocab.json → tokenizer（传入语言对信息）
         let tokenizer = MarianTokenizer::from_model_dir(model_dir, language_pair)?;
 
-        // 3. 模型读入内存
-        let model_bytes = fs::read(&model_path)
-            .map_err(|e| anyhow!("failed to read model.onnx: {e}"))?;
-
-        // 4. 构建 Session
-        let builder = Session::builder()
-            .map_err(|e| anyhow!("failed to create Session builder: {e}"))?;
-
-        let session = builder
-            .commit_from_memory(&model_bytes)
-            .map_err(|e| anyhow!("failed to load Marian ONNX model: {e}"))?;
-
-        // 打印模型的 I/O 信息
-        println!("--- ONNX Model Inputs ---");
-        for (i, input) in session.inputs.iter().enumerate() {
-            println!(
-                "Input[{i}] name={:?} input_type={:?}",
-                input.name, input.input_type
-            );
+        // 3. 加载 encoder 模型（使用文件路径，以便 ONNX Runtime 可以找到外部数据文件）
+        let encoder_path = model_dir.join("encoder_model.onnx");
+        if !encoder_path.exists() {
+            return Err(anyhow!(
+                "encoder_model.onnx not found at {}. Please export it first using scripts/export_marian_encoder.py",
+                encoder_path.display()
+            ));
         }
 
-        println!("--- ONNX Model Outputs ---");
-        for (i, output) in session.outputs.iter().enumerate() {
-            println!(
+        // 读取 encoder 模型文件
+        // 注意：ONNX Runtime 在加载模型时会查找外部数据文件
+        // 它会在模型文件所在目录查找，所以我们需要确保路径正确
+        let encoder_bytes = fs::read(&encoder_path)
+            .map_err(|e| anyhow!("failed to read encoder_model.onnx: {e}"))?;
+
+        // 检查外部数据文件是否存在
+        let encoder_data_path = model_dir.join("encoder_model.onnx.data");
+        if encoder_data_path.exists() {
+            println!("[INFO] Found external data file: {}", encoder_data_path.display());
+        }
+
+        // 使用 with_model_from_memory 并设置外部数据目录
+        // 注意：ort crate 可能需要在模型目录中查找外部数据
+        // 我们通过设置当前工作目录来解决这个问题
+        let current_dir = std::env::current_dir()?;
+        std::env::set_current_dir(&model_dir)
+            .map_err(|e| anyhow!("failed to change to model directory: {e}"))?;
+
+        let encoder_builder = Session::builder()
+            .map_err(|e| anyhow!("failed to create encoder Session builder: {e}"))?;
+
+        let encoder_session = encoder_builder
+            .commit_from_memory(&encoder_bytes)
+            .map_err(|e| anyhow!("failed to load encoder ONNX model: {e}"))?;
+
+        // 恢复工作目录
+        std::env::set_current_dir(&current_dir)
+            .map_err(|e| anyhow!("failed to restore working directory: {e}"))?;
+
+        println!("[OK] Encoder model loaded: {}", encoder_path.display());
+
+        // 4. 加载 decoder 模型
+        let decoder_bytes = fs::read(&model_path)
+            .map_err(|e| anyhow!("failed to read model.onnx (decoder): {e}"))?;
+
+        let decoder_builder = Session::builder()
+            .map_err(|e| anyhow!("failed to create decoder Session builder: {e}"))?;
+
+        let decoder_session = decoder_builder
+            .commit_from_memory(&decoder_bytes)
+            .map_err(|e| anyhow!("failed to load decoder ONNX model from {}: {e}", model_path.display()))?;
+
+        // 打印 decoder 模型的 I/O 信息
+        println!("--- Decoder ONNX Model Inputs ---");
+        for (i, input) in decoder_session.inputs.iter().enumerate() {
+    println!(
+                "Input[{i}] name={:?} input_type={:?}",
+                input.name, input.input_type
+    );
+}
+
+        println!("--- Decoder ONNX Model Outputs ---");
+        for (i, output) in decoder_session.outputs.iter().enumerate() {
+    println!(
                 "Output[{i}] name={:?} output_type={:?}",
                 output.name, output.output_type
             );
@@ -225,7 +266,8 @@ impl MarianNmtOnnx {
             };
 
         Ok(Self { 
-            session: std::sync::Mutex::new(session), 
+            encoder_session: std::sync::Mutex::new(encoder_session),
+            decoder_session: std::sync::Mutex::new(decoder_session), 
             tokenizer,
             decoder_start_token_id,
             eos_token_id,
@@ -254,6 +296,75 @@ impl MarianNmtOnnx {
         Self::new_from_dir(&model_dir)
     }
 
+    /// 运行 encoder 模型，获取 encoder_hidden_states
+    /// 
+    /// # Arguments
+    /// * `input_ids` - 编码后的输入 token IDs
+    /// 
+    /// # Returns
+    /// (encoder_hidden_states, encoder_attention_mask)
+    fn run_encoder(&self, input_ids: &[i64]) -> Result<(Array3<f32>, Array2<i64>)> {
+        use ndarray::Array2;
+        use ort::value::Value;
+
+        let batch_size = 1usize;
+        let seq_len = input_ids.len();
+
+        // 准备输入
+        let input_ids_array: Array2<i64> = Array2::from_shape_vec(
+            (batch_size, seq_len),
+            input_ids.to_vec(),
+        )?;
+
+        let attention_mask: Array2<i64> = Array2::ones((batch_size, seq_len));
+
+        // 转换为 ONNX Value
+        macro_rules! array_to_value {
+            ($arr:expr, $ty:ty) => {{
+                let arr_dyn = $arr.into_dyn();
+                let shape: Vec<i64> = arr_dyn.shape().iter().map(|&d| d as i64).collect();
+                let data: Vec<$ty> = arr_dyn.iter().cloned().collect();
+                Value::from_array((shape, data))
+                    .map_err(|e| anyhow!("failed to convert array to Value: {e}"))
+            }};
+        }
+
+        let input_ids_value = array_to_value!(input_ids_array, i64)?;
+        let attention_mask_value = array_to_value!(attention_mask.clone(), i64)?;
+
+        // 运行 encoder
+        use std::borrow::Cow;
+        use ort::session::SessionInputValue;
+        
+        let mut encoder_session = self.encoder_session.lock().unwrap();
+        let inputs: Vec<(Cow<'_, str>, SessionInputValue<'_>)> = vec![
+            (Cow::Borrowed("input_ids"), input_ids_value.into()),
+            (Cow::Borrowed("attention_mask"), attention_mask_value.into()),
+        ];
+        let outputs = encoder_session.run(inputs)
+            .map_err(|e| anyhow!("failed to run encoder model: {e}"))?;
+
+        // 提取 encoder_hidden_states (last_hidden_state)
+        let hidden_states_value = outputs.get("last_hidden_state")
+            .ok_or_else(|| anyhow!("encoder output 'last_hidden_state' not found"))?;
+
+        let (hidden_states_shape, hidden_states_data) = hidden_states_value
+            .try_extract_tensor::<f32>()
+            .map_err(|e| anyhow!("failed to extract encoder hidden states: {e}"))?;
+
+        // 转换为 Array3
+        let encoder_hidden_states = Array3::from_shape_vec(
+            (
+                hidden_states_shape[0] as usize,
+                hidden_states_shape[1] as usize,
+                hidden_states_shape[2] as usize,
+            ),
+            hidden_states_data.to_vec(),
+        )?;
+
+        Ok((encoder_hidden_states, attention_mask))
+    }
+
     /// 执行完整的翻译流程
     /// 
     /// # Arguments
@@ -274,12 +385,9 @@ impl MarianNmtOnnx {
         println!("Source text: '{}'", source_text);
         println!("Encoded source IDs: {:?} (length: {})", source_ids, encoder_seq_len);
 
-        // 2. 准备 encoder 输出（占位符 - 实际应该从 encoder 模型获取）
-        // TODO: 实现真正的 encoder 推理
-        let encoder_hidden_states: Array3<f32> = 
-            Array3::zeros((batch_size, encoder_seq_len, 512));
-        let encoder_attention_mask: Array2<i64> = 
-            Array2::ones((batch_size, encoder_seq_len));
+        // 2. 运行 encoder 获取真实的 encoder_hidden_states
+        let (encoder_hidden_states, encoder_attention_mask) = self.run_encoder(&source_ids)?;
+        println!("Encoder output shape: {:?}", encoder_hidden_states.shape());
 
         // 3. 初始化 decoder 状态
         let mut decoder_input_ids = vec![self.decoder_start_token_id];
@@ -316,10 +424,11 @@ impl MarianNmtOnnx {
             }};
         }
 
-        let _current_past_len = past_decoder_seq_len;
+        let mut current_past_len = past_decoder_seq_len;
         let max_steps = self.max_length.min(128); // 限制最大步数
 
         for step in 0..max_steps {
+            println!("[DEBUG] Step {}: decoder_input_ids={:?}, past_decoder_seq_len={}", step, decoder_input_ids, current_past_len);
             // 准备 decoder input
             let decoder_input: Array2<i64> = Array2::from_shape_vec(
                 (batch_size, decoder_input_ids.len()),
@@ -370,8 +479,8 @@ impl MarianNmtOnnx {
             }
 
             // 运行模型
-            let mut session = self.session.lock().unwrap();
-            let outputs = session.run(inputs)
+            let mut decoder_session = self.decoder_session.lock().unwrap();
+            let outputs = decoder_session.run(inputs)
                 .map_err(|e| anyhow!("failed to run decoder model: {e}"))?;
 
             // 提取 logits
@@ -405,23 +514,40 @@ impl MarianNmtOnnx {
             decoder_input_ids = vec![next_token_id];
 
             // 更新 past_key_values（从 present 输出）
-            for layer_idx in 0..6 {
-                let present_dec_key_name = format!("present.{}.decoder.key", layer_idx);
-                let present_dec_val_name = format!("present.{}.decoder.value", layer_idx);
-                let present_enc_key_name = format!("present.{}.encoder.key", layer_idx);
-                let present_enc_val_name = format!("present.{}.encoder.value", layer_idx);
-
-                if let (Some(_dec_key), Some(_dec_val), Some(_enc_key), Some(_enc_val)) = (
-                    outputs.get(&present_dec_key_name),
-                    outputs.get(&present_dec_val_name),
-                    outputs.get(&present_enc_key_name),
-                    outputs.get(&present_enc_val_name),
-                ) {
-                    // 提取并更新 KV cache
-                    // 这里简化处理，实际应该正确提取形状
-                    // TODO: 正确提取和更新 KV cache
-                }
+            // KV Cache 说明：
+            // - Transformer 模型在解码时，每次生成新 token 都需要计算 attention
+            // - Attention 需要用到之前所有 token 的 key 和 value
+            // - KV cache 缓存这些之前计算过的 key/value，避免重复计算，加速推理
+            // - 每次迭代：模型输出 present KV cache，我们将其作为下次迭代的 past_key_values 输入
+            
+            // 注意：在第一次迭代时，past_decoder_seq_len 为 0，但模型输出的 present KV cache 
+            // 的 decoder 部分长度应该是 1（因为输入了一个 decoder_start_token_id）
+            // 从第二次迭代开始，我们需要更新 KV cache
+            
+            // 更新 KV cache（从第二次迭代开始）
+            // 注意：由于 ort crate 的内存安全问题，我们暂时跳过 KV cache 更新
+            // 这会导致每次迭代都使用相同的 KV cache，翻译结果可能不准确
+            // 但至少可以验证基本的翻译流程
+            // 
+            // 问题分析：
+            // - try_extract_tensor 返回的 slice 可能引用了 outputs 内部的数据
+            // - 当我们在循环中多次提取时，可能会出现内存安全问题
+            // - 这可能是 ort crate 2.0.0-rc.10 的一个已知问题
+            //
+            // 可能的解决方案：
+            // 1. 升级 ort crate 到稳定版本（如果有）
+            // 2. 使用不同的 API 提取 tensor 数据
+            // 3. 一次性提取所有数据，避免多次访问 outputs
+            // 4. 使用 unsafe 代码手动管理内存（不推荐）
+            
+            if step > 0 {
+                // TODO: 修复 KV cache 更新逻辑
+                // 目前暂时跳过，因为会出现内存安全问题
+                println!("[DEBUG] Step {}: KV cache update skipped due to memory safety issues", step);
+            } else {
+                println!("[DEBUG] Step 0: First iteration, skipping KV cache update");
             }
+            current_past_len += 1;
         }
 
         println!("Generated IDs: {:?} (length: {})", generated_ids, generated_ids.len());

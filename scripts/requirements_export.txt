@@ -1,0 +1,10 @@
+# Requirements for exporting Marian NMT models to ONNX
+# Install with: pip install -r scripts/requirements_export.txt
+
+torch>=2.0.0
+transformers>=4.30.0
+onnx>=1.14.0
+onnxruntime>=1.15.0
+numpy>=1.24.0,<2.2.0  # Compatible with numba 0.61.0
+sentencepiece>=0.1.99  # Required for MarianTokenizer
+
