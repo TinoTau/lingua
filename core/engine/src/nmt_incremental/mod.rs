@@ -166,6 +166,57 @@ impl MarianNmtOnnx {
     const NUM_LAYERS: usize = 6;
     const NUM_HEADS: usize = 8;
     const HEAD_DIM: usize = 64;
+
+    /// 构造第一步用的零张量 KV 值
+    /// 
+    /// # Arguments
+    /// * `encoder_seq_len` - encoder 序列长度
+    /// 
+    /// # Returns
+    /// 返回一个包含所有层的 KV cache 占位符，每层有 4 个 Value：dec_k, dec_v, enc_k, enc_v
+    fn build_initial_kv_values(
+        &self,
+        encoder_seq_len: usize,
+    ) -> anyhow::Result<Vec<[Value<'static>; 4]>> {
+        use ndarray::Array4;
+        use std::ptr;
+        use ndarray::CowArray;
+
+        let batch = 1usize;
+        let dec_len = 1usize;           // decoder "历史长度"占位为 1
+        let enc_len = encoder_seq_len;  // encoder 长度与真实输入一致
+
+        let zeros_dec =
+            Array4::<f32>::zeros((batch, Self::NUM_HEADS, dec_len, Self::HEAD_DIM));
+        let zeros_enc =
+            Array4::<f32>::zeros((batch, Self::NUM_HEADS, enc_len, Self::HEAD_DIM));
+
+        // 使用与 decoder_step 中相同的 array_to_value 宏
+        macro_rules! array_to_value {
+            ($arr:expr) => {{
+                let arr_dyn = $arr.into_dyn();
+                let arr_owned = arr_dyn.to_owned();
+                let cow_arr = CowArray::from(arr_owned);
+                let value = Value::from_array(ptr::null_mut(), &cow_arr)
+                    .map_err(|e| anyhow!("failed to convert array to Value: {:?}", e))?;
+                Ok::<ort::Value<'static>, anyhow::Error>(unsafe { std::mem::transmute::<ort::Value, ort::Value<'static>>(value) })
+            }};
+        }
+
+        let mut result = Vec::with_capacity(Self::NUM_LAYERS);
+
+        for _ in 0..Self::NUM_LAYERS {
+            // 每层有 4 个 KV：dec_k, dec_v, enc_k, enc_v
+            let dec_k = array_to_value!(zeros_dec.clone())?;
+            let dec_v = array_to_value!(zeros_dec.clone())?;
+            let enc_k = array_to_value!(zeros_enc.clone())?;
+            let enc_v = array_to_value!(zeros_enc.clone())?;
+            result.push([dec_k, dec_v, enc_k, enc_v]);
+        }
+
+        Ok(result)
+    }
+
     /// 从模型目录加载 MarianNmtOnnx
     /// 
     /// # Arguments
@@ -404,9 +455,8 @@ impl MarianNmtOnnx {
             state.input_ids.clone(),
         )?;
 
-        // 2. use_cache_branch: [1]，类型是 f32（模型期望 float，不是 bool）
-        let use_cache_value_f32 = if state.use_cache_branch { 1.0f32 } else { 0.0f32 };
-        let use_cache_array = Array1::<f32>::from_vec(vec![use_cache_value_f32]);
+        // 2. use_cache_branch: [1]，类型是 Bool（根据模型输入定义）
+        let use_cache_array = Array1::<bool>::from_vec(vec![state.use_cache_branch]);
 
         // 3. 转换为 Value
         macro_rules! array_to_value {
@@ -423,7 +473,7 @@ impl MarianNmtOnnx {
         let input_ids_value = array_to_value!(decoder_input_ids, i64)?;
         let encoder_states_value = array_to_value!(encoder_hidden_states.clone(), f32)?;
         let encoder_mask_value = array_to_value!(encoder_attention_mask.clone(), i64)?;
-        let use_cache_value = array_to_value!(use_cache_array, f32)?;
+        let use_cache_value = array_to_value!(use_cache_array, bool)?;
 
         // 4. 组织输入顺序（严格按照模型 I/O 顺序）
         // 输入顺序：encoder_attention_mask, input_ids, encoder_hidden_states, past_key_values.*, use_cache_branch
@@ -436,19 +486,25 @@ impl MarianNmtOnnx {
         // 3. encoder_hidden_states
         input_values.push(encoder_states_value);
 
-        // 4. KV cache：只有当有历史 KV 时才追加
-        if let Some(prev_kv) = state.kv_cache.take() {
-            // prev_kv: Vec<[Value<'static>; 4]>
-            // 每一层有 4 个 Value：dec_k, dec_v, enc_k, enc_v
-            for kv_layer in prev_kv {
-                let [dec_k, dec_v, enc_k, enc_v] = kv_layer;
-                input_values.push(dec_k);
-                input_values.push(dec_v);
-                input_values.push(enc_k);
-                input_values.push(enc_v);
-            }
+        // 4. KV cache：第一步用占位 KV，后续用真实 present.*
+        let encoder_seq_len = encoder_hidden_states.shape()[1];
+        let kv_to_use: Vec<[Value<'static>; 4]> =
+            if let Some(prev_kv) = state.kv_cache.take() {
+                // 后续步骤：使用上一轮的 present.*
+                prev_kv
+            } else {
+                // 第一步：构造零张量占位 KV
+                self.build_initial_kv_values(encoder_seq_len)?
+            };
+
+        // 无论第几步，都向模型提供完整的 KV 输入
+        for kv_layer in kv_to_use {
+            let [dec_k, dec_v, enc_k, enc_v] = kv_layer;
+            input_values.push(dec_k);
+            input_values.push(dec_v);
+            input_values.push(enc_k);
+            input_values.push(enc_v);
         }
-        // 第一轮：不传 KV cache，模型会根据 use_cache_branch=false 忽略
 
         // 5. use_cache_branch
         input_values.push(use_cache_value);
@@ -470,14 +526,12 @@ impl MarianNmtOnnx {
         let logits_array = logits_view.to_owned(); // shape: [1, cur_len, vocab_size]
 
         // 取最后一个 step 的 logits: [vocab_size]
-        let shape = logits_array.shape().to_vec();
-        let vocab_size = shape[2];
-        let last_step_logits_view = logits_array
-            .index_axis(ndarray::Axis(1), shape[1] - 1);
-        let last_step_logits: Array1<f32> = last_step_logits_view
-            .into_dimensionality::<ndarray::Ix1>()
-            .map_err(|e| anyhow!("failed to convert logits to Array1: {e}"))?
-            .to_owned();
+        let shape = logits_array.shape();
+        let seq_len = shape[1];
+        // 使用 slice 获取最后一个 token 的 logits，然后转换为 Array1
+        let last_step_logits = logits_array
+            .slice(ndarray::s![0, seq_len - 1, ..])
+            .to_owned(); // 已经是 Array1<f32>
 
         // KV cache 只搬运，不解析
         let mut next_kv: Vec<[Value<'static>; 4]> = Vec::with_capacity(Self::NUM_LAYERS);
