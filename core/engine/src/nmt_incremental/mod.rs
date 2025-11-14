@@ -447,6 +447,14 @@ impl MarianNmtOnnx {
         use ndarray::CowArray;
         use ort::tensor::OrtOwnedTensor;
 
+        // 打印调试信息
+        println!(
+            "[decoder_step] step input_ids_len={}, use_cache_branch={}, has_kv_cache={}",
+            state.input_ids.len(),
+            state.use_cache_branch,
+            state.kv_cache.is_some(),
+        );
+
         // 1. 准备 decoder input_ids: [1, cur_len]
         let batch_size = 1usize;
         let cur_len = state.input_ids.len();
@@ -454,6 +462,11 @@ impl MarianNmtOnnx {
             (batch_size, cur_len),
             state.input_ids.clone(),
         )?;
+        
+        println!(
+            "[decoder_step] input_ids shape: {:?}",
+            decoder_input_ids.shape()
+        );
 
         // 2. use_cache_branch: [1]，类型是 Bool（根据模型输入定义）
         let use_cache_array = Array1::<bool>::from_vec(vec![state.use_cache_branch]);
@@ -582,6 +595,7 @@ impl MarianNmtOnnx {
 
         // 4. 进入解码循环
         let max_steps = self.max_length.min(128); // 限制最大步数
+        let mut final_generated_ids = Vec::new();
 
         for step in 0..max_steps {
             println!("[DEBUG] Step {}: decoder_input_ids={:?}", step, state.input_ids);
@@ -591,8 +605,6 @@ impl MarianNmtOnnx {
                 &encoder_attention_mask,
                 state,
             )?;
-
-            state = next_state;
 
             // 选择概率最高的 token（贪婪解码）
             let next_token_id = logits
@@ -605,18 +617,30 @@ impl MarianNmtOnnx {
             // 检查是否生成 EOS
             if next_token_id == self.eos_token_id {
                 println!("Generated EOS token at step {}", step);
+                // 保存最终的 generated_ids
+                final_generated_ids = next_state.generated_ids;
+                final_generated_ids.push(next_token_id);
                 break;
             }
 
-            // 更新 state
-            state.generated_ids.push(next_token_id);
-            state.input_ids.push(next_token_id);
+            // 更新 state：只把最新生成的一个 token 放进 input_ids
+            // 完整历史保存在 generated_ids 中，KV cache 中已经包含了所有历史
+            let mut generated = next_state.generated_ids;
+            generated.push(next_token_id);
+            final_generated_ids = generated.clone();
+            
+            state = DecoderState {
+                input_ids: vec![next_token_id],  // 下一轮只传当前 token
+                generated_ids: generated,         // 完整历史保存在这里
+                kv_cache: next_state.kv_cache,    // 使用当前轮的 present.*
+                use_cache_branch: true,           // 从第二轮开始一直为 true
+            };
         }
 
-        println!("[NMT][translate] Generated IDs: {:?} (length: {})", state.generated_ids, state.generated_ids.len());
+        println!("[NMT][translate] Generated IDs: {:?} (length: {})", final_generated_ids, final_generated_ids.len());
 
         // 5. 使用 tokenizer 解码
-        let translated_text = self.tokenizer.decode(&state.generated_ids);
+        let translated_text = self.tokenizer.decode(&final_generated_ids);
         println!("[NMT][translate] Translated text: '{}'", translated_text);
 
         Ok(translated_text)
