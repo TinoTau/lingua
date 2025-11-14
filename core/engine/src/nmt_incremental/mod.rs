@@ -1,4 +1,4 @@
-use async_trait::async_trait;
+﻿use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{EngineError, EngineResult};
@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use ort::session::Session;
 use ort::tensor::OrtOwnedTensor;
+use ort::value::Value;
 use ndarray::{Array1, Array2, Array3, Array4, IxDyn, Ix3};
 
 mod tokenizer;
@@ -136,6 +137,20 @@ impl NmtIncremental for MarianNmtStub {
 }
 
 
+/// 单句翻译时 Decoder 的状态
+struct DecoderState {
+    /// 当前 decoder 的 input_ids（最后一个 token 是本步要解码的）
+    pub input_ids: Vec<i64>,
+    /// 已经生成的 token IDs（不包括起始的 decoder_start_token_id）
+    pub generated_ids: Vec<i64>,
+    /// 上一步返回的 KV cache（present.*）
+    /// - 每一层有 4 个 Value：decoder.key, decoder.value, encoder.key, encoder.value
+    /// - `None` 代表第一步（没有历史 KV）
+    pub kv_cache: Option<Vec<[Value<'static>; 4]>>,
+    /// 控制 `use_cache_branch` 输入
+    pub use_cache_branch: bool,
+}
+
 pub struct MarianNmtOnnx {
     pub encoder_session: std::sync::Mutex<Session>,
     pub decoder_session: std::sync::Mutex<Session>,
@@ -147,6 +162,10 @@ pub struct MarianNmtOnnx {
 }
 
 impl MarianNmtOnnx {
+    // 模型常量
+    const NUM_LAYERS: usize = 6;
+    const NUM_HEADS: usize = 8;
+    const HEAD_DIM: usize = 64;
     /// 从模型目录加载 MarianNmtOnnx
     /// 
     /// # Arguments
@@ -359,6 +378,125 @@ impl MarianNmtOnnx {
         Ok((encoder_hidden_states, attention_mask))
     }
 
+    /// 执行 decoder 的单次步进
+    ///
+    /// - 输入：
+    ///   - encoder_hidden_states: [1, encoder_seq_len, hidden_dim]
+    ///   - encoder_attention_mask: [1, encoder_seq_len]
+    ///   - state: 包含当前 decoder_input_ids / 上一步 KV cache
+    /// - 输出：
+    ///   - (logits_last_step, next_state)
+    fn decoder_step(
+        &self,
+        encoder_hidden_states: &Array3<f32>,
+        encoder_attention_mask: &Array2<i64>,
+        mut state: DecoderState,
+    ) -> anyhow::Result<(Array1<f32>, DecoderState)> {
+        use std::ptr;
+        use ndarray::CowArray;
+        use ort::tensor::OrtOwnedTensor;
+
+        // 1. 准备 decoder input_ids: [1, cur_len]
+        let batch_size = 1usize;
+        let cur_len = state.input_ids.len();
+        let decoder_input_ids = Array2::<i64>::from_shape_vec(
+            (batch_size, cur_len),
+            state.input_ids.clone(),
+        )?;
+
+        // 2. use_cache_branch: [1]，类型是 f32（模型期望 float，不是 bool）
+        let use_cache_value_f32 = if state.use_cache_branch { 1.0f32 } else { 0.0f32 };
+        let use_cache_array = Array1::<f32>::from_vec(vec![use_cache_value_f32]);
+
+        // 3. 转换为 Value
+        macro_rules! array_to_value {
+            ($arr:expr, $ty:ty) => {{
+                let arr_dyn = $arr.into_dyn();
+                let arr_owned = arr_dyn.to_owned();
+                let cow_arr = CowArray::from(arr_owned);
+                let value = Value::from_array(ptr::null_mut(), &cow_arr)
+                    .map_err(|e| anyhow!("failed to convert array to Value: {:?}", e))?;
+                Ok::<ort::Value<'static>, anyhow::Error>(unsafe { std::mem::transmute::<ort::Value, ort::Value<'static>>(value) })
+            }};
+        }
+
+        let input_ids_value = array_to_value!(decoder_input_ids, i64)?;
+        let encoder_states_value = array_to_value!(encoder_hidden_states.clone(), f32)?;
+        let encoder_mask_value = array_to_value!(encoder_attention_mask.clone(), i64)?;
+        let use_cache_value = array_to_value!(use_cache_array, f32)?;
+
+        // 4. 组织输入顺序（严格按照模型 I/O 顺序）
+        // 输入顺序：encoder_attention_mask, input_ids, encoder_hidden_states, past_key_values.*, use_cache_branch
+        let mut input_values: Vec<Value<'static>> = Vec::new();
+
+        // 1. encoder_attention_mask
+        input_values.push(encoder_mask_value);
+        // 2. input_ids
+        input_values.push(input_ids_value);
+        // 3. encoder_hidden_states
+        input_values.push(encoder_states_value);
+
+        // 4. KV cache：只有当有历史 KV 时才追加
+        if let Some(prev_kv) = state.kv_cache.take() {
+            // prev_kv: Vec<[Value<'static>; 4]>
+            // 每一层有 4 个 Value：dec_k, dec_v, enc_k, enc_v
+            for kv_layer in prev_kv {
+                let [dec_k, dec_v, enc_k, enc_v] = kv_layer;
+                input_values.push(dec_k);
+                input_values.push(dec_v);
+                input_values.push(enc_k);
+                input_values.push(enc_v);
+            }
+        }
+        // 第一轮：不传 KV cache，模型会根据 use_cache_branch=false 忽略
+
+        // 5. use_cache_branch
+        input_values.push(use_cache_value);
+
+        // 5. 调用 session.run
+        let decoder_session = self.decoder_session.lock().unwrap();
+        let outputs: Vec<Value<'static>> = decoder_session.run(input_values)
+            .map_err(|e| anyhow!("failed to run decoder model: {e}"))?;
+
+        // 6. 从输出中提取 logits + 新 KV
+        // logits 是唯一需要转回 ndarray 的
+        let mut iter = outputs.into_iter();
+        let logits_value = iter.next().expect("missing logits output");
+
+        let logits_tensor: OrtOwnedTensor<f32, IxDyn> = logits_value
+            .try_extract::<f32>()
+            .map_err(|e| anyhow!("failed to extract logits: {e}"))?;
+        let logits_view = logits_tensor.view();
+        let logits_array = logits_view.to_owned(); // shape: [1, cur_len, vocab_size]
+
+        // 取最后一个 step 的 logits: [vocab_size]
+        let shape = logits_array.shape().to_vec();
+        let vocab_size = shape[2];
+        let last_step_logits_view = logits_array
+            .index_axis(ndarray::Axis(1), shape[1] - 1);
+        let last_step_logits: Array1<f32> = last_step_logits_view
+            .into_dimensionality::<ndarray::Ix1>()
+            .map_err(|e| anyhow!("failed to convert logits to Array1: {e}"))?
+            .to_owned();
+
+        // KV cache 只搬运，不解析
+        let mut next_kv: Vec<[Value<'static>; 4]> = Vec::with_capacity(Self::NUM_LAYERS);
+
+        for _layer in 0..Self::NUM_LAYERS {
+            let dec_k = iter.next().expect("missing present.*.decoder.key");
+            let dec_v = iter.next().expect("missing present.*.decoder.value");
+            let enc_k = iter.next().expect("missing present.*.encoder.key");
+            let enc_v = iter.next().expect("missing present.*.encoder.value");
+            next_kv.push([dec_k, dec_v, enc_k, enc_v]);
+        }
+
+        // 更新 state
+        state.kv_cache = Some(next_kv);
+        state.use_cache_branch = true; // 后续步骤都走 cache 分支
+
+        Ok((last_step_logits, state))
+    }
+
     /// 执行完整的翻译流程
     /// 
     /// # Arguments
@@ -373,161 +511,42 @@ impl MarianNmtOnnx {
     pub fn translate(&self, source_text: &str) -> Result<String> {
         // 1. 使用 tokenizer 编码源文本
         let source_ids = self.tokenizer.encode(source_text, true);
-        let encoder_seq_len = source_ids.len();
-        let batch_size = 1usize;
-
         println!("Source text: '{}'", source_text);
-        println!("Encoded source IDs: {:?} (length: {})", source_ids, encoder_seq_len);
+        println!("Encoded source IDs: {:?} (length: {})", source_ids, source_ids.len());
 
         // 2. 运行 encoder 获取真实的 encoder_hidden_states
         let (encoder_hidden_states, encoder_attention_mask) = self.run_encoder(&source_ids)?;
         println!("Encoder output shape: {:?}", encoder_hidden_states.shape());
 
-        // 3. 初始化 decoder 状态
-        let mut decoder_input_ids = vec![self.decoder_start_token_id];
-        let mut generated_ids = Vec::new();
-        let _num_heads = 8usize; // 用于创建空的 KV cache
-        // 4. KV cache 状态：使用 Option<Vec<Value>> 存储，None 表示第一步（不传 KV cache）
-        // 根据 recommended_kv_solution.md：第一步不传 KV cache，让模型内部初始化
-        use ort::value::Value;
-        let num_layers = 6usize; // 从模型结构推断
-        let mut kv_cache: Option<Vec<Value<'static>>> = None;
+        // 3. 初始化 DecoderState
+        let mut state = DecoderState {
+            input_ids: vec![self.decoder_start_token_id],
+            generated_ids: Vec::new(),
+            kv_cache: None,
+            use_cache_branch: false,
+        };
 
-        // 5. 增量解码循环
-        // ort 1.16.3 使用 from_array 需要 allocator 和动态维度的 array
-        macro_rules! array_to_value {
-            ($arr:expr, $t:ty) => {{
-                // 转换为动态维度和 CowRepr 类型，使用 null allocator（让 ORT 使用默认 allocator）
-                // 注意：需要确保数据是 owned 的，这样 Value 可以拥有数据的所有权
-                let arr_dyn = $arr.into_dyn();
-                let arr_owned = arr_dyn.to_owned();
-                let cow_arr = CowArray::from(arr_owned);
-                // Value::from_array 会复制数据，但返回的 Value 仍然有生命周期限制
-                // 使用 transmute 转换为 'static 生命周期（因为数据已经被复制到 ORT 内部）
-                let value = Value::from_array(ptr::null_mut(), &cow_arr)
-                    .map_err(|e| anyhow!("failed to convert array to Value: {:?}", e))?;
-                Ok::<ort::Value<'static>, anyhow::Error>(unsafe { std::mem::transmute::<ort::Value, ort::Value<'static>>(value) })
-            }};
-        }
-
+        // 4. 进入解码循环
         let max_steps = self.max_length.min(128); // 限制最大步数
 
         for step in 0..max_steps {
-            println!("[DEBUG] Step {}: decoder_input_ids={:?}", step, decoder_input_ids);
-            // 准备 decoder input
-            let decoder_input: Array2<i64> = Array2::from_shape_vec(
-                (batch_size, decoder_input_ids.len()),
-                decoder_input_ids.clone(),
+            println!("[DEBUG] Step {}: decoder_input_ids={:?}", step, state.input_ids);
+            
+            let (logits, next_state) = self.decoder_step(
+                &encoder_hidden_states,
+                &encoder_attention_mask,
+                state,
             )?;
 
-            // 准备基本输入
-            let encoder_attention_mask_value = array_to_value!(encoder_attention_mask.clone(), i64)?;
-            let input_ids_value = array_to_value!(decoder_input, i64)?;
-            let encoder_hidden_states_value = array_to_value!(encoder_hidden_states.clone(), f32)?;
-            
-            // 根据 recommended_kv_solution.md：
-            // Step 0: use_cache_branch = false，不传 KV cache（但实际上模型要求所有输入都存在）
-            // Step N: use_cache_branch = true，传 KV cache
-            // 注意：模型定义中 use_cache_branch 是 Bool 类型
-            let is_first_step = kv_cache.is_none();
-            let use_cache_branch_value = if is_first_step {
-                array_to_value!(Array1::from_vec(vec![false]), bool)? // Step 0
-            } else {
-                array_to_value!(Array1::from_vec(vec![true]), bool)? // Step N
-            };
-
-            // 运行模型
-            // ort 1.16.3: session.run() 接受 Vec<Value>，按输入顺序排列
-            // 根据模型定义，输入顺序是：
-            // encoder_attention_mask, input_ids, encoder_hidden_states, past_key_values.*, use_cache_branch
-            let decoder_session = self.decoder_session.lock().unwrap();
-            let mut inputs: Vec<ort::Value> = vec![
-                encoder_attention_mask_value,
-                input_ids_value,
-                encoder_hidden_states_value,
-            ];
-            
-            // 添加 past_key_values（所有输入都是必需的，包括第一步）
-            // 根据 recommended_kv_solution.md：第一步不传 KV cache，但模型要求所有输入都存在
-            // 所以我们需要在第一步也传递空的 KV cache，但使用 use_cache_branch = 0.0 来告诉模型忽略它们
-            // 但实际上，根据文档，第一步应该不传 KV cache。但模型定义要求所有输入都存在。
-            // 让我们尝试在第一步传递空的 KV cache，看看是否能工作。
-            use ort::tensor::OrtOwnedTensor;
-            use ndarray::{IxDyn, CowArray, Array4};
-            
-            if let Some(prev_kv) = &kv_cache {
-                // Step N: 使用上一步的 KV cache
-                for kv_value in prev_kv {
-                    let kv_tensor: OrtOwnedTensor<f32, IxDyn> = kv_value.try_extract::<f32>()
-                        .map_err(|e| anyhow!("failed to extract KV cache: {e}"))?;
-                    let kv_view = kv_tensor.view();
-                    let kv_arr = kv_view.to_owned().into_dyn();
-                    let kv_cow = CowArray::from(kv_arr);
-                    let kv_new = Value::from_array(ptr::null_mut(), &kv_cow)
-                        .map_err(|e| anyhow!("failed to rebuild KV cache: {e}"))?;
-                    inputs.push(unsafe { std::mem::transmute::<Value<'_>, Value<'static>>(kv_new) });
-                }
-            } else {
-                // Step 0: 模型要求所有输入都存在，但根据 recommended_kv_solution.md，第一步应该不传 KV cache
-                // 这里我们创建一个空的 KV cache，但使用 use_cache_branch = false 来告诉模型忽略它们
-                // 创建空的 KV cache：每层 4 个值（dec_k, dec_v, enc_k, enc_v），每个都是空的 4D tensor
-                // 形状：[batch=1, num_heads=8, seq_len=1, head_dim=64]（使用 1 而不是 0，因为 ONNX 不允许 0 维度）
-                let batch = 1;
-                let num_heads = 8;
-                let head_dim = 64;
-                let empty_seq_len = 1; // 使用 1 而不是 0，因为 ONNX 不允许 0 维度
-                
-                for _layer in 0..num_layers {
-                    // 为每层创建 4 个空的 KV cache：dec_k, dec_v, enc_k, enc_v
-                    for _ in 0..4 {
-                        let empty_arr = Array4::<f32>::zeros((batch, num_heads, empty_seq_len, head_dim));
-                        let arr_dyn = empty_arr.into_dyn();
-                        let arr_owned = arr_dyn.to_owned();
-                        let cow_arr = CowArray::from(arr_owned);
-                        let kv_value = Value::from_array(ptr::null_mut(), &cow_arr)
-                            .map_err(|e| anyhow!("failed to create empty KV cache: {e}"))?;
-                        inputs.push(unsafe { std::mem::transmute::<Value<'_>, Value<'static>>(kv_value) });
-                    }
-                }
-            }
-            
-            // use_cache_branch 是最后一个输入
-            inputs.push(use_cache_branch_value);
-            
-            let outputs: Vec<ort::Value> = decoder_session.run(inputs)
-                .map_err(|e| anyhow!("failed to run decoder model: {e}"))?;
-
-            // 提取 logits
-            // ort 1.16.3: 当使用 HashMap 构建的 inputs 时，outputs 是 Vec<Value>，按输出顺序排列
-            // logits 是第一个输出（索引 0）
-            let logits_value = &outputs[0];
-            // ort 1.16.3: 使用 try_extract() + view() + into_dimensionality()
-            // logits shape: [batch, seq_len, vocab_size]
-            let tensor: OrtOwnedTensor<f32, IxDyn> = logits_value
-                .try_extract::<f32>()
-                .map_err(|e| anyhow!("failed to extract logits: {e}"))?;
-            let view = tensor.view();
-            let logits_arr: Array3<f32> = view
-                .to_owned()
-                .into_dimensionality::<Ix3>()
-                .map_err(|e| anyhow!("failed to convert logits to Array3: {e}"))?;
-            
-            // 取最后一个 token 的 logits
-            let logits_shape = logits_arr.shape();
-            let _vocab_size = logits_shape[2];
-            let seq_len = logits_shape[1];
-            // 获取最后一个 token 的 logits (最后一个 seq_len 维度)
-            let last_token_logits = logits_arr.slice(ndarray::s![0, seq_len - 1, ..]);
+            state = next_state;
 
             // 选择概率最高的 token（贪婪解码）
-            let next_token_id = last_token_logits
+            let next_token_id = logits
                 .iter()
                 .enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(idx, _)| idx as i64)
                 .ok_or_else(|| anyhow!("failed to find next token"))?;
-
-            generated_ids.push(next_token_id);
 
             // 检查是否生成 EOS
             if next_token_id == self.eos_token_id {
@@ -535,50 +554,16 @@ impl MarianNmtOnnx {
                 break;
             }
 
-            // 更新 decoder_input_ids（只保留最后一个 token）
-            decoder_input_ids = vec![next_token_id];
-
-            // 更新 KV cache：从 outputs 中提取 present.* Value 并重新构建
-            // 根据 recommended_kv_solution.md：KV cache 作为黑盒 Value 存储
-            // 输出顺序：logits (0), present.0.decoder.key (1), present.0.decoder.value (2), ...
-            // 对于第 i 层：present.{i}.decoder.key 在索引 1 + i*4, present.{i}.decoder.value 在 1 + i*4 + 1, ...
-            // 注意：在 ort 1.16.3 中，outputs 是 Vec<Value<'static>>，所以我们可以直接使用
-            // 但为了确保数据被正确复制，我们仍然需要提取并重新构建
-            let mut new_kv_cache = Vec::new();
-            
-            for layer in 0..num_layers {
-                let output_idx_base = 1 + layer * 4; // logits 是 0，所以从 1 开始
-                
-                // 提取每层的 4 个 KV cache 值：dec_k, dec_v, enc_k, enc_v
-                // 注意：outputs 中的 Value 可能不能直接 clone，所以我们需要提取数据并重新构建
-                // 根据 recommended_kv_solution.md：KV cache 作为黑盒 Value 处理
-                use ort::tensor::OrtOwnedTensor;
-                use ndarray::{IxDyn, CowArray};
-                
-                for offset in 0..4 {
-                    let kv_output = &outputs[output_idx_base + offset];
-                    // 提取 tensor 数据并重新构建 Value
-                    // 注意：即使 use_cache_branch = false，模型仍然会输出 present.*，但可能某些值是空的
-                    let kv_tensor: OrtOwnedTensor<f32, IxDyn> = kv_output
-                        .try_extract::<f32>()
-                        .map_err(|e| anyhow!("failed to extract present.{layer} KV cache (offset {}): {e}. This may happen if the tensor data pointer is null.", offset))?;
-                    let kv_view = kv_tensor.view();
-                    let kv_arr = kv_view.to_owned().into_dyn();
-                    let kv_cow = CowArray::from(kv_arr);
-                    let kv_value = Value::from_array(ptr::null_mut(), &kv_cow)
-                        .map_err(|e| anyhow!("failed to rebuild present.{layer} KV cache: {e}"))?;
-                    new_kv_cache.push(unsafe { std::mem::transmute::<Value<'_>, Value<'static>>(kv_value) });
-                }
-            }
-            
-            kv_cache = Some(new_kv_cache);
+            // 更新 state
+            state.generated_ids.push(next_token_id);
+            state.input_ids.push(next_token_id);
         }
 
-        println!("Generated IDs: {:?} (length: {})", generated_ids, generated_ids.len());
+        println!("[NMT][translate] Generated IDs: {:?} (length: {})", state.generated_ids, state.generated_ids.len());
 
-        // 6. 使用 tokenizer 解码
-        let translated_text = self.tokenizer.decode(&generated_ids);
-        println!("Translated text: '{}'", translated_text);
+        // 5. 使用 tokenizer 解码
+        let translated_text = self.tokenizer.decode(&state.generated_ids);
+        println!("[NMT][translate] Translated text: '{}'", translated_text);
 
         Ok(translated_text)
     }
