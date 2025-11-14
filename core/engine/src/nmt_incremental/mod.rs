@@ -499,16 +499,16 @@ impl MarianNmtOnnx {
         // 3. encoder_hidden_states
         input_values.push(encoder_states_value);
 
-        // 4. KV cache：第一步用占位 KV，后续用真实 present.*
+        // 4. KV cache：Workaround 模式下，始终使用占位 KV（不使用历史 KV）
+        // 由于模型要求所有输入都存在，即使 use_cache_branch=false 也需要传入 KV
         let encoder_seq_len = encoder_hidden_states.shape()[1];
-        let kv_to_use: Vec<[Value<'static>; 4]> =
-            if let Some(prev_kv) = state.kv_cache.take() {
-                // 后续步骤：使用上一轮的 present.*
-                prev_kv
-            } else {
-                // 第一步：构造零张量占位 KV
-                self.build_initial_kv_values(encoder_seq_len)?
-            };
+        let kv_to_use: Vec<[Value<'static>; 4]> = if state.use_cache_branch && state.kv_cache.is_some() {
+            // 正常模式：使用历史 KV（但 workaround 模式下不会走到这里）
+            state.kv_cache.take().unwrap()
+        } else {
+            // Workaround 模式：始终使用占位 KV
+            self.build_initial_kv_values(encoder_seq_len)?
+        };
 
         // 无论第几步，都向模型提供完整的 KV 输入
         for kv_layer in kv_to_use {
@@ -546,21 +546,33 @@ impl MarianNmtOnnx {
             .slice(ndarray::s![0, seq_len - 1, ..])
             .to_owned(); // 已经是 Array1<f32>
 
-        // KV cache 只搬运，不解析
-        let mut next_kv: Vec<[Value<'static>; 4]> = Vec::with_capacity(Self::NUM_LAYERS);
-
-        for _layer in 0..Self::NUM_LAYERS {
-            let dec_k = iter.next().expect("missing present.*.decoder.key");
-            let dec_v = iter.next().expect("missing present.*.decoder.value");
-            let enc_k = iter.next().expect("missing present.*.encoder.key");
-            let enc_v = iter.next().expect("missing present.*.encoder.value");
-            next_kv.push([dec_k, dec_v, enc_k, enc_v]);
+        // KV cache：Workaround 模式下，不再从输出中提取 KV cache
+        // 直接跳过所有 present.* 输出，不保存它们
+        if state.use_cache_branch {
+            // 正常模式：提取 KV cache（但 workaround 模式下不会走到这里）
+            let mut next_kv: Vec<[Value<'static>; 4]> = Vec::with_capacity(Self::NUM_LAYERS);
+            for _layer in 0..Self::NUM_LAYERS {
+                let dec_k = iter.next().expect("missing present.*.decoder.key");
+                let dec_v = iter.next().expect("missing present.*.decoder.value");
+                let enc_k = iter.next().expect("missing present.*.encoder.key");
+                let enc_v = iter.next().expect("missing present.*.encoder.value");
+                next_kv.push([dec_k, dec_v, enc_k, enc_v]);
+            }
+            state.kv_cache = Some(next_kv);
+            state.use_cache_branch = true;
+        } else {
+            // Workaround 模式：跳过所有 present.* 输出，不保存 KV cache
+            for _layer in 0..Self::NUM_LAYERS {
+                iter.next(); // decoder.key
+                iter.next(); // decoder.value
+                iter.next(); // encoder.key
+                iter.next(); // encoder.value
+            }
+            state.kv_cache = None;
+            state.use_cache_branch = false;
         }
 
-        // 更新 state
-        state.kv_cache = Some(next_kv);
-        state.use_cache_branch = true; // 后续步骤都走 cache 分支
-
+        // 返回 state（保持 generated_ids 不变，因为我们在 translate() 中管理它）
         Ok((last_step_logits, state))
     }
 
@@ -585,27 +597,38 @@ impl MarianNmtOnnx {
         let (encoder_hidden_states, encoder_attention_mask) = self.run_encoder(&source_ids)?;
         println!("Encoder output shape: {:?}", encoder_hidden_states.shape());
 
-        // 3. 初始化 DecoderState
+        // 3. 初始化 DecoderState（Workaround: 禁用 KV cache，使用完整序列解码）
         let mut state = DecoderState {
             input_ids: vec![self.decoder_start_token_id],
-            generated_ids: Vec::new(),
+            generated_ids: vec![self.decoder_start_token_id],  // 一开始就包含 BOS
             kv_cache: None,
-            use_cache_branch: false,
+            use_cache_branch: false,  // 始终禁用 KV 分支
         };
 
-        // 4. 进入解码循环
+        // 4. 进入解码循环（Workaround: 每一步都用完整历史序列解码）
         let max_steps = self.max_length.min(128); // 限制最大步数
-        let mut final_generated_ids = Vec::new();
 
         for step in 0..max_steps {
-            println!("[DEBUG] Step {}: decoder_input_ids={:?}", step, state.input_ids);
+            // 每一步都用完整历史序列解码
+            let current_generated_ids = state.generated_ids.clone();
+            let current_state = DecoderState {
+                input_ids: current_generated_ids.clone(),  // 使用完整历史序列
+                generated_ids: current_generated_ids.clone(),
+                kv_cache: None,           // 关键：不携带历史 KV
+                use_cache_branch: false,  // 关键：每一步都禁用 KV 分支
+            };
             
-            let (logits, next_state) = self.decoder_step(
+            println!("[DEBUG] Step {}: decoder_input_ids={:?} (length: {})", step, current_state.input_ids, current_state.input_ids.len());
+            
+            let (logits, _next_state) = self.decoder_step(
                 &encoder_hidden_states,
                 &encoder_attention_mask,
-                state,
+                current_state,
             )?;
 
+            // decoder_step 返回的 logits 已经是最后一个位置的 Array1<f32>
+            // 所以直接使用即可
+            
             // 选择概率最高的 token（贪婪解码）
             let next_token_id = logits
                 .iter()
@@ -617,30 +640,21 @@ impl MarianNmtOnnx {
             // 检查是否生成 EOS
             if next_token_id == self.eos_token_id {
                 println!("Generated EOS token at step {}", step);
-                // 保存最终的 generated_ids
-                final_generated_ids = next_state.generated_ids;
-                final_generated_ids.push(next_token_id);
                 break;
             }
 
-            // 更新 state：只把最新生成的一个 token 放进 input_ids
-            // 完整历史保存在 generated_ids 中，KV cache 中已经包含了所有历史
-            let mut generated = next_state.generated_ids;
-            generated.push(next_token_id);
-            final_generated_ids = generated.clone();
-            
-            state = DecoderState {
-                input_ids: vec![next_token_id],  // 下一轮只传当前 token
-                generated_ids: generated,         // 完整历史保存在这里
-                kv_cache: next_state.kv_cache,    // 使用当前轮的 present.*
-                use_cache_branch: true,           // 从第二轮开始一直为 true
-            };
+            // 更新 state 的 generated_ids
+            state.generated_ids.push(next_token_id);
         }
 
-        println!("[NMT][translate] Generated IDs: {:?} (length: {})", final_generated_ids, final_generated_ids.len());
+        println!("[NMT][translate] Generated IDs: {:?} (length: {})", state.generated_ids, state.generated_ids.len());
 
-        // 5. 使用 tokenizer 解码
-        let translated_text = self.tokenizer.decode(&final_generated_ids);
+        // 5. 使用 tokenizer 解码（跳过 BOS token）
+        let translated_ids: Vec<i64> = state.generated_ids.iter()
+            .skip(1)  // 跳过 BOS token
+            .copied()
+            .collect();
+        let translated_text = self.tokenizer.decode(&translated_ids);
         println!("[NMT][translate] Translated text: '{}'", translated_text);
 
         Ok(translated_text)
