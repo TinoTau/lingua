@@ -20,7 +20,9 @@ pub use config_manager::{ConfigManager, EngineConfig};
 pub use emotion_adapter::{EmotionAdapter, EmotionRequest, EmotionResponse};
 pub use error::{EngineError, EngineResult};
 pub use event_bus::{CoreEvent, EventBus, EventSubscription, EventTopic};
-pub use nmt_incremental::{NmtIncremental, TranslationRequest, TranslationResponse};
+pub use nmt_incremental::{
+    LanguageCode, LanguagePair, MarianNmtOnnx, MarianTokenizer, NmtIncremental, TranslationRequest, TranslationResponse,
+};
 pub use persona_adapter::{PersonaAdapter, PersonaContext};
 pub use telemetry::{TelemetryDatum, TelemetrySink};
 pub use tts_streaming::{TtsRequest, TtsStreamChunk, TtsStreaming};

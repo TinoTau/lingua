@@ -1,22 +1,25 @@
 use std::path::PathBuf;
 
-use core_engine::nmt_incremental::load_marian_onnx_for_smoke_test;
+use core_engine::nmt_incremental::MarianNmtOnnx;
 
-/// 测试：能否成功加载 Marian NMT 的 ONNX 模型（仅检查 Session 创建成功）
+/// 测试：能否成功加载 Marian NMT 的 ONNX 模型并打印 I/O 信息
 #[test]
 fn test_load_marian_onnx_model() {
     // 通过 CARGO_MANIFEST_DIR 找到 core/engine 目录
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
-    // 项目根目录：D:\Programs\github\lingua
-    let project_root = crate_root
-        .parent()  // ...\lingua\core
-        .and_then(|p| p.parent())  // ...\lingua
-        .expect("failed to resolve project root");
+    // 使用 core/engine/models/nmt/marian-en-zh/ 目录
+    let model_dir = crate_root.join("models/nmt/marian-en-zh");
 
-    // 按我们约定的路径拼出 model.onnx 的位置
-    let model_path = project_root.join("third_party/nmt/marian-en-zh/model.onnx");
+    assert!(
+        model_dir.exists(),
+        "NMT model directory not found at {:?}",
+        model_dir
+    );
 
-    load_marian_onnx_for_smoke_test(&model_path)
-        .expect(&format!("failed to load Marian ONNX model at {}", model_path.display()));
+    // 调用 new_from_dir 会打印模型的 I/O 信息
+    let _nmt = MarianNmtOnnx::new_from_dir(&model_dir)
+        .expect("failed to load MarianNmtOnnx from directory");
+
+    println!("✓ MarianNmtOnnx loaded successfully");
 }

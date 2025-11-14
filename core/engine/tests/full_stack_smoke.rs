@@ -8,6 +8,7 @@ use core_engine::bootstrap::CoreEngineBuilder;
 use core_engine::nmt_incremental::{
     load_marian_onnx_for_smoke_test,
     translate_full_sentence_stub,
+    MarianNmtOnnx,
 };
 
 /// 1. ASR：用 whisper-cli 跑 JFK 示例音频，检查经典台词是否出现。
@@ -117,4 +118,29 @@ fn test_fullstack_core_engine_builder_nmt_wiring() {
     //
     // 这里仅仅确保函数本身不会出错即可。
     let _ = builder;
+}
+
+/// 4. NMT ONNX：加载完整的 MarianNmtOnnx 并打印模型的 I/O 信息。
+#[test]
+fn test_fullstack_nmt_onnx_model_io_info() {
+    let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let project_root = crate_root
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("failed to resolve project root");
+
+    // 使用 core/engine/models/nmt/marian-en-zh/ 目录
+    let model_dir = crate_root.join("models/nmt/marian-en-zh");
+
+    assert!(
+        model_dir.exists(),
+        "NMT model directory not found at {:?}",
+        model_dir
+    );
+
+    // 调用 new_from_dir 会打印模型的 I/O 信息
+    let _nmt = MarianNmtOnnx::new_from_dir(&model_dir)
+        .expect("failed to load MarianNmtOnnx from directory");
+
+    println!("✓ MarianNmtOnnx loaded successfully");
 }
