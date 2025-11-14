@@ -396,24 +396,29 @@ impl MarianNmtOnnx {
         let head_dim = 64usize;
         let past_decoder_seq_len = 0usize;
 
-        // 4. 创建空的 KV cache
-        fn create_empty_kv(batch: usize, num_heads: usize, seq_len: usize, head_dim: usize) -> Array4<f32> {
-            Array4::<f32>::zeros((batch, num_heads, seq_len.max(1), head_dim))
+        // 4. 创建空的 KV cache（作为 Value 黑盒）
+        // 注意：我们将 KV cache 作为 ort::Value 存储，不需要知道具体值
+        use ort::value::Value;
+        
+        fn create_empty_kv_value(batch: usize, num_heads: usize, seq_len: usize, head_dim: usize) -> Result<Value> {
+            // 创建空的 Array4，然后转换为 Value
+            let arr = Array4::<f32>::zeros((batch, num_heads, seq_len.max(1), head_dim));
+            let arr_dyn = arr.into_dyn();
+            let shape: Vec<i64> = arr_dyn.shape().iter().map(|&d| d as i64).collect();
+            let data: Vec<f32> = arr_dyn.iter().cloned().collect();
+            // Value::from_array 返回 Value<TensorValueType<f32>>，需要转换为 Value
+            let value: Value = Value::from_array((shape, data))
+                .map_err(|e| anyhow!("failed to create empty KV cache Value: {e}"))?
+                .into();
+            Ok(value)
         }
 
-        let mut past_key_values = Vec::new();
-        for _ in 0..6 {
-            // 6 layers
-            past_key_values.push((
-                create_empty_kv(batch_size, num_heads, past_decoder_seq_len, head_dim), // decoder key
-                create_empty_kv(batch_size, num_heads, past_decoder_seq_len, head_dim), // decoder value
-                create_empty_kv(batch_size, num_heads, encoder_seq_len, head_dim),      // encoder key
-                create_empty_kv(batch_size, num_heads, encoder_seq_len, head_dim),      // encoder value
-            ));
-        }
+        // 存储 KV cache 作为 Value（黑盒）
+        // 类型：Option<Vec<(decoder_key, decoder_value, encoder_key, encoder_value)>>
+        // None 表示第一次迭代（使用空的 KV cache），Some 表示后续迭代（使用上一次的 present KV cache）
+        let mut past_key_values: Option<Vec<(Value, Value, Value, Value)>> = None;
 
         // 5. 增量解码循环
-        use ort::value::Value;
         macro_rules! array_to_value {
             ($arr:expr, $t:ty) => {{
                 let arr_dyn = $arr.into_dyn();
@@ -441,31 +446,97 @@ impl MarianNmtOnnx {
             let encoder_hidden_states_value = array_to_value!(encoder_hidden_states.clone(), f32)?;
             let use_cache_branch_value = array_to_value!(Array1::from_vec(vec![true]), bool)?;
 
-            // 准备 past_key_values
-            let mut past_kv_inputs = Vec::new();
-            for (layer_idx, (dec_key, dec_val, enc_key, enc_val)) in past_key_values.iter().enumerate() {
-                past_kv_inputs.push((
-                    format!("past_key_values.{}.decoder.key", layer_idx),
-                    array_to_value!(dec_key.clone(), f32)?,
-                ));
-                past_kv_inputs.push((
-                    format!("past_key_values.{}.decoder.value", layer_idx),
-                    array_to_value!(dec_val.clone(), f32)?,
-                ));
-                past_kv_inputs.push((
-                    format!("past_key_values.{}.encoder.key", layer_idx),
-                    array_to_value!(enc_key.clone(), f32)?,
-                ));
-                past_kv_inputs.push((
-                    format!("past_key_values.{}.encoder.value", layer_idx),
-                    array_to_value!(enc_val.clone(), f32)?,
-                ));
+            // 准备 past_key_values（黑盒方式：从存储的 KV cache 重新构建 Value）
+            // 注意：由于 Value 不支持 Clone，我们需要在每次迭代时重新构建
+            // 但我们仍然将 KV cache 视为"黑盒"，不关心具体值
+            use std::borrow::Cow;
+            use ort::session::SessionInputValue;
+            let mut past_kv_inputs: Vec<(String, Value)> = Vec::new();
+            
+            if let Some(ref kv_cache) = past_key_values {
+                // 使用上一次迭代的 KV cache
+                // 由于 Value 不支持 Clone，我们需要从存储的 Value 中提取数据并重新构建
+                // 这是"黑盒"传递：我们只是搬运数据，不关心具体值
+                for (layer_idx, (dec_key, dec_val, enc_key, enc_val)) in kv_cache.iter().enumerate() {
+                    // 从存储的 Value 中提取数据并重新构建（黑盒方式）
+                    // 虽然需要提取数据，但我们只是"搬运"，不关心具体值
+                    let (dec_key_shape, dec_key_data) = dec_key
+                        .try_extract_tensor::<f32>()
+                        .map_err(|e| anyhow!("failed to extract past_key_values.{}.decoder.key: {}", layer_idx, e))?;
+                    let (dec_val_shape, dec_val_data) = dec_val
+                        .try_extract_tensor::<f32>()
+                        .map_err(|e| anyhow!("failed to extract past_key_values.{}.decoder.value: {}", layer_idx, e))?;
+                    let (enc_key_shape, enc_key_data) = enc_key
+                        .try_extract_tensor::<f32>()
+                        .map_err(|e| anyhow!("failed to extract past_key_values.{}.encoder.key: {}", layer_idx, e))?;
+                    let (enc_val_shape, enc_val_data) = enc_val
+                        .try_extract_tensor::<f32>()
+                        .map_err(|e| anyhow!("failed to extract past_key_values.{}.encoder.value: {}", layer_idx, e))?;
+
+                    // 重新构建 Value（黑盒：只是搬运数据）
+                    let dec_key_shape_vec: Vec<i64> = dec_key_shape.iter().map(|&d| d as i64).collect();
+                    let dec_val_shape_vec: Vec<i64> = dec_val_shape.iter().map(|&d| d as i64).collect();
+                    let enc_key_shape_vec: Vec<i64> = enc_key_shape.iter().map(|&d| d as i64).collect();
+                    let enc_val_shape_vec: Vec<i64> = enc_val_shape.iter().map(|&d| d as i64).collect();
+
+                    let dec_key_value: Value = Value::from_array((dec_key_shape_vec, dec_key_data.to_vec()))
+                        .map_err(|e| anyhow!("failed to rebuild past_key_values.{}.decoder.key: {}", layer_idx, e))?
+                        .into();
+                    let dec_val_value: Value = Value::from_array((dec_val_shape_vec, dec_val_data.to_vec()))
+                        .map_err(|e| anyhow!("failed to rebuild past_key_values.{}.decoder.value: {}", layer_idx, e))?
+                        .into();
+                    let enc_key_value: Value = Value::from_array((enc_key_shape_vec, enc_key_data.to_vec()))
+                        .map_err(|e| anyhow!("failed to rebuild past_key_values.{}.encoder.key: {}", layer_idx, e))?
+                        .into();
+                    let enc_val_value: Value = Value::from_array((enc_val_shape_vec, enc_val_data.to_vec()))
+                        .map_err(|e| anyhow!("failed to rebuild past_key_values.{}.encoder.value: {}", layer_idx, e))?
+                        .into();
+
+                    past_kv_inputs.push((
+                        format!("past_key_values.{}.decoder.key", layer_idx),
+                        dec_key_value,
+                    ));
+                    past_kv_inputs.push((
+                        format!("past_key_values.{}.decoder.value", layer_idx),
+                        dec_val_value,
+                    ));
+                    past_kv_inputs.push((
+                        format!("past_key_values.{}.encoder.key", layer_idx),
+                        enc_key_value,
+                    ));
+                    past_kv_inputs.push((
+                        format!("past_key_values.{}.encoder.value", layer_idx),
+                        enc_val_value,
+                    ));
+                }
+            } else {
+                // 第一次迭代：创建空的 KV cache
+                for layer_idx in 0..6 {
+                    let empty_dec_key = create_empty_kv_value(batch_size, num_heads, past_decoder_seq_len, head_dim)?;
+                    let empty_dec_val = create_empty_kv_value(batch_size, num_heads, past_decoder_seq_len, head_dim)?;
+                    let empty_enc_key = create_empty_kv_value(batch_size, num_heads, encoder_seq_len, head_dim)?;
+                    let empty_enc_val = create_empty_kv_value(batch_size, num_heads, encoder_seq_len, head_dim)?;
+                    
+                    past_kv_inputs.push((
+                        format!("past_key_values.{}.decoder.key", layer_idx),
+                        empty_dec_key,
+                    ));
+                    past_kv_inputs.push((
+                        format!("past_key_values.{}.decoder.value", layer_idx),
+                        empty_dec_val,
+                    ));
+                    past_kv_inputs.push((
+                        format!("past_key_values.{}.encoder.key", layer_idx),
+                        empty_enc_key,
+                    ));
+                    past_kv_inputs.push((
+                        format!("past_key_values.{}.encoder.value", layer_idx),
+                        empty_enc_val,
+                    ));
+                }
             }
 
             // 构建输入 - 使用 ort::inputs! 宏，但需要手动构建所有输入
-            use std::borrow::Cow;
-            use ort::session::SessionInputValue;
-            
             let mut inputs: Vec<(Cow<'_, str>, SessionInputValue<'_>)> = vec![
                 ("encoder_attention_mask".into(), encoder_attention_mask_value.into()),
                 ("input_ids".into(), input_ids_value.into()),
@@ -473,7 +544,7 @@ impl MarianNmtOnnx {
                 ("use_cache_branch".into(), use_cache_branch_value.into()),
             ];
             
-            // 添加 past_key_values
+            // 添加 past_key_values（Value 可以直接转换为 SessionInputValue）
             for (name, value) in past_kv_inputs {
                 inputs.push((Cow::Owned(name), value.into()));
             }
@@ -519,34 +590,73 @@ impl MarianNmtOnnx {
             // - Attention 需要用到之前所有 token 的 key 和 value
             // - KV cache 缓存这些之前计算过的 key/value，避免重复计算，加速推理
             // - 每次迭代：模型输出 present KV cache，我们将其作为下次迭代的 past_key_values 输入
-            
-            // 注意：在第一次迭代时，past_decoder_seq_len 为 0，但模型输出的 present KV cache 
-            // 的 decoder 部分长度应该是 1（因为输入了一个 decoder_start_token_id）
-            // 从第二次迭代开始，我们需要更新 KV cache
-            
-            // 更新 KV cache（从第二次迭代开始）
-            // 注意：由于 ort crate 的内存安全问题，我们暂时跳过 KV cache 更新
-            // 这会导致每次迭代都使用相同的 KV cache，翻译结果可能不准确
-            // 但至少可以验证基本的翻译流程
-            // 
-            // 问题分析：
-            // - try_extract_tensor 返回的 slice 可能引用了 outputs 内部的数据
-            // - 当我们在循环中多次提取时，可能会出现内存安全问题
-            // - 这可能是 ort crate 2.0.0-rc.10 的一个已知问题
             //
-            // 可能的解决方案：
-            // 1. 升级 ort crate 到稳定版本（如果有）
-            // 2. 使用不同的 API 提取 tensor 数据
-            // 3. 一次性提取所有数据，避免多次访问 outputs
-            // 4. 使用 unsafe 代码手动管理内存（不推荐）
+            // 关键优化：将 KV cache 作为黑盒 Value 传递，不需要提取具体值
+            // - 从 outputs 中直接获取 present KV cache 的 Value
+            // - 由于 Value 不支持 Clone，我们需要通过 try_extract_tensor 提取数据，然后重新构建 Value
+            // - 但这样仍然避免了在 Rust 侧操作 KV cache 的具体值
             
-            if step > 0 {
-                // TODO: 修复 KV cache 更新逻辑
-                // 目前暂时跳过，因为会出现内存安全问题
-                println!("[DEBUG] Step {}: KV cache update skipped due to memory safety issues", step);
-            } else {
-                println!("[DEBUG] Step 0: First iteration, skipping KV cache update");
+            // 从 outputs 中提取 present KV cache 的 Value（黑盒方式）
+            // 注意：虽然我们需要提取数据来重新构建 Value，但这是为了绕过 Value 不支持 Clone 的限制
+            // 我们仍然不需要在 Rust 侧理解或操作 KV cache 的具体值
+            let mut new_past_key_values = Vec::new();
+            for layer_idx in 0..6 {
+                let present_dec_key_name = format!("present.{}.decoder.key", layer_idx);
+                let present_dec_val_name = format!("present.{}.decoder.value", layer_idx);
+                let present_enc_key_name = format!("present.{}.encoder.key", layer_idx);
+                let present_enc_val_name = format!("present.{}.encoder.value", layer_idx);
+
+                // 从 outputs 中获取 Value 引用
+                let dec_key_ref = &outputs[present_dec_key_name.as_str()];
+                let dec_val_ref = &outputs[present_dec_val_name.as_str()];
+                let enc_key_ref = &outputs[present_enc_key_name.as_str()];
+                let enc_val_ref = &outputs[present_enc_val_name.as_str()];
+
+                // 提取 tensor 数据并重新构建 Value（绕过 Clone 限制）
+                // 虽然我们提取了数据，但我们只是"搬运"数据，不关心具体值
+                let (dec_key_shape, dec_key_data) = dec_key_ref
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| anyhow!("failed to extract present.{}.decoder.key: {}", layer_idx, e))?;
+                let (dec_val_shape, dec_val_data) = dec_val_ref
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| anyhow!("failed to extract present.{}.decoder.value: {}", layer_idx, e))?;
+                let (enc_key_shape, enc_key_data) = enc_key_ref
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| anyhow!("failed to extract present.{}.encoder.key: {}", layer_idx, e))?;
+                let (enc_val_shape, enc_val_data) = enc_val_ref
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| anyhow!("failed to extract present.{}.encoder.value: {}", layer_idx, e))?;
+
+                // 将 shape 转换为 Vec<i64>（Value::from_array 需要）
+                let dec_key_shape_vec: Vec<i64> = dec_key_shape.iter().map(|&d| d as i64).collect();
+                let dec_val_shape_vec: Vec<i64> = dec_val_shape.iter().map(|&d| d as i64).collect();
+                let enc_key_shape_vec: Vec<i64> = enc_key_shape.iter().map(|&d| d as i64).collect();
+                let enc_val_shape_vec: Vec<i64> = enc_val_shape.iter().map(|&d| d as i64).collect();
+
+                // 立即复制数据并重新构建 Value
+                let dec_key_value: Value = Value::from_array((dec_key_shape_vec, dec_key_data.to_vec()))
+                    .map_err(|e| anyhow!("failed to rebuild present.{}.decoder.key Value: {}", layer_idx, e))?
+                    .into();
+                let dec_val_value: Value = Value::from_array((dec_val_shape_vec, dec_val_data.to_vec()))
+                    .map_err(|e| anyhow!("failed to rebuild present.{}.decoder.value Value: {}", layer_idx, e))?
+                    .into();
+                let enc_key_value: Value = Value::from_array((enc_key_shape_vec, enc_key_data.to_vec()))
+                    .map_err(|e| anyhow!("failed to rebuild present.{}.encoder.key Value: {}", layer_idx, e))?
+                    .into();
+                let enc_val_value: Value = Value::from_array((enc_val_shape_vec, enc_val_data.to_vec()))
+                    .map_err(|e| anyhow!("failed to rebuild present.{}.encoder.value Value: {}", layer_idx, e))?
+                    .into();
+
+                new_past_key_values.push((
+                    dec_key_value,
+                    dec_val_value,
+                    enc_key_value,
+                    enc_val_value,
+                ));
             }
+            
+            // 更新 past_key_values（从第二次迭代开始）
+            past_key_values = Some(new_past_key_values);
             current_past_len += 1;
         }
 
