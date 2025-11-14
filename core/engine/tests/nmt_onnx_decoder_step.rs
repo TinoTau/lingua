@@ -17,16 +17,17 @@ fn test_marian_decoder_single_step() -> Result<()> {
     let crate_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let model_path = crate_root.join("models/nmt/marian-en-zh/model.onnx");
 
-    // 3. 读取模型文件
-    let model_bytes = fs::read(&model_path)
-        .map_err(|e| anyhow!("failed to read model file: {e}"))?;
-
-    // 4. 创建 Session（和你之前 load 的方式一致）
-    let builder = Session::builder()
-        .map_err(|e| anyhow!("failed to create Session builder: {e}"))?;
-
-    let mut session = builder
-        .commit_from_memory(&model_bytes)
+    // 3. 创建 Session（使用文件模式，ort 1.16.3）
+    use ort::{SessionBuilder, Environment};
+    use std::sync::Arc;
+    let env = Arc::new(
+        Environment::builder()
+            .with_name("marian_nmt_test")
+            .build()?
+    );
+    let mut session = SessionBuilder::new(&env)
+        .map_err(|e| anyhow!("failed to create Session builder: {e}"))?
+        .with_model_from_file(&model_path)
         .map_err(|e| anyhow!("failed to load ONNX model: {e}"))?;
 
     println!("✓ Marian decoder model loaded.");
@@ -120,18 +121,20 @@ fn test_marian_decoder_single_step() -> Result<()> {
     let use_cache_branch: Array1<bool> = Array1::from_vec(vec![true]);
 
     // 4. 将 ndarray 转换为 ort::Value
-    // ort::Value::from_array 需要 (shape, Vec<T>) 格式
+    // ort 1.16.3: Value::from_array 需要 allocator 和 CowArray
     use ort::value::Value;
+    use std::ptr;
+    use ndarray::CowArray;
     
     // 辅助函数：将 ndarray 转换为 ort::Value
-    // 需要为不同类型分别实现，因为 ort::Value::from_array 需要具体的类型
     macro_rules! array_to_value {
         ($arr:expr, $t:ty) => {{
             let arr_dyn = $arr.into_dyn();
-            let shape: Vec<i64> = arr_dyn.shape().iter().map(|&d| d as i64).collect();
-            let data: Vec<$t> = arr_dyn.iter().cloned().collect();
-            Value::from_array((shape, data))
-                .map_err(|e| anyhow!("failed to convert array to Value: {e}"))
+            let arr_owned = arr_dyn.to_owned();
+            let cow_arr = CowArray::from(arr_owned);
+            let value = Value::from_array(ptr::null_mut(), &cow_arr)
+                .map_err(|e| anyhow!("failed to convert array to Value: {:?}", e))?;
+            Ok::<ort::Value<'static>, anyhow::Error>(unsafe { std::mem::transmute::<ort::Value, ort::Value<'static>>(value) })
         }};
     }
     
@@ -171,60 +174,68 @@ fn test_marian_decoder_single_step() -> Result<()> {
     let pkv5_enc_key_value = array_to_value!(pkv5_enc_key, f32)?;
     let pkv5_enc_val_value = array_to_value!(pkv5_enc_val, f32)?;
 
-    // 5. 调用 session.run，名字和你打印出的输入名一一对应
-    let outputs = session.run(ort::inputs![
-        "encoder_attention_mask" => encoder_attention_mask_value,
-        "input_ids" => input_ids_value,
-        "encoder_hidden_states" => encoder_hidden_states_value,
-        "past_key_values.0.decoder.key" => pkv0_dec_key_value,
-        "past_key_values.0.decoder.value" => pkv0_dec_val_value,
-        "past_key_values.0.encoder.key" => pkv0_enc_key_value,
-        "past_key_values.0.encoder.value" => pkv0_enc_val_value,
-        "past_key_values.1.decoder.key" => pkv1_dec_key_value,
-        "past_key_values.1.decoder.value" => pkv1_dec_val_value,
-        "past_key_values.1.encoder.key" => pkv1_enc_key_value,
-        "past_key_values.1.encoder.value" => pkv1_enc_val_value,
-        "past_key_values.2.decoder.key" => pkv2_dec_key_value,
-        "past_key_values.2.decoder.value" => pkv2_dec_val_value,
-        "past_key_values.2.encoder.key" => pkv2_enc_key_value,
-        "past_key_values.2.encoder.value" => pkv2_enc_val_value,
-        "past_key_values.3.decoder.key" => pkv3_dec_key_value,
-        "past_key_values.3.decoder.value" => pkv3_dec_val_value,
-        "past_key_values.3.encoder.key" => pkv3_enc_key_value,
-        "past_key_values.3.encoder.value" => pkv3_enc_val_value,
-        "past_key_values.4.decoder.key" => pkv4_dec_key_value,
-        "past_key_values.4.decoder.value" => pkv4_dec_val_value,
-        "past_key_values.4.encoder.key" => pkv4_enc_key_value,
-        "past_key_values.4.encoder.value" => pkv4_enc_val_value,
-        "past_key_values.5.decoder.key" => pkv5_dec_key_value,
-        "past_key_values.5.decoder.value" => pkv5_dec_val_value,
-        "past_key_values.5.encoder.key" => pkv5_enc_key_value,
-        "past_key_values.5.encoder.value" => pkv5_enc_val_value,
-        "use_cache_branch" => use_cache_branch_value,
-    ])
-    .map_err(|e| anyhow!("failed to run session: {e}"))?;
+    // 5. 调用 session.run，ort 1.16.3 使用 Vec<Value>，按输入顺序排列
+    let inputs: Vec<ort::Value> = vec![
+        encoder_attention_mask_value,
+        input_ids_value,
+        encoder_hidden_states_value,
+        use_cache_branch_value,
+        pkv0_dec_key_value,
+        pkv0_dec_val_value,
+        pkv0_enc_key_value,
+        pkv0_enc_val_value,
+        pkv1_dec_key_value,
+        pkv1_dec_val_value,
+        pkv1_enc_key_value,
+        pkv1_enc_val_value,
+        pkv2_dec_key_value,
+        pkv2_dec_val_value,
+        pkv2_enc_key_value,
+        pkv2_enc_val_value,
+        pkv3_dec_key_value,
+        pkv3_dec_val_value,
+        pkv3_enc_key_value,
+        pkv3_enc_val_value,
+        pkv4_dec_key_value,
+        pkv4_dec_val_value,
+        pkv4_enc_key_value,
+        pkv4_enc_val_value,
+        pkv5_dec_key_value,
+        pkv5_dec_val_value,
+        pkv5_enc_key_value,
+        pkv5_enc_val_value,
+    ];
+    let outputs: Vec<ort::Value> = session.run(inputs)
+        .map_err(|e| anyhow!("failed to run session: {e}"))?;
 
     // 6. 取出 logits，查看形状
-    // ort crate 2.0 使用 try_extract_tensor 来提取数组，返回 (shape, data)
-    let logits_value = &outputs["logits"];
-    let (logits_shape, logits_data) = logits_value
-        .try_extract_tensor::<f32>()
+    // ort 1.16.3: outputs 是 Vec<Value>，logits 是第一个输出（索引 0）
+    use ort::tensor::OrtOwnedTensor;
+    use ndarray::{IxDyn, Ix3};
+    let logits_value = &outputs[0];
+    let tensor: OrtOwnedTensor<f32, IxDyn> = logits_value
+        .try_extract::<f32>()
         .map_err(|e| anyhow!("failed to extract logits tensor: {e}"))?;
-    println!("Decoder logits shape: {:?}", logits_shape);
+    let view = tensor.view();
+    let logits_arr: ndarray::Array3<f32> = view
+        .to_owned()
+        .into_dimensionality::<Ix3>()
+        .map_err(|e| anyhow!("failed to convert logits to Array3: {e}"))?;
+    println!("Decoder logits shape: {:?}", logits_arr.shape());
 
     // 再看一下一部分值，确认不是全 0（虽然因为 encoder_hidden_states 是 0，语义肯定是乱的）
-    let flat = logits_data;
+    let flat: Vec<f32> = logits_arr.iter().cloned().collect();
     println!("First few logit values: {:?}", &flat[..flat.len().min(10)]);
 
     // 7. 同时也可以看一下某一层 present cache 的 shape，确认 KV cache 正常返回
-    let present0_dec_key_value = &outputs["present.0.decoder.key"];
-    let (present0_dec_key_shape, _) = present0_dec_key_value
-        .try_extract_tensor::<f32>()
+    // present.0.decoder.key 应该在索引 1（logits 是 0）
+    let present0_dec_key_value = &outputs[1];
+    let present0_tensor: OrtOwnedTensor<f32, IxDyn> = present0_dec_key_value
+        .try_extract::<f32>()
         .map_err(|e| anyhow!("failed to extract present.0.decoder.key tensor: {e}"))?;
-    println!(
-        "present.0.decoder.key shape: {:?}",
-        present0_dec_key_shape
-    );
+    let present0_view = present0_tensor.view();
+    let present0_arr = present0_view.to_owned();
+    println!("present.0.decoder.key shape: {:?}", present0_arr.shape());
 
     Ok(())
 }

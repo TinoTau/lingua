@@ -21,10 +21,11 @@ from pathlib import Path
 try:
     import torch
     from transformers import MarianMTModel, MarianTokenizer
+    import onnx
 except ImportError as e:
     print(f"Error: Missing required package: {e}")
     print("\nPlease install required packages:")
-    print("  pip install torch transformers")
+    print("  pip install torch transformers onnx")
     sys.exit(1)
 
 
@@ -60,14 +61,21 @@ def export_encoder(model, tokenizer, output_dir: Path):
                 "attention_mask": {0: "batch_size", 1: "sequence_length"},
                 "last_hidden_state": {0: "batch_size", 1: "sequence_length"},
             },
-            opset_version=14,
+            opset_version=13,  # 降低到 13 以兼容 ort 1.16.3 (支持 IR 9)
             do_constant_folding=True,
             verbose=False,
         )
         
+        # 降级 IR 版本以兼容 ort 1.16.3 (支持 IR 9)
+        print("  Converting IR version from 10 to 9 for ort 1.16.3 compatibility...")
+        model_proto = onnx.load(str(encoder_output_path))
+        model_proto.ir_version = 9
+        onnx.save(model_proto, str(encoder_output_path))
+        
         file_size_mb = encoder_output_path.stat().st_size / (1024 * 1024)
         print(f"[OK] Encoder exported to: {encoder_output_path}")
         print(f"  File size: {file_size_mb:.2f} MB")
+        print(f"  IR version: {model_proto.ir_version}")
         
         return encoder_output_path
         
