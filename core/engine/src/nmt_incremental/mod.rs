@@ -386,57 +386,15 @@ impl MarianNmtOnnx {
         // 3. 初始化 decoder 状态
         let mut decoder_input_ids = vec![self.decoder_start_token_id];
         let mut generated_ids = Vec::new();
-        let num_heads = 8usize;
-        let head_dim = 64usize;
-        let num_layers = 6usize;
-
-        // 4. 创建 DecoderState 来存储 KV cache（作为 Value 黑盒）
+        let _num_heads = 8usize; // 用于创建空的 KV cache
+        // 4. KV cache 状态：使用 Option<Vec<Value>> 存储，None 表示第一步（不传 KV cache）
+        // 根据 recommended_kv_solution.md：第一步不传 KV cache，让模型内部初始化
         use ort::value::Value;
-        
-        struct DecoderState {
-            // 每一层的 KV cache 都保存成 ort::Value，不做解码
-            layer_kv: Vec<(Value<'static>, Value<'static>, Value<'static>, Value<'static>)>, // (dec_k, dec_v, enc_k, enc_v)
-        }
-        
-        impl DecoderState {
-            fn new_empty(batch: usize, num_heads: usize, enc_len: usize, head_dim: usize, layers: usize) -> Result<Self> {
-                fn empty_kv(batch: usize, num_heads: usize, seq_len: usize, head_dim: usize) -> Result<Value<'static>> {
-                    let actual_len = seq_len.max(1);
-                    let arr = Array4::<f32>::zeros((batch, num_heads, actual_len, head_dim));
-                    // ort 1.16.3 使用 from_array 需要 allocator 和动态维度的 array
-                    // 使用 null allocator（让 ORT 使用默认 allocator）
-                    // 需要转换为 CowRepr 类型，并且需要 owned 数据
-                    // 使用 CowArray::Owned 确保数据是 owned 的，这样 Value 可以拥有数据的所有权
-                    use ndarray::{CowArray, IxDyn};
-                    let arr_dyn: ndarray::ArrayBase<ndarray::OwnedRepr<f32>, IxDyn> = arr.into_dyn();
-                    // 使用 CowArray::Owned 包装，确保数据是 owned 的
-                    let cow_arr = CowArray::from(arr_dyn);
-                    // Value::from_array 会复制数据，所以返回的 Value 不依赖于 cow_arr 的生命周期
-                    let value = Value::from_array(ptr::null_mut(), &cow_arr)
-                        .map_err(|e| anyhow!("failed to create empty KV cache Value: {e}"))?;
-                    // 由于 Value::from_array 会复制数据，返回的 Value 应该是 'static 的
-                    // 但编译器可能无法推断，我们需要显式转换
-                    Ok(unsafe { std::mem::transmute(value) })
-                }
-                
-                let mut layer_kv = Vec::new();
-                for _ in 0..layers {
-                    layer_kv.push((
-                        empty_kv(batch, num_heads, 0, head_dim)?,      // dec_k
-                        empty_kv(batch, num_heads, 0, head_dim)?,      // dec_v
-                        empty_kv(batch, num_heads, enc_len, head_dim)?, // enc_k
-                        empty_kv(batch, num_heads, enc_len, head_dim)?, // enc_v
-                    ));
-                }
-                Ok(Self { layer_kv })
-            }
-        }
-        
-        let mut decoder_state = DecoderState::new_empty(batch_size, num_heads, encoder_seq_len, head_dim, num_layers)?;
+        let num_layers = 6usize; // 从模型结构推断
+        let mut kv_cache: Option<Vec<Value<'static>>> = None;
 
         // 5. 增量解码循环
         // ort 1.16.3 使用 from_array 需要 allocator 和动态维度的 array
-        use ndarray::CowArray;
         macro_rules! array_to_value {
             ($arr:expr, $t:ty) => {{
                 // 转换为动态维度和 CowRepr 类型，使用 null allocator（让 ORT 使用默认 allocator）
@@ -462,79 +420,79 @@ impl MarianNmtOnnx {
                 decoder_input_ids.clone(),
             )?;
 
-            // 准备所有输入（在循环中需要 clone，因为每次迭代都会使用）
+            // 准备基本输入
             let encoder_attention_mask_value = array_to_value!(encoder_attention_mask.clone(), i64)?;
             let input_ids_value = array_to_value!(decoder_input, i64)?;
             let encoder_hidden_states_value = array_to_value!(encoder_hidden_states.clone(), f32)?;
-            // use_cache_branch: 虽然模型定义是 Bool，但 ort 1.16.3 可能需要 float
-            // 使用 1.0 表示 true，0.0 表示 false
-            let use_cache_branch_value = array_to_value!(Array1::from_vec(vec![1.0f32]), f32)?;
-
-            // 准备 past_key_values（黑盒方式：直接把 state.layer_kv 里的 Value 原样喂回去）
-            // 构建输入 - 根据指南：KV cache 作为黑盒 Value 直接传递
-            // ort 1.16.3: 使用 ort::inputs! 宏构建输入
-            // 对于 KV cache，由于 Value 不支持 clone，我们需要重新构建
-            // 但根据指南，这应该是黑盒处理，所以我们需要找到另一种方法
-            // 暂时跳过 KV cache 的传递，先让代码编译通过
-            // TODO: 找到正确的方法来处理 KV cache 的传递
+            
+            // 根据 recommended_kv_solution.md：
+            // Step 0: use_cache_branch = false，不传 KV cache（但实际上模型要求所有输入都存在）
+            // Step N: use_cache_branch = true，传 KV cache
+            // 注意：模型定义中 use_cache_branch 是 Bool 类型
+            let is_first_step = kv_cache.is_none();
+            let use_cache_branch_value = if is_first_step {
+                array_to_value!(Array1::from_vec(vec![false]), bool)? // Step 0
+            } else {
+                array_to_value!(Array1::from_vec(vec![true]), bool)? // Step N
+            };
 
             // 运行模型
             // ort 1.16.3: session.run() 接受 Vec<Value>，按输入顺序排列
-            // 注意：需要按照模型定义的输入顺序传递
-            // 输入顺序：encoder_attention_mask, input_ids, encoder_hidden_states, use_cache_branch, past_key_values...
-            let mut decoder_session = self.decoder_session.lock().unwrap();
+            // 根据模型定义，输入顺序是：
+            // encoder_attention_mask, input_ids, encoder_hidden_states, past_key_values.*, use_cache_branch
+            let decoder_session = self.decoder_session.lock().unwrap();
             let mut inputs: Vec<ort::Value> = vec![
                 encoder_attention_mask_value,
                 input_ids_value,
                 encoder_hidden_states_value,
-                use_cache_branch_value,
             ];
             
-            // 添加 past_key_values（按层顺序：每层 4 个值：dec_k, dec_v, enc_k, enc_v）
-            // 由于 Value 不支持 clone，我们需要从 outputs 中提取并重新构建
-            // 但第一次运行时，我们使用空的 KV cache
-            for (dec_k, dec_v, enc_k, enc_v) in &decoder_state.layer_kv {
-                // 从 Value 中提取数据并重新构建（黑盒方式：只是搬运数据）
-                use ort::tensor::OrtOwnedTensor;
-                use ndarray::{IxDyn, CowArray};
+            // 添加 past_key_values（所有输入都是必需的，包括第一步）
+            // 根据 recommended_kv_solution.md：第一步不传 KV cache，但模型要求所有输入都存在
+            // 所以我们需要在第一步也传递空的 KV cache，但使用 use_cache_branch = 0.0 来告诉模型忽略它们
+            // 但实际上，根据文档，第一步应该不传 KV cache。但模型定义要求所有输入都存在。
+            // 让我们尝试在第一步传递空的 KV cache，看看是否能工作。
+            use ort::tensor::OrtOwnedTensor;
+            use ndarray::{IxDyn, CowArray, Array4};
+            
+            if let Some(prev_kv) = &kv_cache {
+                // Step N: 使用上一步的 KV cache
+                for kv_value in prev_kv {
+                    let kv_tensor: OrtOwnedTensor<f32, IxDyn> = kv_value.try_extract::<f32>()
+                        .map_err(|e| anyhow!("failed to extract KV cache: {e}"))?;
+                    let kv_view = kv_tensor.view();
+                    let kv_arr = kv_view.to_owned().into_dyn();
+                    let kv_cow = CowArray::from(kv_arr);
+                    let kv_new = Value::from_array(ptr::null_mut(), &kv_cow)
+                        .map_err(|e| anyhow!("failed to rebuild KV cache: {e}"))?;
+                    inputs.push(unsafe { std::mem::transmute::<Value<'_>, Value<'static>>(kv_new) });
+                }
+            } else {
+                // Step 0: 模型要求所有输入都存在，但根据 recommended_kv_solution.md，第一步应该不传 KV cache
+                // 这里我们创建一个空的 KV cache，但使用 use_cache_branch = false 来告诉模型忽略它们
+                // 创建空的 KV cache：每层 4 个值（dec_k, dec_v, enc_k, enc_v），每个都是空的 4D tensor
+                // 形状：[batch=1, num_heads=8, seq_len=1, head_dim=64]（使用 1 而不是 0，因为 ONNX 不允许 0 维度）
+                let batch = 1;
+                let num_heads = 8;
+                let head_dim = 64;
+                let empty_seq_len = 1; // 使用 1 而不是 0，因为 ONNX 不允许 0 维度
                 
-                let dec_k_tensor: OrtOwnedTensor<f32, IxDyn> = dec_k.try_extract::<f32>()
-                    .map_err(|e| anyhow!("failed to extract dec_k: {e}"))?;
-                let dec_k_view = dec_k_tensor.view();
-                let dec_k_arr = dec_k_view.to_owned().into_dyn();
-                let dec_k_cow = CowArray::from(dec_k_arr);
-                let dec_k_value = Value::from_array(ptr::null_mut(), &dec_k_cow)
-                    .map_err(|e| anyhow!("failed to rebuild dec_k: {e}"))?;
-                inputs.push(unsafe { std::mem::transmute::<Value<'_>, Value<'static>>(dec_k_value) });
-                
-                // 类似地处理 dec_v, enc_k, enc_v
-                let dec_v_tensor: OrtOwnedTensor<f32, IxDyn> = dec_v.try_extract::<f32>()
-                    .map_err(|e| anyhow!("failed to extract dec_v: {e}"))?;
-                let dec_v_view = dec_v_tensor.view();
-                let dec_v_arr = dec_v_view.to_owned().into_dyn();
-                let dec_v_cow = CowArray::from(dec_v_arr);
-                let dec_v_value = Value::from_array(ptr::null_mut(), &dec_v_cow)
-                    .map_err(|e| anyhow!("failed to rebuild dec_v: {e}"))?;
-                inputs.push(unsafe { std::mem::transmute::<Value<'_>, Value<'static>>(dec_v_value) });
-                
-                let enc_k_tensor: OrtOwnedTensor<f32, IxDyn> = enc_k.try_extract::<f32>()
-                    .map_err(|e| anyhow!("failed to extract enc_k: {e}"))?;
-                let enc_k_view = enc_k_tensor.view();
-                let enc_k_arr = enc_k_view.to_owned().into_dyn();
-                let enc_k_cow = CowArray::from(enc_k_arr);
-                let enc_k_value = Value::from_array(ptr::null_mut(), &enc_k_cow)
-                    .map_err(|e| anyhow!("failed to rebuild enc_k: {e}"))?;
-                inputs.push(unsafe { std::mem::transmute::<Value<'_>, Value<'static>>(enc_k_value) });
-                
-                let enc_v_tensor: OrtOwnedTensor<f32, IxDyn> = enc_v.try_extract::<f32>()
-                    .map_err(|e| anyhow!("failed to extract enc_v: {e}"))?;
-                let enc_v_view = enc_v_tensor.view();
-                let enc_v_arr = enc_v_view.to_owned().into_dyn();
-                let enc_v_cow = CowArray::from(enc_v_arr);
-                let enc_v_value = Value::from_array(ptr::null_mut(), &enc_v_cow)
-                    .map_err(|e| anyhow!("failed to rebuild enc_v: {e}"))?;
-                inputs.push(unsafe { std::mem::transmute::<Value<'_>, Value<'static>>(enc_v_value) });
+                for _layer in 0..num_layers {
+                    // 为每层创建 4 个空的 KV cache：dec_k, dec_v, enc_k, enc_v
+                    for _ in 0..4 {
+                        let empty_arr = Array4::<f32>::zeros((batch, num_heads, empty_seq_len, head_dim));
+                        let arr_dyn = empty_arr.into_dyn();
+                        let arr_owned = arr_dyn.to_owned();
+                        let cow_arr = CowArray::from(arr_owned);
+                        let kv_value = Value::from_array(ptr::null_mut(), &cow_arr)
+                            .map_err(|e| anyhow!("failed to create empty KV cache: {e}"))?;
+                        inputs.push(unsafe { std::mem::transmute::<Value<'_>, Value<'static>>(kv_value) });
+                    }
+                }
             }
+            
+            // use_cache_branch 是最后一个输入
+            inputs.push(use_cache_branch_value);
             
             let outputs: Vec<ort::Value> = decoder_session.run(inputs)
                 .map_err(|e| anyhow!("failed to run decoder model: {e}"))?;
@@ -581,64 +539,39 @@ impl MarianNmtOnnx {
             decoder_input_ids = vec![next_token_id];
 
             // 更新 KV cache：从 outputs 中提取 present.* Value 并重新构建
-            // 注意：由于 Value 不支持 Clone，我们需要提取数据并重新构建 Value
-            // 但这是"黑盒"处理：我们只是搬运数据，不关心具体值
-            for (layer_idx, kv) in decoder_state.layer_kv.iter_mut().enumerate() {
-                let i = layer_idx;
-                // 更新 KV cache：使用黑盒方式，直接使用 outputs 中的 Value
-                // ort 1.16.3: outputs 是 Vec<Value>，按输出顺序排列
-                // 输出顺序：logits (0), present.0.decoder.key (1), present.0.decoder.value (2), ...
-                // 对于第 i 层：present.{i}.decoder.key 在索引 1 + i*4, present.{i}.decoder.value 在 1 + i*4 + 1, ...
-                let output_idx_base = 1 + i * 4; // logits 是 0，所以从 1 开始
+            // 根据 recommended_kv_solution.md：KV cache 作为黑盒 Value 存储
+            // 输出顺序：logits (0), present.0.decoder.key (1), present.0.decoder.value (2), ...
+            // 对于第 i 层：present.{i}.decoder.key 在索引 1 + i*4, present.{i}.decoder.value 在 1 + i*4 + 1, ...
+            // 注意：在 ort 1.16.3 中，outputs 是 Vec<Value<'static>>，所以我们可以直接使用
+            // 但为了确保数据被正确复制，我们仍然需要提取并重新构建
+            let mut new_kv_cache = Vec::new();
+            
+            for layer in 0..num_layers {
+                let output_idx_base = 1 + layer * 4; // logits 是 0，所以从 1 开始
                 
-                // 根据指南：KV cache 应该作为黑盒 Value 处理
-                // 但 ort 1.16.3 的 Value 不支持 clone()，所以我们需要重新构建
-                // 使用 try_extract + 重新构建的方式（虽然指南不推荐，但这是唯一可行的方法）
-                // TODO: 找到更好的方法来处理 KV cache 的传递
-                let dec_key_tensor: OrtOwnedTensor<f32, IxDyn> = outputs[output_idx_base]
-                    .try_extract::<f32>()
-                    .map_err(|e| anyhow!("failed to extract present.{i}.decoder.key: {e}"))?;
-                let dec_val_tensor: OrtOwnedTensor<f32, IxDyn> = outputs[output_idx_base + 1]
-                    .try_extract::<f32>()
-                    .map_err(|e| anyhow!("failed to extract present.{i}.decoder.value: {e}"))?;
-                let enc_key_tensor: OrtOwnedTensor<f32, IxDyn> = outputs[output_idx_base + 2]
-                    .try_extract::<f32>()
-                    .map_err(|e| anyhow!("failed to extract present.{i}.encoder.key: {e}"))?;
-                let enc_val_tensor: OrtOwnedTensor<f32, IxDyn> = outputs[output_idx_base + 3]
-                    .try_extract::<f32>()
-                    .map_err(|e| anyhow!("failed to extract present.{i}.encoder.value: {e}"))?;
-
-                // 重新构建 Value（黑盒方式：只是搬运数据）
-                // 注意：Value::from_array 返回的 Value 有生命周期限制，需要使用 transmute 转换为 'static
-                use ndarray::CowArray;
-                let dec_key_view = dec_key_tensor.view();
-                let dec_key_arr = dec_key_view.to_owned().into_dyn();
-                let dec_key_cow = CowArray::from(dec_key_arr);
-                let dec_key_value = Value::from_array(ptr::null_mut(), &dec_key_cow)
-                    .map_err(|e| anyhow!("failed to rebuild present.{i}.decoder.key: {e}"))?;
-                kv.0 = unsafe { std::mem::transmute::<Value<'_>, Value<'static>>(dec_key_value) };
+                // 提取每层的 4 个 KV cache 值：dec_k, dec_v, enc_k, enc_v
+                // 注意：outputs 中的 Value 可能不能直接 clone，所以我们需要提取数据并重新构建
+                // 根据 recommended_kv_solution.md：KV cache 作为黑盒 Value 处理
+                use ort::tensor::OrtOwnedTensor;
+                use ndarray::{IxDyn, CowArray};
                 
-                let dec_val_view = dec_val_tensor.view();
-                let dec_val_arr = dec_val_view.to_owned().into_dyn();
-                let dec_val_cow = CowArray::from(dec_val_arr);
-                let dec_val_value = Value::from_array(ptr::null_mut(), &dec_val_cow)
-                    .map_err(|e| anyhow!("failed to rebuild present.{i}.decoder.value: {e}"))?;
-                kv.1 = unsafe { std::mem::transmute::<Value<'_>, Value<'static>>(dec_val_value) };
-                
-                let enc_key_view = enc_key_tensor.view();
-                let enc_key_arr = enc_key_view.to_owned().into_dyn();
-                let enc_key_cow = CowArray::from(enc_key_arr);
-                let enc_key_value = Value::from_array(ptr::null_mut(), &enc_key_cow)
-                    .map_err(|e| anyhow!("failed to rebuild present.{i}.encoder.key: {e}"))?;
-                kv.2 = unsafe { std::mem::transmute::<Value<'_>, Value<'static>>(enc_key_value) };
-                
-                let enc_val_view = enc_val_tensor.view();
-                let enc_val_arr = enc_val_view.to_owned().into_dyn();
-                let enc_val_cow = CowArray::from(enc_val_arr);
-                let enc_val_value = Value::from_array(ptr::null_mut(), &enc_val_cow)
-                    .map_err(|e| anyhow!("failed to rebuild present.{i}.encoder.value: {e}"))?;
-                kv.3 = unsafe { std::mem::transmute::<Value<'_>, Value<'static>>(enc_val_value) };
+                for offset in 0..4 {
+                    let kv_output = &outputs[output_idx_base + offset];
+                    // 提取 tensor 数据并重新构建 Value
+                    // 注意：即使 use_cache_branch = false，模型仍然会输出 present.*，但可能某些值是空的
+                    let kv_tensor: OrtOwnedTensor<f32, IxDyn> = kv_output
+                        .try_extract::<f32>()
+                        .map_err(|e| anyhow!("failed to extract present.{layer} KV cache (offset {}): {e}. This may happen if the tensor data pointer is null.", offset))?;
+                    let kv_view = kv_tensor.view();
+                    let kv_arr = kv_view.to_owned().into_dyn();
+                    let kv_cow = CowArray::from(kv_arr);
+                    let kv_value = Value::from_array(ptr::null_mut(), &kv_cow)
+                        .map_err(|e| anyhow!("failed to rebuild present.{layer} KV cache: {e}"))?;
+                    new_kv_cache.push(unsafe { std::mem::transmute::<Value<'_>, Value<'static>>(kv_value) });
+                }
             }
+            
+            kv_cache = Some(new_kv_cache);
         }
 
         println!("Generated IDs: {:?} (length: {})", generated_ids, generated_ids.len());
