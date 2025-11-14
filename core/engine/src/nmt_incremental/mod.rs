@@ -9,7 +9,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use ort::session::Session;
-use ndarray::{Array1, Array2, Array3, Array4};
+use ort::tensor::OrtOwnedTensor;
+use ndarray::{Array1, Array2, Array3, Array4, ArrayViewD, IxDyn, Ix3, Ix4};
 
 mod tokenizer;
 mod language_pair;
@@ -205,12 +206,13 @@ impl MarianNmtOnnx {
         std::env::set_current_dir(&model_dir)
             .map_err(|e| anyhow!("failed to change to model directory: {e}"))?;
 
-        let encoder_builder = Session::builder()
-            .map_err(|e| anyhow!("failed to create encoder Session builder: {e}"))?;
-
-        let encoder_session = encoder_builder
-            .commit_from_memory(&encoder_bytes)
-            .map_err(|e| anyhow!("failed to load encoder ONNX model: {e}"))?;
+        // ort 1.16.3: 使用 SessionBuilder 创建 session
+        use ort::SessionBuilder;
+        let encoder_session: Session = SessionBuilder::new()
+            .map_err(|e| anyhow!("failed to create encoder Session builder: {e}"))?
+            .with_model_from_memory(&encoder_bytes)
+            .map_err(|e| anyhow!("failed to load encoder ONNX model: {e}"))?
+            .into();
 
         // 恢复工作目录
         std::env::set_current_dir(&current_dir)
@@ -222,12 +224,12 @@ impl MarianNmtOnnx {
         let decoder_bytes = fs::read(&model_path)
             .map_err(|e| anyhow!("failed to read model.onnx (decoder): {e}"))?;
 
-        let decoder_builder = Session::builder()
-            .map_err(|e| anyhow!("failed to create decoder Session builder: {e}"))?;
-
-        let decoder_session = decoder_builder
-            .commit_from_memory(&decoder_bytes)
-            .map_err(|e| anyhow!("failed to load decoder ONNX model from {}: {e}", model_path.display()))?;
+        // ort 1.16.3: 使用 SessionBuilder 创建 session
+        let decoder_session: Session = SessionBuilder::new()
+            .map_err(|e| anyhow!("failed to create decoder Session builder: {e}"))?
+            .with_model_from_memory(&decoder_bytes)
+            .map_err(|e| anyhow!("failed to load decoder ONNX model from {}: {e}", model_path.display()))?
+            .into();
 
         // 打印 decoder 模型的 I/O 信息
         println!("--- Decoder ONNX Model Inputs ---");
@@ -320,12 +322,15 @@ impl MarianNmtOnnx {
         let attention_mask: Array2<i64> = Array2::ones((batch_size, seq_len));
 
         // 转换为 ONNX Value
-        // ort 1.16.3 使用 from_array 需要 allocator 和 array
+        // ort 1.16.3 使用 from_array 需要 allocator 和 array（需要 CowRepr 类型）
         use std::ptr;
+        use ndarray::CowArray;
         macro_rules! array_to_value {
             ($arr:expr, $ty:ty) => {{
-                // 使用 null allocator（让 ORT 使用默认 allocator）
-                Value::from_array(ptr::null_mut(), &$arr)
+                // 转换为动态维度和 CowRepr 类型，使用 null allocator（让 ORT 使用默认 allocator）
+                let arr_dyn = $arr.into_dyn();
+                let cow_arr = CowArray::from(arr_dyn);
+                Value::from_array(ptr::null_mut(), &cow_arr)
                     .map_err(|e| anyhow!("failed to convert array to Value: {e}"))
             }};
         }
@@ -350,22 +355,15 @@ impl MarianNmtOnnx {
         // encoder 只有一个输出 last_hidden_state，索引为 0
         let hidden_states_value = &outputs[0];
 
-        // ort 1.16.3 使用 try_extract 返回 OrtOwnedTensor
-        let hidden_states_tensor = hidden_states_value
+        // ort 1.16.3: 使用 try_extract() + view() + into_dimensionality()
+        let tensor: OrtOwnedTensor<f32, IxDyn> = hidden_states_value
             .try_extract::<f32>()
             .map_err(|e| anyhow!("failed to extract encoder hidden states: {e}"))?;
-
-        // OrtOwnedTensor 需要手动提取 shape 和 data 来构建 Array3
-        // 先转换为 ArrayBase，然后手动提取数据
-        let tensor_array: ndarray::ArrayBase<ndarray::OwnedRepr<f32>, _> = hidden_states_tensor.into();
-        // 获取 shape 和 data
-        let shape = tensor_array.shape();
-        let data: Vec<f32> = tensor_array.iter().cloned().collect();
-        // 手动构建 Array3
-        let encoder_hidden_states = Array3::from_shape_vec(
-            (shape[0], shape[1], shape[2]),
-            data,
-        )?;
+        let view = tensor.view();
+        let encoder_hidden_states = view
+            .into_dimensionality::<Ix3>()
+            .map_err(|e| anyhow!("failed to convert to Array3: {e}"))?
+            .to_owned();
 
         Ok((encoder_hidden_states, attention_mask))
     }
@@ -480,37 +478,40 @@ impl MarianNmtOnnx {
                 let i = layer_idx;
                 
                 // 提取数据并重新构建 Value（黑盒：只是搬运数据）
-                // ort 1.16.3 使用 try_extract 返回 OrtOwnedTensor
-                let dec_k_tensor = dec_k
+                // ort 1.16.3: 使用 try_extract() + view() + into_dimensionality()
+                let dec_k_tensor: OrtOwnedTensor<f32, IxDyn> = dec_k
                     .try_extract::<f32>()
                     .map_err(|e| anyhow!("failed to extract past_key_values.{i}.decoder.key: {e}"))?;
-                let dec_v_tensor = dec_v
+                let dec_v_tensor: OrtOwnedTensor<f32, IxDyn> = dec_v
                     .try_extract::<f32>()
                     .map_err(|e| anyhow!("failed to extract past_key_values.{i}.decoder.value: {e}"))?;
-                let enc_k_tensor = enc_k
+                let enc_k_tensor: OrtOwnedTensor<f32, IxDyn> = enc_k
                     .try_extract::<f32>()
                     .map_err(|e| anyhow!("failed to extract past_key_values.{i}.encoder.key: {e}"))?;
-                let enc_v_tensor = enc_v
+                let enc_v_tensor: OrtOwnedTensor<f32, IxDyn> = enc_v
                     .try_extract::<f32>()
                     .map_err(|e| anyhow!("failed to extract past_key_values.{i}.encoder.value: {e}"))?;
 
-                // OrtOwnedTensor 实现了 Into<ArrayBase>，先转换为 ArrayBase
-                let dec_k_arr_dyn: ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::Dim<ndarray::IxDyn>> = dec_k_tensor.into();
-                let dec_k_arr = dec_k_arr_dyn
-                    .into_dimensionality::<ndarray::Ix4>()
-                    .map_err(|e| anyhow!("failed to convert dec_k to Array4: {e}"))?;
-                let dec_v_arr_dyn: ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::Dim<ndarray::IxDyn>> = dec_v_tensor.into();
-                let dec_v_arr = dec_v_arr_dyn
-                    .into_dimensionality::<ndarray::Ix4>()
-                    .map_err(|e| anyhow!("failed to convert dec_v to Array4: {e}"))?;
-                let enc_k_arr_dyn: ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::Dim<ndarray::IxDyn>> = enc_k_tensor.into();
-                let enc_k_arr = enc_k_arr_dyn
-                    .into_dimensionality::<ndarray::Ix4>()
-                    .map_err(|e| anyhow!("failed to convert enc_k to Array4: {e}"))?;
-                let enc_v_arr_dyn: ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::Dim<ndarray::IxDyn>> = enc_v_tensor.into();
-                let enc_v_arr = enc_v_arr_dyn
-                    .into_dimensionality::<ndarray::Ix4>()
-                    .map_err(|e| anyhow!("failed to convert enc_v to Array4: {e}"))?;
+                let dec_k_view = dec_k_tensor.view();
+                let dec_k_arr = dec_k_view
+                    .into_dimensionality::<Ix4>()
+                    .map_err(|e| anyhow!("failed to convert dec_k to Array4: {e}"))?
+                    .to_owned();
+                let dec_v_view = dec_v_tensor.view();
+                let dec_v_arr = dec_v_view
+                    .into_dimensionality::<Ix4>()
+                    .map_err(|e| anyhow!("failed to convert dec_v to Array4: {e}"))?
+                    .to_owned();
+                let enc_k_view = enc_k_tensor.view();
+                let enc_k_arr = enc_k_view
+                    .into_dimensionality::<Ix4>()
+                    .map_err(|e| anyhow!("failed to convert enc_k to Array4: {e}"))?
+                    .to_owned();
+                let enc_v_view = enc_v_tensor.view();
+                let enc_v_arr = enc_v_view
+                    .into_dimensionality::<Ix4>()
+                    .map_err(|e| anyhow!("failed to convert enc_v to Array4: {e}"))?
+                    .to_owned();
 
                 // 转换为动态维度和 CowRepr 类型
                 use ndarray::CowArray;
@@ -554,17 +555,16 @@ impl MarianNmtOnnx {
             // ort 1.16.3: 当使用手动构建的 inputs 时，outputs 是 Vec<Value>
             // 需要根据输出顺序访问，logits 是第一个输出（索引 0）
             let logits_value = &outputs[0];
-            // ort 1.16.3 使用 try_extract 返回 OrtOwnedTensor
-            let logits_tensor = logits_value
+            // ort 1.16.3: 使用 try_extract() + view() + into_dimensionality()
+            // logits shape: [batch, seq_len, vocab_size]
+            let tensor: OrtOwnedTensor<f32, IxDyn> = logits_value
                 .try_extract::<f32>()
                 .map_err(|e| anyhow!("failed to extract logits: {e}"))?;
-
-            // OrtOwnedTensor 实现了 Into<ArrayBase>，先转换为 ArrayBase
-            // logits shape: [batch, seq_len, vocab_size]
-            let logits_arr_dyn: ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::Dim<ndarray::IxDyn>> = logits_tensor.into();
-            let logits_arr = logits_arr_dyn
-                .into_dimensionality::<ndarray::Ix3>()
-                .map_err(|e| anyhow!("failed to convert logits to Array3: {e}"))?;
+            let view = tensor.view();
+            let logits_arr = view
+                .into_dimensionality::<Ix3>()
+                .map_err(|e| anyhow!("failed to convert logits to Array3: {e}"))?
+                .to_owned();
             
             // 取最后一个 token 的 logits
             let logits_shape = logits_arr.shape();
@@ -607,37 +607,40 @@ impl MarianNmtOnnx {
                 // 输出顺序：logits (0), present.0.decoder.key (1), present.0.decoder.value (2), ...
                 // 对于第 i 层：present.{i}.decoder.key 在索引 1 + i*4, present.{i}.decoder.value 在 1 + i*4 + 1, ...
                 let output_idx_base = 1 + i * 4; // logits 是 0，所以从 1 开始
-                // ort 1.16.3 使用 try_extract 返回 OrtOwnedTensor
-                let dec_key_tensor = outputs[output_idx_base]
+                // ort 1.16.3: 使用 try_extract() + view() + into_dimensionality()
+                let dec_key_tensor: OrtOwnedTensor<f32, IxDyn> = outputs[output_idx_base]
                     .try_extract::<f32>()
                     .map_err(|e| anyhow!("failed to extract present.{i}.decoder.key: {e}"))?;
-                let dec_val_tensor = outputs[output_idx_base + 1]
+                let dec_val_tensor: OrtOwnedTensor<f32, IxDyn> = outputs[output_idx_base + 1]
                     .try_extract::<f32>()
                     .map_err(|e| anyhow!("failed to extract present.{i}.decoder.value: {e}"))?;
-                let enc_key_tensor = outputs[output_idx_base + 2]
+                let enc_key_tensor: OrtOwnedTensor<f32, IxDyn> = outputs[output_idx_base + 2]
                     .try_extract::<f32>()
                     .map_err(|e| anyhow!("failed to extract present.{i}.encoder.key: {e}"))?;
-                let enc_val_tensor = outputs[output_idx_base + 3]
+                let enc_val_tensor: OrtOwnedTensor<f32, IxDyn> = outputs[output_idx_base + 3]
                     .try_extract::<f32>()
                     .map_err(|e| anyhow!("failed to extract present.{i}.encoder.value: {e}"))?;
 
-                // OrtOwnedTensor 实现了 Into<ArrayBase>，先转换为 ArrayBase
-                let dec_key_arr_dyn: ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::Dim<ndarray::IxDyn>> = dec_key_tensor.into();
-                let dec_key_arr = dec_key_arr_dyn
-                    .into_dimensionality::<ndarray::Ix4>()
-                    .map_err(|e| anyhow!("failed to convert dec_key to Array4: {e}"))?;
-                let dec_val_arr_dyn: ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::Dim<ndarray::IxDyn>> = dec_val_tensor.into();
-                let dec_val_arr = dec_val_arr_dyn
-                    .into_dimensionality::<ndarray::Ix4>()
-                    .map_err(|e| anyhow!("failed to convert dec_val to Array4: {e}"))?;
-                let enc_key_arr_dyn: ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::Dim<ndarray::IxDyn>> = enc_key_tensor.into();
-                let enc_key_arr = enc_key_arr_dyn
-                    .into_dimensionality::<ndarray::Ix4>()
-                    .map_err(|e| anyhow!("failed to convert enc_key to Array4: {e}"))?;
-                let enc_val_arr_dyn: ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::Dim<ndarray::IxDyn>> = enc_val_tensor.into();
-                let enc_val_arr = enc_val_arr_dyn
-                    .into_dimensionality::<ndarray::Ix4>()
-                    .map_err(|e| anyhow!("failed to convert enc_val to Array4: {e}"))?;
+                let dec_key_view = dec_key_tensor.view();
+                let dec_key_arr = dec_key_view
+                    .into_dimensionality::<Ix4>()
+                    .map_err(|e| anyhow!("failed to convert dec_key to Array4: {e}"))?
+                    .to_owned();
+                let dec_val_view = dec_val_tensor.view();
+                let dec_val_arr = dec_val_view
+                    .into_dimensionality::<Ix4>()
+                    .map_err(|e| anyhow!("failed to convert dec_val to Array4: {e}"))?
+                    .to_owned();
+                let enc_key_view = enc_key_tensor.view();
+                let enc_key_arr = enc_key_view
+                    .into_dimensionality::<Ix4>()
+                    .map_err(|e| anyhow!("failed to convert enc_key to Array4: {e}"))?
+                    .to_owned();
+                let enc_val_view = enc_val_tensor.view();
+                let enc_val_arr = enc_val_view
+                    .into_dimensionality::<Ix4>()
+                    .map_err(|e| anyhow!("failed to convert enc_val to Array4: {e}"))?
+                    .to_owned();
 
                 // 转换为动态维度和 CowRepr 类型
                 use ndarray::CowArray;
