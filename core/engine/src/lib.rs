@@ -14,7 +14,7 @@ pub mod vad;
 pub mod asr_streaming;
 pub mod onnx_utils;
 
-pub use bootstrap::{CoreEngine, CoreEngineBuilder};
+pub use bootstrap::{CoreEngine, CoreEngineBuilder, ProcessResult};
 pub use cache_manager::CacheManager;
 pub use config_manager::{ConfigManager, EngineConfig};
 pub use emotion_adapter::{EmotionAdapter, EmotionRequest, EmotionResponse};

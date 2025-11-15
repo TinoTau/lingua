@@ -1,18 +1,20 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::asr_streaming::AsrStreaming;
+use crate::asr_streaming::{AsrStreaming, AsrResult};
 use crate::asr_whisper::WhisperAsrStreaming;
 use crate::cache_manager::CacheManager;
 use crate::config_manager::ConfigManager;
 use crate::emotion_adapter::EmotionAdapter;
 use crate::error::{EngineError, EngineResult};
-use crate::event_bus::EventBus;
-use crate::nmt_incremental::{NmtIncremental, MarianNmtOnnx};
+use crate::event_bus::{EventBus, CoreEvent, EventTopic};
+use crate::nmt_incremental::{NmtIncremental, MarianNmtOnnx, TranslationRequest, TranslationResponse};
 use crate::persona_adapter::PersonaAdapter;
 use crate::telemetry::{TelemetryDatum, TelemetrySink};
 use crate::tts_streaming::TtsStreaming;
+use crate::types::{PartialTranscript, StableTranscript};
 use crate::vad::VoiceActivityDetector;
+use serde_json::json;
 
 
 pub struct CoreEngine {
@@ -196,6 +198,8 @@ impl CoreEngine {
         self.event_bus.start().await?;
         let config = self.config.load().await?;
         self.cache.warm_up().await?;
+        self.asr.initialize().await?;
+        self.nmt.initialize().await?;
         self.telemetry
             .record(TelemetryDatum {
                 name: "core_engine.boot".to_string(),
@@ -214,6 +218,8 @@ impl CoreEngine {
     }
 
     pub async fn shutdown(&self) -> EngineResult<()> {
+        self.asr.finalize().await?;
+        self.nmt.finalize().await?;
         self.tts.close().await?;
         self.cache.purge().await?;
         self.event_bus.stop().await?;
@@ -226,4 +232,203 @@ impl CoreEngine {
             .await?;
         Ok(())
     }
+
+    /// 处理音频帧（完整业务流程：VAD → ASR → NMT → 事件发布）
+    /// 
+    /// 流程：
+    /// 1. 通过 VAD 检测语音活动
+    /// 2. 如果检测到语音，累积到 ASR 缓冲区
+    /// 3. 如果检测到语音边界（is_boundary），触发 ASR 推理
+    /// 4. 如果 ASR 返回最终结果，自动触发 NMT 翻译
+    /// 5. 发布事件到 EventBus（ASR 部分结果、ASR 最终结果、翻译结果）
+    /// 
+    /// # Arguments
+    /// * `frame` - 音频帧
+    /// * `language_hint` - 语言提示（可选）
+    /// 
+    /// # Returns
+    /// 返回处理结果（包含 ASR 和 NMT 结果）
+    pub async fn process_audio_frame(
+        &self,
+        frame: crate::types::AudioFrame,
+        language_hint: Option<String>,
+    ) -> EngineResult<Option<ProcessResult>> {
+        // 1. 通过 VAD 检测语音活动
+        let vad_result = self.vad.detect(frame).await?;
+
+        // 2. 累积音频帧到 ASR 缓冲区
+        // 尝试将 ASR 转换为 WhisperAsrStreaming
+        let asr_ptr = Arc::as_ptr(&self.asr);
+        let whisper_asr_ptr = asr_ptr as *const WhisperAsrStreaming;
+        
+        unsafe {
+            let whisper_asr_ref = whisper_asr_ptr.as_ref();
+            if let Some(whisper_asr) = whisper_asr_ref {
+                // 累积帧
+                whisper_asr.accumulate_frame(vad_result.frame.clone())?;
+                
+                // 3. 如果检测到语音边界，触发 ASR 推理（返回最终结果）
+                if vad_result.is_boundary {
+                    let asr_result = whisper_asr.infer_on_boundary().await?;
+                    
+                    // 4. 发布 ASR 最终结果事件
+                    if let Some(ref final_transcript) = asr_result.final_transcript {
+                        self.publish_asr_final_event(final_transcript, vad_result.frame.timestamp_ms).await?;
+                    }
+                    
+                    // 5. 如果 ASR 返回最终结果，自动触发 NMT 翻译
+                    let translation_result = if let Some(ref final_transcript) = asr_result.final_transcript {
+                        self.translate_and_publish(final_transcript, vad_result.frame.timestamp_ms).await.ok()
+                    } else {
+                        None
+                    };
+                    
+                    return Ok(Some(ProcessResult {
+                        asr: asr_result,
+                        translation: translation_result,
+                    }));
+                } else {
+                    // 未检测到边界，检查是否需要输出部分结果（如果启用流式推理）
+                    if whisper_asr.is_streaming_enabled() {
+                        if let Some(partial) = whisper_asr.infer_partial(vad_result.frame.timestamp_ms).await? {
+                            // 发布 ASR 部分结果事件
+                            self.publish_asr_partial_event(&partial, vad_result.frame.timestamp_ms).await?;
+                            
+                            return Ok(Some(ProcessResult {
+                                asr: AsrResult {
+                                    partial: Some(partial),
+                                    final_transcript: None,
+                                },
+                                translation: None,
+                            }));
+                        }
+                    }
+                    // 不需要输出部分结果，返回 None
+                    return Ok(None);
+                }
+            } else {
+                // 如果不是 WhisperAsrStreaming，使用原来的 infer 方法
+                let frame_timestamp = vad_result.frame.timestamp_ms;
+                let asr_result = self.asr.infer(crate::asr_streaming::AsrRequest {
+                    frame: vad_result.frame,
+                    language_hint: language_hint.clone(),
+                }).await?;
+                
+                // 如果检测到边界且有最终结果，触发翻译
+                if vad_result.is_boundary {
+                    if let Some(ref final_transcript) = asr_result.final_transcript {
+                        self.publish_asr_final_event(final_transcript, frame_timestamp).await?;
+                        let translation_result = self.translate_and_publish(final_transcript, frame_timestamp).await.ok();
+                        return Ok(Some(ProcessResult {
+                            asr: asr_result,
+                            translation: translation_result,
+                        }));
+                    }
+                }
+                
+                // 如果有部分结果，发布事件
+                if let Some(ref partial) = asr_result.partial {
+                    self.publish_asr_partial_event(partial, frame_timestamp).await?;
+                }
+                
+                return Ok(Some(ProcessResult {
+                    asr: asr_result,
+                    translation: None,
+                }));
+            }
+        }
+    }
+
+    /// 翻译并发布事件
+    async fn translate_and_publish(
+        &self,
+        transcript: &StableTranscript,
+        timestamp_ms: u64,
+    ) -> EngineResult<TranslationResponse> {
+        // 1. 获取目标语言（从配置中）
+        let config = self.config.current().await?;
+        let target_language = config.target_language.clone();
+        
+        // 2. 构造翻译请求
+        let translation_request = TranslationRequest {
+            transcript: PartialTranscript {
+                text: transcript.text.clone(),
+                confidence: 1.0,  // 最终转录的置信度
+                is_final: true,
+            },
+            target_language,
+            wait_k: None,
+        };
+        
+        // 3. 执行翻译
+        let translation_response = self.nmt.translate(translation_request).await?;
+        
+        // 4. 发布翻译事件
+        self.publish_translation_event(&translation_response, timestamp_ms).await?;
+        
+        Ok(translation_response)
+    }
+
+    /// 发布 ASR 部分结果事件
+    async fn publish_asr_partial_event(
+        &self,
+        partial: &PartialTranscript,
+        timestamp_ms: u64,
+    ) -> EngineResult<()> {
+        let event = CoreEvent {
+            topic: EventTopic("AsrPartial".to_string()),
+            payload: json!({
+                "text": partial.text,
+                "confidence": partial.confidence,
+                "is_final": partial.is_final,
+            }),
+            timestamp_ms,
+        };
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
+
+    /// 发布 ASR 最终结果事件
+    async fn publish_asr_final_event(
+        &self,
+        final_transcript: &StableTranscript,
+        timestamp_ms: u64,
+    ) -> EngineResult<()> {
+        let event = CoreEvent {
+            topic: EventTopic("AsrFinal".to_string()),
+            payload: json!({
+                "text": final_transcript.text,
+                "speaker_id": final_transcript.speaker_id,
+                "language": final_transcript.language,
+            }),
+            timestamp_ms,
+        };
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
+
+    /// 发布翻译事件
+    async fn publish_translation_event(
+        &self,
+        translation: &TranslationResponse,
+        timestamp_ms: u64,
+    ) -> EngineResult<()> {
+        let event = CoreEvent {
+            topic: EventTopic("Translation".to_string()),
+            payload: json!({
+                "translated_text": translation.translated_text,
+                "is_stable": translation.is_stable,
+            }),
+            timestamp_ms,
+        };
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
+}
+
+/// 处理结果（包含 ASR 和 NMT 结果）
+#[derive(Debug, Clone)]
+pub struct ProcessResult {
+    pub asr: AsrResult,
+    pub translation: Option<TranslationResponse>,
 }
