@@ -546,10 +546,11 @@ impl MarianNmtOnnx {
             .slice(ndarray::s![0, seq_len - 1, ..])
             .to_owned(); // 已经是 Array1<f32>
 
-        // KV cache：Workaround 模式下，不再从输出中提取 KV cache
-        // 直接跳过所有 present.* 输出，不保存它们
+        // KV cache：处理 present.* 输出
+        // 关键：即使第一步 use_cache_branch=false，模型仍然会输出 present.*
+        // 我们需要提取这些输出，以便在后续步骤中使用
         if state.use_cache_branch {
-            // 正常模式：提取 KV cache（但 workaround 模式下不会走到这里）
+            // 正常模式（第二步及以后）：提取 KV cache 供下一步使用
             let mut next_kv: Vec<[Value<'static>; 4]> = Vec::with_capacity(Self::NUM_LAYERS);
             for _layer in 0..Self::NUM_LAYERS {
                 let dec_k = iter.next().expect("missing present.*.decoder.key");
@@ -559,9 +560,27 @@ impl MarianNmtOnnx {
                 next_kv.push([dec_k, dec_v, enc_k, enc_v]);
             }
             state.kv_cache = Some(next_kv);
-            state.use_cache_branch = true;
+            state.use_cache_branch = true;  // 保持启用状态
         } else {
-            // Workaround 模式：跳过所有 present.* 输出，不保存 KV cache
+            // 第一步（use_cache_branch=false）：提取 KV cache 供下一步使用
+            // 关键：即使 use_cache_branch=false，模型也会输出 present.*
+            // 我们可以提取这些输出，以便在后续步骤中使用 KV cache（正常模式）
+            // 或者跳过它们，继续使用完整序列（workaround 模式）
+            
+            // 当前使用 workaround 模式：跳过 KV cache，避免 Reshape 错误
+            // 如果将来要启用 KV cache，可以改为提取并保存：
+            // let mut next_kv: Vec<[Value<'static>; 4]> = Vec::with_capacity(Self::NUM_LAYERS);
+            // for _layer in 0..Self::NUM_LAYERS {
+            //     let dec_k = iter.next().expect("missing present.*.decoder.key");
+            //     let dec_v = iter.next().expect("missing present.*.decoder.value");
+            //     let enc_k = iter.next().expect("missing present.*.encoder.key");
+            //     let enc_v = iter.next().expect("missing present.*.encoder.value");
+            //     next_kv.push([dec_k, dec_v, enc_k, enc_v]);
+            // }
+            // state.kv_cache = Some(next_kv);
+            // state.use_cache_branch = true;  // 下一步启用 KV cache
+            
+            // Workaround 模式：跳过所有 present.* 输出
             for _layer in 0..Self::NUM_LAYERS {
                 iter.next(); // decoder.key
                 iter.next(); // decoder.value
@@ -569,7 +588,7 @@ impl MarianNmtOnnx {
                 iter.next(); // encoder.value
             }
             state.kv_cache = None;
-            state.use_cache_branch = false;
+            state.use_cache_branch = false;  // 保持 workaround 模式
         }
 
         // 返回 state（保持 generated_ids 不变，因为我们在 translate() 中管理它）
@@ -597,30 +616,48 @@ impl MarianNmtOnnx {
         let (encoder_hidden_states, encoder_attention_mask) = self.run_encoder(&source_ids)?;
         println!("Encoder output shape: {:?}", encoder_hidden_states.shape());
 
-        // 3. 初始化 DecoderState（Workaround: 禁用 KV cache，使用完整序列解码）
+        // 3. 初始化 DecoderState
+        // 第一步：不使用 KV cache，input_ids 只包含 BOS token
         let mut state = DecoderState {
             input_ids: vec![self.decoder_start_token_id],
             generated_ids: vec![self.decoder_start_token_id],  // 一开始就包含 BOS
             kv_cache: None,
-            use_cache_branch: false,  // 始终禁用 KV 分支
+            use_cache_branch: false,  // 第一步：禁用 KV 分支
         };
 
-        // 4. 进入解码循环（Workaround: 每一步都用完整历史序列解码）
+        // 4. 进入解码循环
         let max_steps = self.max_length.min(128); // 限制最大步数
 
         for step in 0..max_steps {
-            // 每一步都用完整历史序列解码
-            let current_generated_ids = state.generated_ids.clone();
-            let current_state = DecoderState {
-                input_ids: current_generated_ids.clone(),  // 使用完整历史序列
-                generated_ids: current_generated_ids.clone(),
-                kv_cache: None,           // 关键：不携带历史 KV
-                use_cache_branch: false,  // 关键：每一步都禁用 KV 分支
+            // 准备当前步骤的 state
+            // 关键：如果使用 KV cache，input_ids 应该只包含新 token（单个 token）
+            // 如果不使用 KV cache（workaround），input_ids 包含完整历史序列
+            let current_state = if state.use_cache_branch && state.kv_cache.is_some() {
+                // 正常模式（使用 KV cache）：只输入新 token
+                // 注意：这里应该使用上一步生成的最后一个 token
+                let last_token = state.generated_ids.last().copied().unwrap_or(self.decoder_start_token_id);
+                DecoderState {
+                    input_ids: vec![last_token],  // 关键：只包含新 token
+                    generated_ids: state.generated_ids.clone(),
+                    kv_cache: state.kv_cache.take(),  // 使用历史 KV cache
+                    use_cache_branch: true,  // 启用 KV 分支
+                }
+            } else {
+                // Workaround 模式（不使用 KV cache）：使用完整历史序列
+                let current_generated_ids = state.generated_ids.clone();
+                DecoderState {
+                    input_ids: current_generated_ids.clone(),  // 使用完整历史序列
+                    generated_ids: current_generated_ids.clone(),
+                    kv_cache: None,           // 不携带历史 KV
+                    use_cache_branch: false,  // 禁用 KV 分支
+                }
             };
             
-            println!("[DEBUG] Step {}: decoder_input_ids={:?} (length: {})", step, current_state.input_ids, current_state.input_ids.len());
+            println!("[DEBUG] Step {}: decoder_input_ids={:?} (length: {}), use_cache_branch={}, has_kv_cache={}", 
+                step, current_state.input_ids, current_state.input_ids.len(), 
+                current_state.use_cache_branch, current_state.kv_cache.is_some());
             
-            let (logits, _next_state) = self.decoder_step(
+            let (logits, next_state) = self.decoder_step(
                 &encoder_hidden_states,
                 &encoder_attention_mask,
                 current_state,
@@ -643,8 +680,10 @@ impl MarianNmtOnnx {
                 break;
             }
 
-            // 更新 state 的 generated_ids
+            // 更新 state：添加新 token，并保存 KV cache（如果返回了）
             state.generated_ids.push(next_token_id);
+            state.kv_cache = next_state.kv_cache;  // 保存 KV cache 供下一步使用
+            state.use_cache_branch = next_state.use_cache_branch;  // 更新 use_cache_branch 状态
         }
 
         println!("[NMT][translate] Generated IDs: {:?} (length: {})", state.generated_ids, state.generated_ids.len());
@@ -658,5 +697,40 @@ impl MarianNmtOnnx {
         println!("[NMT][translate] Translated text: '{}'", translated_text);
 
         Ok(translated_text)
+    }
+}
+
+/// 为 MarianNmtOnnx 实现 NmtIncremental trait
+#[async_trait]
+impl NmtIncremental for MarianNmtOnnx {
+    async fn initialize(&self) -> EngineResult<()> {
+        // ONNX 模型在 new_from_dir 时已经加载，这里只需要验证
+        // 可以尝试运行一个简单的翻译来验证模型是否正常工作
+        Ok(())
+    }
+
+    async fn translate(&self, request: TranslationRequest) -> EngineResult<TranslationResponse> {
+        // 从 TranslationRequest 中提取源文本
+        let source_text = request.transcript.text.clone();
+        
+        // 由于 self.translate() 是同步方法，但 trait 要求是 async，
+        // 我们直接调用同步方法（虽然会阻塞当前任务，但对于翻译这种 CPU 密集型操作是合理的）
+        let translated = self.translate(&source_text)
+            .map_err(|e| {
+                // 将 anyhow::Error 转换为 EngineError
+                // String 可以转换为 Cow<'static, str>
+                let error_msg = format!("Translation failed: {}", e);
+                EngineError::new(error_msg)
+            })?;
+
+        Ok(TranslationResponse {
+            translated_text: translated,
+            is_stable: request.wait_k.is_none() || request.wait_k == Some(0),
+        })
+    }
+
+    async fn finalize(&self) -> EngineResult<()> {
+        // ONNX 会话会在对象销毁时自动清理
+        Ok(())
     }
 }

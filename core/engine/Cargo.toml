@@ -17,3 +17,7 @@ anyhow = "1"
 ort = { version = "1.16.3", default-features = false, features = ["download-binaries"] }
 
 ndarray = "0.15"
+
+# Whisper ASR 支持
+whisper-rs = "0.15.1"
+hound = "3.5"  # WAV 文件读取

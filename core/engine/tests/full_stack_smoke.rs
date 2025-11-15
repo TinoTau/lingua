@@ -105,13 +105,13 @@ fn test_fullstack_nmt_marian_stub_hello_world() {
     );
 }
 
-/// 3. CoreEngineBuilder：检查默认的 Marian NMT stub wiring 是否正常。
+/// 3. CoreEngineBuilder：检查默认的 Marian NMT ONNX wiring 是否正常。
 #[test]
 fn test_fullstack_core_engine_builder_nmt_wiring() {
     // 这里只测试 NMT wiring，不构造完整 CoreEngine（因为其它依赖还没实现）。
     let builder = CoreEngineBuilder::new()
-        .nmt_with_default_marian_stub()
-        .expect("failed to attach MarianNmtStub via nmt_with_default_marian_stub");
+        .nmt_with_default_marian_onnx()
+        .expect("failed to attach MarianNmtOnnx via nmt_with_default_marian_onnx");
 
     // 不能直接访问 builder.nmt（是私有字段），
     // 但如果路径不对或构造失败，上面的 expect 已经会 panic。
