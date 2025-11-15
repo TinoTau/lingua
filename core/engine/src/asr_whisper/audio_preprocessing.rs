@@ -39,7 +39,7 @@ pub fn preprocess_audio_frame(frame: &AudioFrame) -> Result<Vec<f32>> {
 }
 
 /// 将多声道音频转换为单声道（取平均值）
-fn convert_to_mono(audio: &[f32], num_channels: usize) -> Vec<f32> {
+pub fn convert_to_mono(audio: &[f32], num_channels: usize) -> Vec<f32> {
     audio.chunks(num_channels)
         .map(|chunk| {
             chunk.iter().sum::<f32>() / num_channels as f32
@@ -82,7 +82,7 @@ pub fn resample_audio(audio: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec
 /// 
 /// # Arguments
 /// * `audio` - 音频数据（原地修改）
-fn normalize_audio(audio: &mut [f32]) {
+pub fn normalize_audio(audio: &mut [f32]) {
     // 找到最大绝对值
     let max_abs = audio.iter()
         .map(|&x| x.abs())

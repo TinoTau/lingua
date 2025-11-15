@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use whisper_rs::{
-    WhisperContext, WhisperContextParameters, WhisperState, 
+    WhisperContext, WhisperContextParameters, 
     FullParams, SamplingStrategy,
 };
 

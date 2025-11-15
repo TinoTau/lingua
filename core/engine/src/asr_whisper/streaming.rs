@@ -3,6 +3,7 @@
 
 use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
+use anyhow::anyhow;
 
 use crate::asr_streaming::{AsrRequest, AsrResult, AsrStreaming};
 use crate::error::{EngineError, EngineResult};
@@ -29,7 +30,7 @@ struct StreamingConfig {
 /// 2. VAD 集成模式：使用 `accumulate_frame()` 累积帧，在 `infer_on_boundary()` 时推理
 /// 3. 流式模式：使用滑动窗口定期推理，返回部分结果（步骤 3.2）
 pub struct WhisperAsrStreaming {
-    engine: Arc<WhisperAsrEngine>,
+    engine: Arc<Mutex<WhisperAsrEngine>>,  // 使用 Mutex 以支持内部可变性（语言设置）
     /// 音频帧缓冲区（累积所有收到的帧）
     audio_buffer: Arc<Mutex<Vec<AudioFrame>>>,
     /// 是否已初始化
@@ -47,7 +48,7 @@ impl WhisperAsrStreaming {
         let engine = WhisperAsrEngine::new_from_model_path(model_path)?;
         
         Ok(Self {
-            engine: Arc::new(engine),
+            engine: Arc::new(Mutex::new(engine)),
             audio_buffer: Arc::new(Mutex::new(Vec::new())),
             initialized: Arc::new(Mutex::new(false)),
             streaming_config: Arc::new(Mutex::new(StreamingConfig {
@@ -66,7 +67,7 @@ impl WhisperAsrStreaming {
         let engine = WhisperAsrEngine::new_from_dir(model_dir)?;
         
         Ok(Self {
-            engine: Arc::new(engine),
+            engine: Arc::new(Mutex::new(engine)),
             audio_buffer: Arc::new(Mutex::new(Vec::new())),
             initialized: Arc::new(Mutex::new(false)),
             streaming_config: Arc::new(Mutex::new(StreamingConfig {
@@ -79,13 +80,20 @@ impl WhisperAsrStreaming {
 
     /// 设置语言
     /// 
-    /// 注意：由于 engine 是 Arc，我们需要通过内部可变性来修改
-    /// 但 WhisperAsrEngine 的 set_language 需要 &mut self
-    /// 这里我们暂时不实现，或者需要修改 WhisperAsrEngine 的设计
-    /// 为了简化，这里先留空，后续可以改进
-    #[allow(unused_variables)]
-    pub fn set_language(&self, _language: Option<String>) {
-        // TODO: 实现语言设置
+    /// # Arguments
+    /// * `language` - 语言代码（如 "en", "zh", "ja"），`None` 表示自动检测
+    /// 
+    /// # Examples
+    /// ```
+    /// asr.set_language(Some("en".to_string()));  // 设置为英语
+    /// asr.set_language(Some("zh".to_string()));  // 设置为中文
+    /// asr.set_language(None);                     // 自动检测
+    /// ```
+    pub fn set_language(&self, language: Option<String>) -> EngineResult<()> {
+        let mut engine = self.engine.lock()
+            .map_err(|e| EngineError::new(format!("Failed to lock WhisperAsrEngine: {}", e)))?;
+        engine.set_language(language);
+        Ok(())
     }
 
     /// 启用流式推理模式（部分结果输出）
@@ -194,9 +202,18 @@ impl WhisperAsrStreaming {
         }
         let audio_data = audio_buffer;
 
-        // 5. 运行推理
-        let transcript_text = self.engine.transcribe_full(&audio_data)
-            .map_err(|e| EngineError::new(format!("Failed to transcribe: {}", e)))?;
+        // 5. 运行推理（使用 spawn_blocking 避免阻塞异步运行时）
+        let engine_clone = Arc::clone(&self.engine);
+        let audio_data_clone = audio_data.clone();
+        let transcript_text = tokio::task::spawn_blocking(move || {
+            let engine = engine_clone.lock()
+                .map_err(|e| anyhow::anyhow!("Failed to lock WhisperAsrEngine: {}", e))?;
+            engine.transcribe_full(&audio_data_clone)
+                .map_err(|e| anyhow::anyhow!("Failed to transcribe: {}", e))
+        })
+        .await
+        .map_err(|e| EngineError::new(format!("Task join error: {}", e)))?
+        .map_err(|e| EngineError::new(format!("Transcription error: {}", e)))?;
 
         // 6. 构造部分结果
         if transcript_text.is_empty() {
@@ -241,9 +258,18 @@ impl WhisperAsrStreaming {
         }
         let audio_data = audio_buffer;
 
-        // 6. 运行推理
-        let transcript_text = self.engine.transcribe_full(&audio_data)
-            .map_err(|e| EngineError::new(format!("Failed to transcribe: {}", e)))?;
+        // 6. 运行推理（使用 spawn_blocking 避免阻塞异步运行时）
+        let engine_clone = Arc::clone(&self.engine);
+        let audio_data_clone = audio_data.clone();
+        let transcript_text = tokio::task::spawn_blocking(move || {
+            let engine = engine_clone.lock()
+                .map_err(|e| anyhow::anyhow!("Failed to lock WhisperAsrEngine: {}", e))?;
+            engine.transcribe_full(&audio_data_clone)
+                .map_err(|e| anyhow::anyhow!("Failed to transcribe: {}", e))
+        })
+        .await
+        .map_err(|e| EngineError::new(format!("Task join error: {}", e)))?
+        .map_err(|e| EngineError::new(format!("Transcription error: {}", e)))?;
 
         // 7. 清空缓冲区（因为已经推理完成）
         self.clear_buffer();
@@ -275,13 +301,17 @@ impl WhisperAsrStreaming {
                     confidence,
                     is_final: true,  // 在边界时，结果应该是最终的
                 }),
-                final_transcript: Some(StableTranscript {
-                    text: transcript_text,
-                    speaker_id: None,
-                    language: self.engine.language()
-                        .unwrap_or("unknown")
-                        .to_string(),
-                }),
+                final_transcript: {
+                    let engine = self.engine.lock()
+                        .map_err(|e| EngineError::new(format!("Failed to lock WhisperAsrEngine: {}", e)))?;
+                    Some(StableTranscript {
+                        text: transcript_text,
+                        speaker_id: None,
+                        language: engine.language()
+                            .unwrap_or("unknown")
+                            .to_string(),
+                    })
+                },
             }
         };
 
@@ -353,9 +383,18 @@ impl AsrStreaming for WhisperAsrStreaming {
         }
         let audio_data = audio_buffer;
 
-        // 6. 运行推理
-        let transcript_text = self.engine.transcribe_full(&audio_data)
-            .map_err(|e| EngineError::new(format!("Failed to transcribe: {}", e)))?;
+        // 6. 运行推理（使用 spawn_blocking 避免阻塞异步运行时）
+        let engine_clone = Arc::clone(&self.engine);
+        let audio_data_clone = audio_data.clone();
+        let transcript_text = tokio::task::spawn_blocking(move || {
+            let engine = engine_clone.lock()
+                .map_err(|e| anyhow::anyhow!("Failed to lock WhisperAsrEngine: {}", e))?;
+            engine.transcribe_full(&audio_data_clone)
+                .map_err(|e| anyhow::anyhow!("Failed to transcribe: {}", e))
+        })
+        .await
+        .map_err(|e| EngineError::new(format!("Task join error: {}", e)))?
+        .map_err(|e| EngineError::new(format!("Transcription error: {}", e)))?;
 
         // 7. 构造结果
         let result = if transcript_text.is_empty() {
@@ -372,13 +411,17 @@ impl AsrStreaming for WhisperAsrStreaming {
                     confidence,
                     is_final: false,
                 }),
-                final_transcript: Some(StableTranscript {
-                    text: transcript_text,
-                    speaker_id: None,
-                    language: self.engine.language()
-                        .unwrap_or("unknown")
-                        .to_string(),
-                }),
+                final_transcript: {
+                    let engine = self.engine.lock()
+                        .map_err(|e| EngineError::new(format!("Failed to lock WhisperAsrEngine: {}", e)))?;
+                    Some(StableTranscript {
+                        text: transcript_text,
+                        speaker_id: None,
+                        language: engine.language()
+                            .unwrap_or("unknown")
+                            .to_string(),
+                    })
+                },
             }
         };
 
