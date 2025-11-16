@@ -17,7 +17,7 @@ pub mod onnx_utils;
 pub use bootstrap::{CoreEngine, CoreEngineBuilder, ProcessResult};
 pub use cache_manager::CacheManager;
 pub use config_manager::{ConfigManager, EngineConfig};
-pub use emotion_adapter::{EmotionAdapter, EmotionRequest, EmotionResponse};
+pub use emotion_adapter::{EmotionAdapter, EmotionRequest, EmotionResponse, XlmREmotionEngine, EmotionStub};
 pub use error::{EngineError, EngineResult};
 pub use event_bus::{CoreEvent, EventBus, EventSubscription, EventTopic};
 pub use nmt_incremental::{
