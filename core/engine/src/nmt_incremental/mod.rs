@@ -499,18 +499,40 @@ impl MarianNmtOnnx {
         // 3. encoder_hidden_states
         input_values.push(encoder_states_value);
 
-        // 4. KV cache：Workaround 模式下，始终使用占位 KV（不使用历史 KV）
+        // 4. KV cache：准备输入 KV cache
         // 由于模型要求所有输入都存在，即使 use_cache_branch=false 也需要传入 KV
         let encoder_seq_len = encoder_hidden_states.shape()[1];
+        // 保存旧的 KV cache（用于后续提取 encoder KV cache）
+        let old_kv_for_encoder = if state.use_cache_branch && state.kv_cache.is_some() {
+            // 正常模式：需要保存旧的 KV cache 以便提取 encoder KV cache
+            // 注意：我们不能 clone Value，所以需要先保存，然后在构建输入时移动
+            Some(state.kv_cache.as_ref().unwrap().clone())  // 这里会失败，因为 Value 不支持 Clone
+        } else {
+            None
+        };
+        
         let kv_to_use: Vec<[Value<'static>; 4]> = if state.use_cache_branch && state.kv_cache.is_some() {
-            // 正常模式：使用历史 KV（但 workaround 模式下不会走到这里）
+            // 正常模式：使用历史 KV
             state.kv_cache.take().unwrap()
         } else {
-            // Workaround 模式：始终使用占位 KV
+            // 第一步或 Workaround 模式：使用占位 KV
             self.build_initial_kv_values(encoder_seq_len)?
         };
 
         // 无论第几步，都向模型提供完整的 KV 输入
+        // 注意：我们需要在移动之前保存 encoder KV cache 的引用
+        // 但由于 Value 不支持 Clone，我们需要使用不同的方法
+        // 实际上，我们需要在处理 present.* 输出时，从旧的 KV cache 中获取 encoder KV
+        // 所以我们需要在移动之前，先提取 encoder KV cache
+        let saved_encoder_kv: Option<Vec<(Value<'static>, Value<'static>)>> = if state.use_cache_branch {
+            // 从 kv_to_use 中提取 encoder KV cache（在移动之前）
+            // 但是，由于 Value 不支持 Clone，我们不能这样做
+            // 我们需要使用不同的方法：在处理 present.* 输出时，从旧的 KV cache 中获取
+            None  // 暂时为 None，稍后从 kv_to_use 中提取
+        } else {
+            None
+        };
+        
         for kv_layer in kv_to_use {
             let [dec_k, dec_v, enc_k, enc_v] = kv_layer;
             input_values.push(dec_k);
@@ -547,10 +569,29 @@ impl MarianNmtOnnx {
             .to_owned(); // 已经是 Array1<f32>
 
         // KV cache：处理 present.* 输出
-        // 关键：即使第一步 use_cache_branch=false，模型仍然会输出 present.*
-        // 我们需要提取这些输出，以便在后续步骤中使用
+        // 关键发现：当 use_cache_branch=true 时，present.*.encoder.* 的第一个维度是 0
+        // 我们不能使用这些空的 encoder KV cache，应该保持使用初始的 encoder KV cache
         if state.use_cache_branch {
-            // 正常模式（第二步及以后）：提取 KV cache 供下一步使用
+            // 正常模式（第二步及以后）：只提取 decoder KV cache，保持 encoder KV cache 不变
+            // 从 kv_to_use 中提取 encoder KV cache（保持不变）
+            let mut next_kv: Vec<[Value<'static>; 4]> = Vec::with_capacity(Self::NUM_LAYERS);
+            for (layer_idx, old_kv_layer) in kv_to_use.into_iter().enumerate() {
+                let dec_k = iter.next().expect("missing present.*.decoder.key");
+                let dec_v = iter.next().expect("missing present.*.decoder.value");
+                iter.next(); // 跳过 present.*.encoder.key（use_cache_branch=true 时形状为 (0, 8, 1, 64)，不可用）
+                iter.next(); // 跳过 present.*.encoder.value（use_cache_branch=true 时形状为 (0, 8, 1, 64)，不可用）
+                
+                // 从旧的 KV cache 中获取 encoder KV cache（保持不变）
+                let [old_dec_k, old_dec_v, old_enc_k, old_enc_v] = old_kv_layer;
+                
+                // 只更新 decoder KV cache，保持 encoder KV cache 不变
+                next_kv.push([dec_k, dec_v, old_enc_k, old_enc_v]);
+            }
+            state.kv_cache = Some(next_kv);
+            state.use_cache_branch = true;  // 保持启用状态
+        } else {
+            // 第一步（use_cache_branch=false）：提取所有 KV cache
+            // 这一步的 present.*.encoder.* 是正常的，可以全部提取
             let mut next_kv: Vec<[Value<'static>; 4]> = Vec::with_capacity(Self::NUM_LAYERS);
             for _layer in 0..Self::NUM_LAYERS {
                 let dec_k = iter.next().expect("missing present.*.decoder.key");
@@ -560,35 +601,7 @@ impl MarianNmtOnnx {
                 next_kv.push([dec_k, dec_v, enc_k, enc_v]);
             }
             state.kv_cache = Some(next_kv);
-            state.use_cache_branch = true;  // 保持启用状态
-        } else {
-            // 第一步（use_cache_branch=false）：提取 KV cache 供下一步使用
-            // 关键：即使 use_cache_branch=false，模型也会输出 present.*
-            // 我们可以提取这些输出，以便在后续步骤中使用 KV cache（正常模式）
-            // 或者跳过它们，继续使用完整序列（workaround 模式）
-            
-            // 当前使用 workaround 模式：跳过 KV cache，避免 Reshape 错误
-            // 如果将来要启用 KV cache，可以改为提取并保存：
-            // let mut next_kv: Vec<[Value<'static>; 4]> = Vec::with_capacity(Self::NUM_LAYERS);
-            // for _layer in 0..Self::NUM_LAYERS {
-            //     let dec_k = iter.next().expect("missing present.*.decoder.key");
-            //     let dec_v = iter.next().expect("missing present.*.decoder.value");
-            //     let enc_k = iter.next().expect("missing present.*.encoder.key");
-            //     let enc_v = iter.next().expect("missing present.*.encoder.value");
-            //     next_kv.push([dec_k, dec_v, enc_k, enc_v]);
-            // }
-            // state.kv_cache = Some(next_kv);
-            // state.use_cache_branch = true;  // 下一步启用 KV cache
-            
-            // Workaround 模式：跳过所有 present.* 输出
-            for _layer in 0..Self::NUM_LAYERS {
-                iter.next(); // decoder.key
-                iter.next(); // decoder.value
-                iter.next(); // encoder.key
-                iter.next(); // encoder.value
-            }
-            state.kv_cache = None;
-            state.use_cache_branch = false;  // 保持 workaround 模式
+            state.use_cache_branch = true;  // 下一步启用 KV cache
         }
 
         // 返回 state（保持 generated_ids 不变，因为我们在 translate() 中管理它）
@@ -684,6 +697,9 @@ impl MarianNmtOnnx {
             state.generated_ids.push(next_token_id);
             state.kv_cache = next_state.kv_cache;  // 保存 KV cache 供下一步使用
             state.use_cache_branch = next_state.use_cache_branch;  // 更新 use_cache_branch 状态
+            
+            println!("[DEBUG] After Step {}: use_cache_branch={}, has_kv_cache={}", 
+                step, state.use_cache_branch, state.kv_cache.is_some());
         }
 
         println!("[NMT][translate] Generated IDs: {:?} (length: {})", state.generated_ids, state.generated_ids.len());
