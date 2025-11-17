@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 测试 IR 9 模型是否能满足功能需求
 
 使用方法:
     python scripts/test_emotion_ir9.py
 """
+
+import sys
+import io
+# 设置 UTF-8 编码输出（Windows 兼容）
+if sys.platform == 'win32':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 import onnx
 import onnxruntime as ort
