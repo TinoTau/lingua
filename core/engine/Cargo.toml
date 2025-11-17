@@ -21,3 +21,6 @@ ndarray = "0.15"
 # Whisper ASR 支持
 whisper-rs = "0.15.1"
 hound = "3.5"  # WAV 文件读取
+
+# Tokenizer 支持（用于 Emotion XLM-R）
+tokenizers = "0.15"

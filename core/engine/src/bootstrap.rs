@@ -5,11 +5,11 @@ use crate::asr_streaming::{AsrStreaming, AsrResult};
 use crate::asr_whisper::WhisperAsrStreaming;
 use crate::cache_manager::CacheManager;
 use crate::config_manager::ConfigManager;
-use crate::emotion_adapter::EmotionAdapter;
+use crate::emotion_adapter::{EmotionAdapter, EmotionRequest, EmotionResponse};
 use crate::error::{EngineError, EngineResult};
 use crate::event_bus::{EventBus, CoreEvent, EventTopic};
 use crate::nmt_incremental::{NmtIncremental, MarianNmtOnnx, TranslationRequest, TranslationResponse};
-use crate::persona_adapter::PersonaAdapter;
+use crate::persona_adapter::{PersonaAdapter, PersonaContext};
 use crate::telemetry::{TelemetryDatum, TelemetrySink};
 use crate::tts_streaming::TtsStreaming;
 use crate::types::{PartialTranscript, StableTranscript};
@@ -276,15 +276,25 @@ impl CoreEngine {
                         self.publish_asr_final_event(final_transcript, vad_result.frame.timestamp_ms).await?;
                     }
                     
-                    // 5. 如果 ASR 返回最终结果，自动触发 NMT 翻译
-                    let translation_result = if let Some(ref final_transcript) = asr_result.final_transcript {
-                        self.translate_and_publish(final_transcript, vad_result.frame.timestamp_ms).await.ok()
+                    // 5. 如果 ASR 返回最终结果，进行 Emotion 分析、Persona 个性化，然后触发 NMT 翻译
+                    let (emotion_result, translation_result) = if let Some(ref final_transcript) = asr_result.final_transcript {
+                        // 5.1. Emotion 情感分析
+                        let emotion_result = self.analyze_emotion(final_transcript, vad_result.frame.timestamp_ms).await.ok();
+                        
+                        // 5.2. 应用 Persona 个性化
+                        let personalized_transcript = self.personalize_transcript(final_transcript).await?;
+                        
+                        // 5.3. 使用个性化后的 transcript 进行翻译
+                        let translation_result = self.translate_and_publish(&personalized_transcript, vad_result.frame.timestamp_ms).await.ok();
+                        
+                        (emotion_result, translation_result)
                     } else {
-                        None
+                        (None, None)
                     };
                     
                     return Ok(Some(ProcessResult {
                         asr: asr_result,
+                        emotion: emotion_result,
                         translation: translation_result,
                     }));
                 } else {
@@ -299,6 +309,7 @@ impl CoreEngine {
                                     partial: Some(partial),
                                     final_transcript: None,
                                 },
+                                emotion: None,
                                 translation: None,
                             }));
                         }
@@ -314,13 +325,22 @@ impl CoreEngine {
                     language_hint: language_hint.clone(),
                 }).await?;
                 
-                // 如果检测到边界且有最终结果，触发翻译
+                // 如果检测到边界且有最终结果，进行 Emotion 分析、Persona 个性化，然后触发翻译
                 if vad_result.is_boundary {
                     if let Some(ref final_transcript) = asr_result.final_transcript {
                         self.publish_asr_final_event(final_transcript, frame_timestamp).await?;
-                        let translation_result = self.translate_and_publish(final_transcript, frame_timestamp).await.ok();
+                        
+                        // Emotion 情感分析
+                        let emotion_result = self.analyze_emotion(final_transcript, frame_timestamp).await.ok();
+                        
+                        // 应用 Persona 个性化
+                        let personalized_transcript = self.personalize_transcript(final_transcript).await?;
+                        
+                        // 使用个性化后的 transcript 进行翻译
+                        let translation_result = self.translate_and_publish(&personalized_transcript, frame_timestamp).await.ok();
                         return Ok(Some(ProcessResult {
                             asr: asr_result,
+                            emotion: emotion_result,
                             translation: translation_result,
                         }));
                     }
@@ -333,10 +353,49 @@ impl CoreEngine {
                 
                 return Ok(Some(ProcessResult {
                     asr: asr_result,
+                    emotion: None,
                     translation: None,
                 }));
             }
         }
+    }
+
+    /// 分析情感
+    async fn analyze_emotion(
+        &self,
+        transcript: &StableTranscript,
+        timestamp_ms: u64,
+    ) -> EngineResult<EmotionResponse> {
+        // 构造 Emotion 请求
+        let request = EmotionRequest {
+            transcript: transcript.clone(),
+            acoustic_features: json!({}),  // 暂时为空，后续可以添加音频特征
+        };
+        
+        // 执行情感分析
+        let response = self.emotion.analyze(request).await?;
+        
+        // 发布 Emotion 事件
+        self.publish_emotion_event(&response, timestamp_ms).await?;
+        
+        Ok(response)
+    }
+
+    /// 应用 Persona 个性化
+    async fn personalize_transcript(
+        &self,
+        transcript: &StableTranscript,
+    ) -> EngineResult<StableTranscript> {
+        // 从配置中获取 PersonaContext（简化版：使用默认值）
+        // TODO: 后续可以从用户配置或数据库获取真实的 PersonaContext
+        let context = PersonaContext {
+            user_id: "default_user".to_string(),
+            tone: "formal".to_string(),  // 默认使用正式语调
+            culture: transcript.language.clone(),
+        };
+        
+        // 应用个性化
+        self.persona.personalize(transcript.clone(), context).await
     }
 
     /// 翻译并发布事件
@@ -407,6 +466,24 @@ impl CoreEngine {
         Ok(())
     }
 
+    /// 发布 Emotion 事件
+    async fn publish_emotion_event(
+        &self,
+        emotion: &EmotionResponse,
+        timestamp_ms: u64,
+    ) -> EngineResult<()> {
+        let event = CoreEvent {
+            topic: EventTopic("Emotion".to_string()),
+            payload: json!({
+                "label": emotion.label,
+                "confidence": emotion.confidence,
+            }),
+            timestamp_ms,
+        };
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
+
     /// 发布翻译事件
     async fn publish_translation_event(
         &self,
@@ -430,5 +507,6 @@ impl CoreEngine {
 #[derive(Debug, Clone)]
 pub struct ProcessResult {
     pub asr: AsrResult,
+    pub emotion: Option<EmotionResponse>,
     pub translation: Option<TranslationResponse>,
 }
