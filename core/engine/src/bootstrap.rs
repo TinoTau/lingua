@@ -366,10 +366,10 @@ impl CoreEngine {
         transcript: &StableTranscript,
         timestamp_ms: u64,
     ) -> EngineResult<EmotionResponse> {
-        // 构造 Emotion 请求
+        // 构造 Emotion 请求（根据 Emotion_Adapter_Spec.md）
         let request = EmotionRequest {
-            transcript: transcript.clone(),
-            acoustic_features: json!({}),  // 暂时为空，后续可以添加音频特征
+            text: transcript.text.clone(),
+            lang: transcript.language.clone(),
         };
         
         // 执行情感分析
@@ -475,7 +475,8 @@ impl CoreEngine {
         let event = CoreEvent {
             topic: EventTopic("Emotion".to_string()),
             payload: json!({
-                "label": emotion.label,
+                "primary": emotion.primary,
+                "intensity": emotion.intensity,
                 "confidence": emotion.confidence,
             }),
             timestamp_ms,

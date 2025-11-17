@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 use core_engine::emotion_adapter::{EmotionAdapter, EmotionRequest, XlmREmotionEngine, EmotionStub};
-use core_engine::types::StableTranscript;
 
 /// 测试 EmotionStub（不依赖模型文件）
 #[tokio::test]
@@ -8,19 +7,17 @@ async fn test_emotion_stub() {
     let stub = EmotionStub::new();
     
     let request = EmotionRequest {
-        transcript: StableTranscript {
-            text: "Hello, this is a test.".to_string(),
-            speaker_id: None,
-            language: "en".to_string(),
-        },
-        acoustic_features: serde_json::json!({}),
+        text: "Hello, this is a test.".to_string(),
+        lang: "en".to_string(),
     };
     
     let response = stub.analyze(request).await.unwrap();
     
-    assert_eq!(response.label, "neutral");
+    assert_eq!(response.primary, "neutral");
+    assert!(response.intensity >= 0.0 && response.intensity <= 1.0);
     assert!(response.confidence > 0.0 && response.confidence <= 1.0);
-    println!("Stub test passed: label={}, confidence={}", response.label, response.confidence);
+    println!("Stub test passed: primary={}, intensity={}, confidence={}", 
+        response.primary, response.intensity, response.confidence);
 }
 
 /// 测试 XlmREmotionEngine 模型加载
@@ -67,20 +64,18 @@ async fn test_xlmr_emotion_inference() {
     };
     
     let request = EmotionRequest {
-        transcript: StableTranscript {
-            text: "I love this product!".to_string(),
-            speaker_id: None,
-            language: "en".to_string(),
-        },
-        acoustic_features: serde_json::json!({}),
+        text: "I love this product!".to_string(),
+        lang: "en".to_string(),
     };
     
     let response = engine.analyze(request).await;
     
     match response {
         Ok(resp) => {
-            println!("✅ Emotion analysis result: label={}, confidence={}", resp.label, resp.confidence);
-            assert!(!resp.label.is_empty());
+            println!("✅ Emotion analysis result: primary={}, intensity={}, confidence={}", 
+                resp.primary, resp.intensity, resp.confidence);
+            assert!(!resp.primary.is_empty());
+            assert!(resp.intensity >= 0.0 && resp.intensity <= 1.0);
             assert!(resp.confidence > 0.0 && resp.confidence <= 1.0);
         }
         Err(e) => {
@@ -116,20 +111,16 @@ async fn test_xlmr_emotion_multiple_texts() {
     
     for (text, expected_sentiment) in test_cases {
         let request = EmotionRequest {
-            transcript: StableTranscript {
-                text: text.to_string(),
-                speaker_id: None,
-                language: "en".to_string(),
-            },
-            acoustic_features: serde_json::json!({}),
+            text: text.to_string(),
+            lang: "en".to_string(),
         };
         
         let response = engine.analyze(request).await;
         
         match response {
             Ok(resp) => {
-                println!("Text: '{}' -> label={}, confidence={} (expected: {})", 
-                    text, resp.label, resp.confidence, expected_sentiment);
+                println!("Text: '{}' -> primary={}, intensity={}, confidence={} (expected: {})", 
+                    text, resp.primary, resp.intensity, resp.confidence, expected_sentiment);
             }
             Err(e) => {
                 eprintln!("⚠️  Failed to analyze '{}': {}", text, e);

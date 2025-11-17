@@ -15,9 +15,10 @@ impl EmotionStub {
 #[async_trait]
 impl EmotionAdapter for EmotionStub {
     async fn analyze(&self, _request: EmotionRequest) -> EngineResult<EmotionResponse> {
-        // 返回默认的 neutral 情感
+        // 返回默认的 neutral 情感（根据 Emotion_Adapter_Spec.md）
         Ok(EmotionResponse {
-            label: "neutral".to_string(),
+            primary: "neutral".to_string(),
+            intensity: 0.0,
             confidence: 0.5,
         })
     }

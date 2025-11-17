@@ -9,6 +9,41 @@ use serde::Deserialize;
 use crate::error::{EngineError, EngineResult};
 use super::{EmotionAdapter, EmotionRequest, EmotionResponse};
 
+/// 标准化情绪标签名称
+/// 
+/// 根据 Emotion_Adapter_Spec.md，标准情绪为：
+/// "neutral" | "joy" | "sadness" | "anger" | "fear" | "surprise"
+fn normalize_emotion_label(label: &str) -> String {
+    let label_lower = label.to_lowercase();
+    
+    // 映射常见的情绪标签变体到标准格式
+    match label_lower.as_str() {
+        "positive" | "happy" | "happiness" | "joy" | "joyful" => "joy".to_string(),
+        "negative" | "sad" | "sadness" | "sorrow" => "sadness".to_string(),
+        "angry" | "anger" | "rage" => "anger".to_string(),
+        "fear" | "afraid" | "scared" => "fear".to_string(),
+        "surprise" | "surprised" | "shock" => "surprise".to_string(),
+        "neutral" | "none" | "normal" => "neutral".to_string(),
+        _ => {
+            // 如果无法识别，尝试从 label 中提取关键词
+            if label_lower.contains("positive") || label_lower.contains("joy") || label_lower.contains("happy") {
+                "joy".to_string()
+            } else if label_lower.contains("negative") || label_lower.contains("sad") {
+                "sadness".to_string()
+            } else if label_lower.contains("angry") || label_lower.contains("anger") {
+                "anger".to_string()
+            } else if label_lower.contains("fear") || label_lower.contains("afraid") {
+                "fear".to_string()
+            } else if label_lower.contains("surprise") || label_lower.contains("shock") {
+                "surprise".to_string()
+            } else {
+                // 默认返回 neutral
+                "neutral".to_string()
+            }
+        }
+    }
+}
+
 /// XLM-R 情感分类引擎
 pub struct XlmREmotionEngine {
     session: Mutex<Session>,
@@ -110,15 +145,17 @@ impl XlmREmotionEngine {
             label_map[id] = label;
         }
 
-        // 加载 ONNX 模型（优先使用 IR 9 版本）
-        let model_path = if model_dir.join("model_ir9.onnx").exists() {
+        // 加载 ONNX 模型（优先使用 PyTorch 1.13 导出的 IR 9 版本）
+        let model_path = if model_dir.join("model_ir9_pytorch13.onnx").exists() {
+            model_dir.join("model_ir9_pytorch13.onnx")
+        } else if model_dir.join("model_ir9.onnx").exists() {
             model_dir.join("model_ir9.onnx")
         } else {
             model_dir.join("model.onnx")
         };
         
         if !model_path.exists() {
-            return Err(anyhow!("model.onnx or model_ir9.onnx not found at {}", model_dir.display()));
+            return Err(anyhow!("model.onnx, model_ir9.onnx, or model_ir9_pytorch13.onnx not found at {}", model_dir.display()));
         }
 
         use ort::{SessionBuilder, Environment};
@@ -142,9 +179,24 @@ impl XlmREmotionEngine {
     }
 
     /// 执行情感分类推理
+    /// 
+    /// 根据 Emotion_Adapter_Spec.md 实现后处理规则：
+    /// - 文本过短（< 3 字符）→ 强制 neutral
+    /// - logits 差值过小（< 0.1）→ neutral
+    /// - confidence = softmax(top1)
     fn infer(&self, text: &str) -> Result<EmotionResponse> {
+        // 0. 后处理规则：文本过短 → 强制 neutral
+        let text_trimmed = text.trim();
+        if text_trimmed.len() < 3 {
+            return Ok(EmotionResponse {
+                primary: "neutral".to_string(),
+                intensity: 0.0,
+                confidence: 1.0,
+            });
+        }
+        
         // 1. 编码文本
-        let input_ids = self.tokenizer.encode(text);
+        let input_ids = self.tokenizer.encode(text_trimmed);
         let seq_len = input_ids.len();
 
         // 2. 准备输入（batch_size=1）
@@ -206,21 +258,39 @@ impl XlmREmotionEngine {
         let sum_exp: f32 = exp_logits.sum();
         let probs: Array1<f32> = exp_logits.mapv(|x| x / sum_exp);
 
-        // 找到最大概率的索引
-        let (predicted_id, confidence) = probs
+        // 找到最大概率的索引和次大概率
+        let mut indexed_probs: Vec<(usize, f32)> = probs
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .ok_or_else(|| anyhow!("empty probabilities"))?;
-
-        // 9. 获取 label
-        let label = self.label_map.get(predicted_id)
-            .cloned()
-            .unwrap_or_else(|| format!("unknown_{}", predicted_id));
+            .map(|(i, &p)| (i, p))
+            .collect();
+        indexed_probs.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        
+        let (predicted_id, top1_prob) = indexed_probs[0];
+        let top2_prob = indexed_probs.get(1).map(|(_, p)| *p).unwrap_or(0.0);
+        
+        // 后处理规则：logits 差值过小（< 0.1）→ neutral
+        let prob_diff = top1_prob - top2_prob;
+        let primary = if prob_diff < 0.1 {
+            "neutral".to_string()
+        } else {
+            // 获取 label 并标准化为规范格式
+            let label = self.label_map.get(predicted_id)
+                .cloned()
+                .unwrap_or_else(|| format!("unknown_{}", predicted_id));
+            
+            // 标准化 label 名称（根据 Emotion_Adapter_Spec.md）
+            normalize_emotion_label(&label)
+        };
+        
+        // intensity 使用 top1 概率，confidence 也使用 top1 概率
+        let intensity = top1_prob;
+        let confidence = top1_prob;
 
         Ok(EmotionResponse {
-            label,
-            confidence: *confidence,
+            primary,
+            intensity,
+            confidence,
         })
     }
 }
@@ -228,8 +298,10 @@ impl XlmREmotionEngine {
 #[async_trait::async_trait]
 impl EmotionAdapter for XlmREmotionEngine {
     async fn analyze(&self, request: EmotionRequest) -> EngineResult<EmotionResponse> {
-        // 使用 transcript 的文本进行情感分析
-        let text = &request.transcript.text;
+        // 根据 Emotion_Adapter_Spec.md，直接使用 text 和 lang
+        // 注意：lang 参数目前未使用，但保留在接口中以便未来扩展
+        let _lang = &request.lang;
+        let text = &request.text;
         
         self.infer(text)
             .map_err(|e| EngineError::new(format!("emotion analysis failed: {e}")))
