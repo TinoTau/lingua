@@ -1,6 +1,8 @@
+// 备份：如果编译卡住，可以临时注释掉 TTS 模块
+// 在 lib.rs 中注释掉: pub mod tts_streaming;
+
 mod fastspeech2_tts;
 mod text_processor;
-mod audio_utils;
 mod stub;
 
 use async_trait::async_trait;
@@ -11,7 +13,6 @@ use crate::error::EngineResult;
 pub use fastspeech2_tts::FastSpeech2TtsEngine;
 pub use stub::TtsStub;
 pub use text_processor::TextProcessor;
-pub use audio_utils::{save_pcm_to_wav, validate_pcm_audio};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TtsRequest {
@@ -32,3 +33,4 @@ pub trait TtsStreaming: Send + Sync {
     async fn synthesize(&self, request: TtsRequest) -> EngineResult<TtsStreamChunk>;
     async fn close(&self) -> EngineResult<()>;
 }
+

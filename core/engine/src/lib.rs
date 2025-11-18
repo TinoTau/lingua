@@ -25,7 +25,7 @@ pub use nmt_incremental::{
 };
 pub use persona_adapter::{PersonaAdapter, PersonaContext, RuleBasedPersonaAdapter, PersonaStub};
 pub use telemetry::{TelemetryDatum, TelemetrySink};
-pub use tts_streaming::{TtsRequest, TtsStreamChunk, TtsStreaming};
+pub use tts_streaming::{TtsRequest, TtsStreamChunk, TtsStreaming, FastSpeech2TtsEngine, TtsStub};
 pub use types::{AudioFrame, PartialTranscript, StableTranscript};
 pub use vad::{DetectionOutcome, VoiceActivityDetector};
 pub use asr_streaming::{AsrRequest, AsrResult, AsrStreaming};
