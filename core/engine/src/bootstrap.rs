@@ -11,7 +11,7 @@ use crate::event_bus::{EventBus, CoreEvent, EventTopic};
 use crate::nmt_incremental::{NmtIncremental, MarianNmtOnnx, TranslationRequest, TranslationResponse};
 use crate::persona_adapter::{PersonaAdapter, PersonaContext};
 use crate::telemetry::{TelemetryDatum, TelemetrySink};
-use crate::tts_streaming::{TtsStreaming, TtsRequest, TtsStreamChunk, VitsTtsEngine};
+use crate::tts_streaming::{TtsStreaming, TtsRequest, TtsStreamChunk, VitsTtsEngine, PiperHttpTts, PiperHttpConfig};
 use crate::types::{PartialTranscript, StableTranscript};
 use crate::vad::VoiceActivityDetector;
 use serde_json::json;
@@ -207,6 +207,35 @@ impl CoreEngineBuilder {
         // 5. 存入 builder 的 tts 字段
         self.tts = Some(Arc::new(tts_impl));
 
+        Ok(self)
+    }
+
+    /// 使用默认的 Piper HTTP TTS 服务初始化 TTS 模块
+    /// 
+    /// 配置：
+    /// - 端点：http://127.0.0.1:5005/tts
+    /// - 默认语音：zh_CN-huayan-medium
+    /// - 超时：8000ms
+    /// 
+    /// 注意：此方法需要 WSL2 中运行 Piper HTTP 服务
+    pub fn tts_with_default_piper_http(mut self) -> EngineResult<Self> {
+        let config = PiperHttpConfig::default();
+        let tts_impl = PiperHttpTts::new(config)
+            .map_err(|e| EngineError::new(format!("Failed to create PiperHttpTts: {}", e)))?;
+        
+        self.tts = Some(Arc::new(tts_impl));
+        Ok(self)
+    }
+
+    /// 使用自定义配置的 Piper HTTP TTS 服务初始化 TTS 模块
+    /// 
+    /// # Arguments
+    /// * `config` - Piper HTTP 配置
+    pub fn tts_with_piper_http(mut self, config: PiperHttpConfig) -> EngineResult<Self> {
+        let tts_impl = PiperHttpTts::new(config)
+            .map_err(|e| EngineError::new(format!("Failed to create PiperHttpTts: {}", e)))?;
+        
+        self.tts = Some(Arc::new(tts_impl));
         Ok(self)
     }
 

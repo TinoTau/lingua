@@ -4,6 +4,7 @@ mod vits_zh_aishell3_tokenizer;
 mod text_processor;
 mod audio_utils;
 mod stub;
+mod piper_http;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,7 @@ pub use vits_tts::VitsTtsEngine;
 pub use stub::TtsStub;
 pub use text_processor::TextProcessor;
 pub use audio_utils::{save_pcm_to_wav, validate_pcm_audio};
+pub use piper_http::{PiperHttpTts, PiperHttpConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TtsRequest {

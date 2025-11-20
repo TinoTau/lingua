@@ -1,6 +1,6 @@
 # 文档索引
 
-**最后更新**: 2024-12-19
+**最后更新**: 2025-11-21
 
 ---
 
@@ -30,7 +30,12 @@
 #### 英文 TTS ✅
 - **TTS_IMPLEMENTATION_COMPLETE.md** (2024-12-19) - TTS 实现完整总结（包含英文和中文问题）
 
-#### 中文 TTS ❌（问题总结）
+#### 中文 TTS ✅（WSL2 Piper 方案）
+- **PIPER_TTS_IMPLEMENTATION_COMPLETE.md** (2025-11-21) - Piper TTS 实现完成总结（已完成）
+- 参考架构文档: `../../docs/architecture/WSL2_Piper_ZH_TTS_Deployment_Guide.md`
+- 参考文档: `../../docs/architecture/PIPER_TTS_IMPLEMENTATION_COMPLETE.md`
+
+#### 中文 TTS ❌（之前尝试的方案 - 问题总结）
 - **VITS_ZH_AISHELL3_ISSUE_SUMMARY.md** (2024-12-19) - vits-zh-aishell3 问题总结
 - **BREEZE2_VITS_ISSUE_SUMMARY.md** (2024-12-19) - Breeze2-VITS 问题总结
 - **SHERPA_ONNX_VITS_ZH_ISSUE_SUMMARY.md** (2024-12-19) - Sherpa-ONNX-VITS-ZH-LL 问题总结
@@ -70,11 +75,22 @@
 
 ## 📁 已归档文档
 
-已归档的文档位于 `archived/` 目录，包括：
+### 引擎文档归档
+已归档的文档位于 `core/engine/docs/archived/` 目录，包括：
 - TTS 实现过程文档（已合并到 TTS_IMPLEMENTATION_COMPLETE.md）
 - Emotion 实现过程文档（已合并到 EMOTION_ADAPTER_COMPLETE.md）
 - 修复步骤文档（已过时）
 - 其他临时文档
+
+### 脚本文档归档
+已归档的脚本说明文件位于 `scripts/archived/` 目录，包括：
+- `manual_download_piper.md` - Piper 手动下载说明（已过时，使用 WSL2 方案）
+- `install_onnxruntime_simple.md` - ONNX Runtime 安装说明（已过时）
+- `README_export_models.md` - 模型导出说明（已过时）
+- `original_vits_code/README.md` - 原始 VITS 代码说明（已过时）
+
+**活跃的脚本文档**:
+- `scripts/wsl2_piper/README.md` - WSL2 Piper 部署和使用指南（活跃）
 
 ---
 
