@@ -66,7 +66,8 @@ struct DummyEmotion;
 impl EmotionAdapter for DummyEmotion {
     async fn analyze(&self, _request: EmotionRequest) -> EngineResult<EmotionResponse> {
         Ok(EmotionResponse {
-            label: "neutral".to_string(),
+            primary: "neutral".to_string(),
+            intensity: 0.0,
             confidence: 1.0,
         })
     }
@@ -292,18 +293,14 @@ async fn test_nmt_integration_full_pipeline() {
     println!("\n--- Step 3: Emotion Analysis ---");
     let emotion = Arc::new(DummyEmotion);
     let emotion_request = EmotionRequest {
-        transcript: StableTranscript {
-            text: translation_response.translated_text.clone(),
-            speaker_id: None,
-            language: "zh".to_string(),
-        },
-        acoustic_features: serde_json::json!({}),
+        text: translation_response.translated_text.clone(),
+        lang: "zh".to_string(),
     };
 
     let emotion_response = emotion.analyze(emotion_request).await
         .expect("Failed to analyze emotion");
     
-    println!("  Label: '{}'", emotion_response.label);
+    println!("  Primary: '{}'", emotion_response.primary);
     println!("  Confidence: {:.2}", emotion_response.confidence);
 
     // 通过 Persona 个性化（使用 Dummy 实现）

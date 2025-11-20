@@ -11,7 +11,7 @@ use crate::event_bus::{EventBus, CoreEvent, EventTopic};
 use crate::nmt_incremental::{NmtIncremental, MarianNmtOnnx, TranslationRequest, TranslationResponse};
 use crate::persona_adapter::{PersonaAdapter, PersonaContext};
 use crate::telemetry::{TelemetryDatum, TelemetrySink};
-use crate::tts_streaming::TtsStreaming;
+use crate::tts_streaming::{TtsStreaming, TtsRequest, TtsStreamChunk, VitsTtsEngine};
 use crate::types::{PartialTranscript, StableTranscript};
 use crate::vad::VoiceActivityDetector;
 use serde_json::json;
@@ -177,6 +177,39 @@ impl CoreEngineBuilder {
         Ok(self)
     }
 
+    /// 使用默认的 VITS TTS 模型初始化 TTS 模块（支持多语言）
+    /// 
+    /// 模型路径：`core/engine/models/tts/`
+    /// - 英文模型：`mms-tts-eng/`（必需）
+    /// - 中文模型：`mms-tts-zh-Hans/`（可选）
+    /// 
+    /// # Returns
+    /// 返回 `EngineResult<Self>`，如果英文模型目录不存在或加载失败则返回错误
+    pub fn tts_with_default_vits(mut self) -> EngineResult<Self> {
+        // 1. 找到 core/engine 目录
+        let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        
+        // 2. 约定的 VITS TTS 模型根目录路径
+        let models_root = crate_root.join("models/tts");
+
+        // 3. 检查模型根目录是否存在
+        if !models_root.exists() {
+            return Err(EngineError::new(format!(
+                "VITS TTS models root directory not found at: {}. Please ensure the models are downloaded.",
+                models_root.display()
+            )));
+        }
+
+        // 4. 加载 VITS TTS 实现（支持多语言）
+        let tts_impl = VitsTtsEngine::new_from_models_root(&models_root)
+            .map_err(|e| EngineError::new(format!("Failed to load VitsTtsEngine: {}", e)))?;
+
+        // 5. 存入 builder 的 tts 字段
+        self.tts = Some(Arc::new(tts_impl));
+
+        Ok(self)
+    }
+
     pub fn build(self) -> EngineResult<CoreEngine> {
         Ok(CoreEngine {
             event_bus: self.event_bus.ok_or_else(|| EngineError::new("event_bus is missing"))?,
@@ -277,7 +310,7 @@ impl CoreEngine {
                     }
                     
                     // 5. 如果 ASR 返回最终结果，进行 Emotion 分析、Persona 个性化，然后触发 NMT 翻译
-                    let (emotion_result, translation_result) = if let Some(ref final_transcript) = asr_result.final_transcript {
+                    let (emotion_result, translation_result, tts_result) = if let Some(ref final_transcript) = asr_result.final_transcript {
                         // 5.1. Emotion 情感分析
                         let emotion_result = self.analyze_emotion(final_transcript, vad_result.frame.timestamp_ms).await.ok();
                         
@@ -287,15 +320,23 @@ impl CoreEngine {
                         // 5.3. 使用个性化后的 transcript 进行翻译
                         let translation_result = self.translate_and_publish(&personalized_transcript, vad_result.frame.timestamp_ms).await.ok();
                         
-                        (emotion_result, translation_result)
+                        // 5.4. 如果翻译成功，进行 TTS 合成
+                        let tts_result = if let Some(ref translation) = translation_result {
+                            self.synthesize_and_publish(translation, vad_result.frame.timestamp_ms).await.ok()
+                        } else {
+                            None
+                        };
+                        
+                        (emotion_result, translation_result, tts_result)
                     } else {
-                        (None, None)
+                        (None, None, None)
                     };
                     
                     return Ok(Some(ProcessResult {
                         asr: asr_result,
                         emotion: emotion_result,
                         translation: translation_result,
+                        tts: tts_result,
                     }));
                 } else {
                     // 未检测到边界，检查是否需要输出部分结果（如果启用流式推理）
@@ -311,6 +352,7 @@ impl CoreEngine {
                                 },
                                 emotion: None,
                                 translation: None,
+                                tts: None,
                             }));
                         }
                     }
@@ -338,10 +380,19 @@ impl CoreEngine {
                         
                         // 使用个性化后的 transcript 进行翻译
                         let translation_result = self.translate_and_publish(&personalized_transcript, frame_timestamp).await.ok();
+                        
+                        // 如果翻译成功，进行 TTS 合成
+                        let tts_result = if let Some(ref translation) = translation_result {
+                            self.synthesize_and_publish(translation, frame_timestamp).await.ok()
+                        } else {
+                            None
+                        };
+                        
                         return Ok(Some(ProcessResult {
                             asr: asr_result,
                             emotion: emotion_result,
                             translation: translation_result,
+                            tts: tts_result,
                         }));
                     }
                 }
@@ -355,6 +406,7 @@ impl CoreEngine {
                     asr: asr_result,
                     emotion: None,
                     translation: None,
+                    tts: None,
                 }));
             }
         }
@@ -502,12 +554,58 @@ impl CoreEngine {
         self.event_bus.publish(event).await?;
         Ok(())
     }
+
+    /// TTS 合成并发布事件
+    async fn synthesize_and_publish(
+        &self,
+        translation: &TranslationResponse,
+        timestamp_ms: u64,
+    ) -> EngineResult<TtsStreamChunk> {
+        // 1. 获取目标语言（用于 TTS locale）
+        let config = self.config.current().await?;
+        let target_language = config.target_language.clone();
+        
+        // 2. 构造 TTS 请求
+        let tts_request = TtsRequest {
+            text: translation.translated_text.clone(),
+            voice: "default".to_string(),  // TODO: 后续可以从配置或 Emotion 结果中选择 voice
+            locale: target_language.clone(),
+        };
+        
+        // 3. 执行 TTS 合成
+        let tts_chunk = self.tts.synthesize(tts_request).await?;
+        
+        // 4. 发布 TTS 事件
+        self.publish_tts_event(&tts_chunk, timestamp_ms).await?;
+        
+        Ok(tts_chunk)
+    }
+
+    /// 发布 TTS 事件
+    async fn publish_tts_event(
+        &self,
+        tts_chunk: &TtsStreamChunk,
+        timestamp_ms: u64,
+    ) -> EngineResult<()> {
+        let event = CoreEvent {
+            topic: EventTopic("Tts".to_string()),
+            payload: json!({
+                "audio_length": tts_chunk.audio.len(),
+                "timestamp_ms": tts_chunk.timestamp_ms,
+                "is_last": tts_chunk.is_last,
+            }),
+            timestamp_ms,
+        };
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
 }
 
-/// 处理结果（包含 ASR 和 NMT 结果）
+/// 处理结果（包含 ASR、Emotion、NMT 和 TTS 结果）
 #[derive(Debug, Clone)]
 pub struct ProcessResult {
     pub asr: AsrResult,
     pub emotion: Option<EmotionResponse>,
     pub translation: Option<TranslationResponse>,
+    pub tts: Option<TtsStreamChunk>,
 }

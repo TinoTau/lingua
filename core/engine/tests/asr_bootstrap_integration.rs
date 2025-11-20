@@ -68,7 +68,8 @@ struct DummyEmotion;
 impl EmotionAdapter for DummyEmotion {
     async fn analyze(&self, _request: EmotionRequest) -> EngineResult<EmotionResponse> {
         Ok(EmotionResponse {
-            label: "neutral".to_string(),
+            primary: "neutral".to_string(),
+            intensity: 0.0,
             confidence: 0.5,
         })
     }

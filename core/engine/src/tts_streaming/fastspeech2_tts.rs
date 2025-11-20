@@ -151,12 +151,30 @@ impl FastSpeech2TtsEngine {
             return Err(anyhow!("phone_ids is empty"));
         }
 
-        // 创建输入张量 [1, seq_len]
-        // 注意：如果模型需要 [1, seq_len, 384]，需要在模型内部或预处理阶段做 embedding
-        // 这里假设模型接受整数 ID 输入，内部会处理 embedding
-        let input_array: Array2<i64> = Array2::from_shape_vec(
-            (batch_size, seq_len),
-            phone_ids.to_vec(),
+        // 创建输入张量 [1, seq_len, 384]
+        // 注意：FastSpeech2 模型期望 3 维输入 [batch, seq_len, embedding_dim]
+        // 模型期望 embedding_dim = 384
+        // 由于我们没有 embedding 层，这里使用一个简单的方案：
+        // 将每个 phone ID 扩展为一个 384 维的向量（使用 one-hot 风格的表示）
+        // TODO: 后续应该实现真正的 embedding 层或使用模型内部的 embedding
+        
+        const EMBEDDING_DIM: usize = 384;
+        let phone_ids_f32: Vec<f32> = phone_ids.iter().map(|&id| id as f32).collect();
+        
+        // 创建 3D 数组 [1, seq_len, 384]
+        // 简单方案：将 phone ID 值复制到 embedding 维度的每个位置
+        // 这只是一个临时方案，正确的做法应该是使用 embedding 查找表
+        let mut input_data = Vec::with_capacity(batch_size * seq_len * EMBEDDING_DIM);
+        for &phone_id_f32 in &phone_ids_f32 {
+            // 将 phone_id 值复制到 384 维（简单方案，不是真正的 embedding）
+            for _ in 0..EMBEDDING_DIM {
+                input_data.push(phone_id_f32);
+            }
+        }
+        
+        let input_array: Array3<f32> = Array3::from_shape_vec(
+            (batch_size, seq_len, EMBEDDING_DIM),
+            input_data,
         )?;
 
         // 转换为 ONNX Value
@@ -187,25 +205,24 @@ impl FastSpeech2TtsEngine {
             .into_dimensionality::<Ix3>()
             .map_err(|e| anyhow!("failed to reshape mel-spectrogram: {e}"))?;
 
-        // mel 形状应该是 [batch, mel_dim, time_steps] = [1, 80, time_steps]
-        // 或者可能是 [batch, time_steps, mel_dim] = [1, time_steps, 80]
-        // 需要根据实际模型输出调整
-        
-        // 如果形状是 [1, time_steps, 80]，需要转置为 [1, 80, time_steps]
-        let mel_shape = mel.shape();
-        if mel_shape.len() == 3 {
-            let (b, dim1, dim2) = (mel_shape[0], mel_shape[1], mel_shape[2]);
-            if dim1 == 80 && dim2 > 80 {
-                // 形状是 [1, 80, time_steps]，正确
+        // 根据模型规范，FastSpeech2 输出是 [1, time_steps, 80] = [batch, seq_len, mel_dim]
+        // 不需要转置，保持原样
+        // 注意：HiFiGAN 期望输入是 [1, time_steps, 384]，但 FastSpeech2 输出是 80 维
+        // 这可能是模型不匹配的问题，需要后续处理
+        let mel_shape_vec: Vec<usize> = mel.shape().to_vec(); // 保存形状信息，避免借用问题
+        if mel_shape_vec.len() == 3 {
+            let (_batch, dim1, dim2) = (mel_shape_vec[0], mel_shape_vec[1], mel_shape_vec[2]);
+            // 根据模型规范，输出应该是 [1, time_steps, 80]
+            if dim2 == 80 {
+                // 形状是 [1, time_steps, 80]，符合模型规范，保持原样
                 Ok(mel)
-            } else if dim1 > 80 && dim2 == 80 {
-                // 形状是 [1, time_steps, 80]，需要转置
-                // 使用 swap_axes 转置维度 1 和 2
-                let mel_transposed = mel.swap_axes(1, 2);
+            } else if dim1 == 80 {
+                // 形状是 [1, 80, time_steps]，需要转置为 [1, time_steps, 80]
+                let mel_transposed = mel.permuted_axes([0, 2, 1]);
+                println!("[INFO] Transposed mel-spectrogram from {:?} to {:?}", mel_shape_vec, mel_transposed.shape());
                 Ok(mel_transposed)
             } else {
-                // 未知形状，直接返回（可能需要根据实际模型调整）
-                println!("[WARN] Unexpected mel-spectrogram shape: {:?}", mel_shape);
+                println!("[WARN] Unexpected mel-spectrogram shape: {:?}, expected [1, time_steps, 80]", mel_shape_vec);
                 Ok(mel)
             }
         } else {
@@ -214,6 +231,10 @@ impl FastSpeech2TtsEngine {
     }
 
     /// 运行 HiFiGAN 推理：Mel-spectrogram → 音频波形
+    /// 
+    /// 注意：根据模型规范，HiFiGAN 期望输入是 [1, time_steps, 384]
+    /// 但 FastSpeech2 输出是 [1, time_steps, 80]
+    /// 这可能是模型不匹配的问题，需要特征扩展或使用不同的模型
     fn run_hifigan(
         &self,
         mel: &Array3<f32>,
@@ -221,8 +242,45 @@ impl FastSpeech2TtsEngine {
     ) -> Result<Array1<f32>> {
         let session_guard = self.get_hifigan_session(locale)?.lock().unwrap();
 
-        // 准备输入：mel-spectrogram [batch, mel_dim, time_steps]
-        let arr_dyn = mel.clone().into_dyn();
+        // 根据模型规范，HiFiGAN 期望输入是 [1, time_steps, 384]
+        // 但 FastSpeech2 输出是 [1, time_steps, 80]
+        // 这里需要将 80 维扩展到 384 维
+        // TODO: 这可能是模型不匹配的问题，需要检查模型是否配对
+        
+        let mel_shape = mel.shape();
+        if mel_shape.len() != 3 || mel_shape[0] != 1 {
+            return Err(anyhow!("Invalid mel-spectrogram shape: {:?}, expected [1, time_steps, 80]", mel_shape));
+        }
+        
+        let (batch, time_steps, mel_dim) = (mel_shape[0], mel_shape[1], mel_shape[2]);
+        
+        // 如果 mel_dim 是 80，需要扩展到 384
+        // 简单方案：将 80 维复制/扩展为 384 维（这不是正确的做法，但可以测试）
+        let hifigan_input = if mel_dim == 80 {
+            // 将 80 维扩展到 384 维
+            // 方案：将每个 80 维向量重复 4.8 次（384/80 = 4.8），然后截断
+            const TARGET_DIM: usize = 384;
+            let mut expanded_data = Vec::with_capacity(batch * time_steps * TARGET_DIM);
+            
+            for t in 0..time_steps {
+                for d in 0..TARGET_DIM {
+                    // 循环使用 80 维的值
+                    let src_idx = d % mel_dim;
+                    expanded_data.push(mel[[0, t, src_idx]]);
+                }
+            }
+            
+            Array3::from_shape_vec((batch, time_steps, TARGET_DIM), expanded_data)
+                .map_err(|e| anyhow!("Failed to expand mel to 384 dim: {e}"))?
+        } else if mel_dim == 384 {
+            // 已经是 384 维，直接使用
+            mel.clone()
+        } else {
+            return Err(anyhow!("Unsupported mel-spectrogram dimension: {}, expected 80 or 384", mel_dim));
+        };
+
+        // 准备输入：HiFiGAN 期望 [1, time_steps, 384]
+        let arr_dyn = hifigan_input.into_dyn();
         let arr_owned = arr_dyn.to_owned();
         let cow_arr = CowArray::from(arr_owned);
         let input_value = Value::from_array(ptr::null_mut(), &cow_arr)
@@ -245,19 +303,121 @@ impl FastSpeech2TtsEngine {
             .map_err(|e| anyhow!("failed to extract audio tensor: {e}"))?;
         let view = tensor.view();
         
-        // 音频形状可能是 [batch, samples] 或 [samples]
-        let audio: Array1<f32> = if view.ndim() == 2 {
-            // [batch, samples] -> 取第一行
-            let audio_2d: Array2<f32> = view
-                .to_owned()
-                .into_dimensionality::<Ix2>()
-                .map_err(|e| anyhow!("failed to reshape audio to 2D: {e}"))?;
-            audio_2d.row(0).to_owned()
-        } else {
-            // [samples]
-            view.to_owned()
-                .into_dimensionality::<ndarray::Ix1>()
-                .map_err(|e| anyhow!("failed to reshape audio to 1D: {e}"))?
+        println!("[DEBUG HiFiGAN] Output shape: {:?}, ndim: {}", view.shape(), view.ndim());
+        
+        // 根据模型规范，HiFiGAN 输出是 [1, '?', 80] = [batch, time_steps, feature_dim]
+        // 这不是标准的音频波形，需要特殊处理
+        // 可能的处理方式：
+        // 1. 如果是 3 维，可能是特征序列，需要进一步处理
+        // 2. 如果是 2 维或 1 维，可能是音频波形
+        let audio: Array1<f32> = match view.ndim() {
+            3 => {
+                // [batch, time_steps, feature_dim] = [1, time_steps, 80]
+                let audio_3d: Array3<f32> = view
+                    .to_owned()
+                    .into_dimensionality::<Ix3>()
+                    .map_err(|e| anyhow!("failed to reshape audio to 3D: {e}"))?;
+                
+                let shape = audio_3d.shape();
+                let (_batch, time_steps, feature_dim) = (shape[0], shape[1], shape[2]);
+                
+                println!("[DEBUG HiFiGAN] 3D output shape: [batch={}, time_steps={}, feature_dim={}]", 
+                    _batch, time_steps, feature_dim);
+                
+                // 打印前几个值，看看数据范围
+                if time_steps > 0 && feature_dim > 0 {
+                    let sample_00 = audio_3d[[0, 0, 0]];
+                    let sample_01 = audio_3d[[0, 0, 1]];
+                    let sample_10 = if time_steps > 1 { audio_3d[[0, 1, 0]] } else { sample_00 };
+                    println!("[DEBUG HiFiGAN] Sample values: [0,0,0]={:.6}, [0,0,1]={:.6}, [0,1,0]={:.6}", 
+                        sample_00, sample_01, sample_10);
+                }
+                
+                // 问题：HiFiGAN 输出 [1, time_steps, 80] 不是音频波形
+                // 可能的情况：
+                // 1. 这个模型不是标准的 vocoder，而是中间层输出
+                // 2. 需要额外的后处理步骤
+                // 3. 模型导出有问题
+                // 
+                // 临时方案：尝试将 80 维特征转换为音频
+                // 假设每个 time_step 对应一个音频帧，80 维是 mel 特征
+                // 但这不对，因为 vocoder 应该输出音频波形，不是 mel 特征
+                
+                println!("[WARN] HiFiGAN output is 3D: {:?}, expected audio waveform [samples].", shape);
+                println!("[WARN] This model may not be a standard vocoder. Attempting to extract audio...");
+                
+                // 尝试方案 1：如果 feature_dim == 1，可能是 [batch, time_steps, 1]，展平为 [time_steps]
+                if feature_dim == 1 {
+                    println!("[INFO] feature_dim == 1, treating as [batch, time_steps, 1] -> [time_steps]");
+                    let mut audio_data = Vec::with_capacity(time_steps);
+                    for t in 0..time_steps {
+                        audio_data.push(audio_3d[[0, t, 0]]);
+                    }
+                    return Ok(Array1::from_vec(audio_data));
+                }
+                
+                // 尝试方案 2：如果 time_steps == 1，可能是 [batch, 1, samples]，展平为 [samples]
+                if time_steps == 1 {
+                    println!("[INFO] time_steps == 1, treating as [batch, 1, samples] -> [samples]");
+                    let mut audio_data = Vec::with_capacity(feature_dim);
+                    for d in 0..feature_dim {
+                        audio_data.push(audio_3d[[0, 0, d]]);
+                    }
+                    return Ok(Array1::from_vec(audio_data));
+                }
+                
+                // 尝试方案 3：转置后展平
+                // 也许输出格式是 [1, mel_dim, time_steps] 而不是 [1, time_steps, mel_dim]
+                // 尝试转置： [1, 4, 80] -> [1, 80, 4]
+                println!("[INFO] Attempting transpose: [1, {}, {}] -> [1, {}, {}]", 
+                    time_steps, feature_dim, feature_dim, time_steps);
+                let audio_transposed = audio_3d.permuted_axes([0, 2, 1]);
+                let transposed_shape = audio_transposed.shape();
+                println!("[INFO] Transposed shape: {:?}", transposed_shape);
+                
+                // 转置后，如果 feature_dim (80) 是 mel 维度，time_steps (4) 是时间步
+                // 那么可能需要将 80 维 mel 特征转换为音频
+                // 但这里我们暂时尝试展平转置后的结果
+                let total_samples = feature_dim * time_steps;  // 80 * 4 = 320
+                let mut audio_data = Vec::with_capacity(total_samples);
+                for d in 0..feature_dim {
+                    for t in 0..time_steps {
+                        audio_data.push(audio_transposed[[0, d, t]]);
+                    }
+                }
+                
+                // 打印展平后的统计信息
+                if !audio_data.is_empty() {
+                    let min_val = audio_data.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+                    let max_val = audio_data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                    let mean_val = audio_data.iter().sum::<f32>() / audio_data.len() as f32;
+                    println!("[DEBUG HiFiGAN] Transposed and flattened audio stats: min={:.6}, max={:.6}, mean={:.6}, len={}", 
+                        min_val, max_val, mean_val, audio_data.len());
+                }
+                
+                Array1::from_vec(audio_data)
+            }
+            2 => {
+                // [batch, samples] -> 取第一行
+                let audio_2d: Array2<f32> = view
+                    .to_owned()
+                    .into_dimensionality::<Ix2>()
+                    .map_err(|e| anyhow!("failed to reshape audio to 2D: {e}"))?;
+                let shape = audio_2d.shape();
+                println!("[DEBUG HiFiGAN] 2D output shape: {:?}, taking first row", shape);
+                audio_2d.row(0).to_owned()
+            }
+            1 => {
+                // [samples]
+                let shape = view.shape();
+                println!("[DEBUG HiFiGAN] 1D output shape: {:?} (this is correct for audio waveform)", shape);
+                view.to_owned()
+                    .into_dimensionality::<ndarray::Ix1>()
+                    .map_err(|e| anyhow!("failed to reshape audio to 1D: {e}"))?
+            }
+            _ => {
+                return Err(anyhow!("Unexpected audio output dimensions: {}", view.ndim()));
+            }
         };
 
         Ok(audio)
@@ -309,7 +469,6 @@ impl FastSpeech2TtsEngine {
         
         let mut chunks = Vec::new();
         let mut offset = 0;
-        let mut chunk_index = 0;
         
         while offset < audio.len() {
             let chunk_end = (offset + chunk_size_bytes).min(audio.len());
@@ -325,7 +484,6 @@ impl FastSpeech2TtsEngine {
             chunks.push((chunk_audio, timestamp_ms, is_last));
             
             offset = chunk_end;
-            chunk_index += 1;
         }
         
         // 如果没有 chunk，至少返回一个空 chunk
@@ -356,7 +514,11 @@ impl TtsStreaming for FastSpeech2TtsEngine {
         let phone_ids = text_processor.text_to_phone_ids(&request.text)
             .map_err(|e| EngineError::new(format!("text preprocessing failed: {e}")))?;
 
+        println!("[DEBUG TTS] Text: '{}', Phone IDs: {:?} (length: {})", 
+            request.text, phone_ids, phone_ids.len());
+
         if phone_ids.is_empty() {
+            println!("[DEBUG TTS] Phone IDs is empty, returning empty audio");
             return Ok(TtsStreamChunk {
                 audio: vec![],
                 timestamp_ms: 0,
@@ -370,6 +532,7 @@ impl TtsStreaming for FastSpeech2TtsEngine {
 
         // 验证 mel-spectrogram 形状
         let mel_shape = mel.shape();
+        println!("[DEBUG TTS] Mel-spectrogram shape: {:?}", mel_shape);
         if mel_shape.len() != 3 || mel_shape[0] != 1 {
             return Err(EngineError::new(format!(
                 "Invalid mel-spectrogram shape: {:?}, expected [1, mel_dim, time_steps]",
@@ -381,15 +544,76 @@ impl TtsStreaming for FastSpeech2TtsEngine {
         let audio_waveform = self.run_hifigan(&mel, &request.locale)
             .map_err(|e| EngineError::new(format!("HiFiGAN inference failed: {e}")))?;
 
+        println!("[DEBUG TTS] Audio waveform length: {} samples", audio_waveform.len());
+        if !audio_waveform.is_empty() {
+            let min_val = audio_waveform.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+            let max_val = audio_waveform.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let mean_val = audio_waveform.iter().sum::<f32>() / audio_waveform.len() as f32;
+            println!("[DEBUG TTS] Audio waveform stats (before normalization): min={:.6}, max={:.6}, mean={:.6}", 
+                min_val, max_val, mean_val);
+        }
+
         if audio_waveform.is_empty() {
             return Err(EngineError::new("HiFiGAN produced empty audio"));
         }
 
-        // 4. 转换为 PCM 16-bit 字节
-        let pcm_audio = self.audio_to_pcm16(&audio_waveform);
+        // 4. 归一化音频波形到 [-1.0, 1.0] 范围
+        // HiFiGAN 输出可能不在标准音频范围内，需要归一化
+        let normalized_audio = if !audio_waveform.is_empty() {
+            let min_val = audio_waveform.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+            let max_val = audio_waveform.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let range = max_val - min_val;
+            
+            if range > 1e-6 {
+                // 归一化到 [-1.0, 1.0]
+                let normalized = audio_waveform.mapv(|x| {
+                    let normalized = (x - min_val) / range; // [0, 1]
+                    normalized * 2.0 - 1.0 // [-1, 1]
+                });
+                
+                // 打印归一化后的统计信息
+                let norm_min = normalized.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+                let norm_max = normalized.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                let norm_mean = normalized.iter().sum::<f32>() / normalized.len() as f32;
+                println!("[DEBUG TTS] Audio waveform stats (after normalization): min={:.6}, max={:.6}, mean={:.6}", 
+                    norm_min, norm_max, norm_mean);
+                
+                normalized
+            } else {
+                // 如果范围太小（可能是常数），直接使用原值或返回零
+                println!("[WARN] Audio waveform range too small: {:.6}, using original values", range);
+                audio_waveform.clone()
+            }
+        } else {
+            audio_waveform.clone()
+        };
+
+        // 5. 转换为 PCM 16-bit 字节
+        let pcm_audio = self.audio_to_pcm16(&normalized_audio);
+
+        println!("[DEBUG TTS] PCM audio length: {} bytes ({} samples)", 
+            pcm_audio.len(), pcm_audio.len() / 2);
+        
+        // 检查 PCM 数据是否全为 0
+        let non_zero_count = pcm_audio.iter().filter(|&&b| b != 0).count();
+        println!("[DEBUG TTS] PCM non-zero bytes: {} / {} ({:.1}%)", 
+            non_zero_count, pcm_audio.len(), 
+            (non_zero_count as f32 / pcm_audio.len() as f32) * 100.0);
+        
+        // 检查前几个 PCM 样本的值
+        if pcm_audio.len() >= 4 {
+            let sample1 = i16::from_le_bytes([pcm_audio[0], pcm_audio[1]]);
+            let sample2 = i16::from_le_bytes([pcm_audio[2], pcm_audio[3]]);
+            println!("[DEBUG TTS] First 2 PCM samples: {}, {}", sample1, sample2);
+        }
 
         if pcm_audio.is_empty() {
             return Err(EngineError::new("PCM conversion produced empty audio"));
+        }
+        
+        // 如果 PCM 数据全为 0，发出警告
+        if non_zero_count == 0 {
+            println!("[WARN] PCM audio data is all zeros! This will produce silence.");
         }
 
         // 5. 创建 chunk（当前实现：一次性返回完整音频）

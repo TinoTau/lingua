@@ -1,4 +1,6 @@
 mod fastspeech2_tts;
+mod vits_tts;
+mod vits_zh_aishell3_tokenizer;
 mod text_processor;
 mod audio_utils;
 mod stub;
@@ -9,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::EngineResult;
 
 pub use fastspeech2_tts::FastSpeech2TtsEngine;
+pub use vits_tts::VitsTtsEngine;
 pub use stub::TtsStub;
 pub use text_processor::TextProcessor;
 pub use audio_utils::{save_pcm_to_wav, validate_pcm_audio};

@@ -85,7 +85,8 @@ struct DummyEmotion;
 impl EmotionAdapter for DummyEmotion {
     async fn analyze(&self, _request: EmotionRequest) -> EngineResult<EmotionResponse> {
         Ok(EmotionResponse {
-            label: "neutral".to_string(),
+            primary: "neutral".to_string(),
+            intensity: 0.0,
             confidence: 0.5,
         })
     }
@@ -213,7 +214,7 @@ async fn test_vad_integration_boundary_trigger() {
         if let Some(asr_result) = result {
             asr_result_count += 1;
             println!("  帧 {}: 检测到边界，ASR 推理完成", i + 1);
-            if let Some(ref final_transcript) = asr_result.final_transcript {
+            if let Some(ref final_transcript) = asr_result.asr.final_transcript {
                 println!("    转录结果: {}", final_transcript.text);
             }
         } else {

@@ -58,7 +58,7 @@ fn test_text_normalization() {
         ("test\nwith\nnewlines", "test with newlines"),
     ];
     
-    for (input, expected_prefix) in test_cases {
+    for (input, _expected_prefix) in test_cases {
         let normalized = processor.normalize_text(input);
         println!("Input: '{}' -> Normalized: '{}'", input, normalized);
         assert!(!normalized.is_empty());

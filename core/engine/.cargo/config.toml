@@ -1,0 +1,8 @@
+# .cargo/config.toml
+# 根据 WINDOWS_RUNTIME_LIBRARY_MISMATCH_FIX.md，统一使用动态运行时 /MD
+# 强制所有 C/C++ 代码（包括 esaxx-rs）使用 /MD，避免与 whisper-rs 的 /MT 冲突
+
+[target.x86_64-pc-windows-msvc]
+# 注意：.cargo/config.toml 不支持 [env] 配置
+# 需要在编译时通过环境变量设置，或使用 build.rs
+

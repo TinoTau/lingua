@@ -86,7 +86,8 @@ struct DummyEmotion;
 impl EmotionAdapter for DummyEmotion {
     async fn analyze(&self, _request: EmotionRequest) -> EngineResult<EmotionResponse> {
         Ok(EmotionResponse {
-            label: "neutral".to_string(),
+            primary: "neutral".to_string(),
+            intensity: 0.0,
             confidence: 0.5,
         })
     }
@@ -217,18 +218,18 @@ async fn test_streaming_partial_results() {
             .expect("Failed to process audio frame");
 
         if let Some(asr_result) = result {
-            if asr_result.partial.is_some() && !asr_result.partial.as_ref().unwrap().is_final {
+            if asr_result.asr.partial.is_some() && !asr_result.asr.partial.as_ref().unwrap().is_final {
                 partial_result_count += 1;
                 println!("  帧 {}: 部分结果", i + 1);
-                if let Some(ref partial) = asr_result.partial {
+                if let Some(ref partial) = asr_result.asr.partial {
                     println!("    文本: {}", partial.text);
                     println!("    置信度: {:.2}", partial.confidence);
                 }
             }
-            if asr_result.final_transcript.is_some() {
+            if asr_result.asr.final_transcript.is_some() {
                 final_result_count += 1;
                 println!("  帧 {}: 最终结果（边界）", i + 1);
-                if let Some(ref final_transcript) = asr_result.final_transcript {
+                if let Some(ref final_transcript) = asr_result.asr.final_transcript {
                     println!("    文本: {}", final_transcript.text);
                 }
             }
