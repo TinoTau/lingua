@@ -1,15 +1,18 @@
 //! 完整 S2S 流集成测试（简化版）：使用真实的 ASR 和 NMT
 //! 
 //! 使用方法：
-//!   cargo run --example test_s2s_full_simple -- <input_wav_file>
+//!   cargo run --example test_s2s_full_simple -- <input_wav_file> [--direction <en-zh|zh-en>]
 //! 
 //! 示例：
-//!   cargo run --example test_s2s_full_simple -- test_output/s2s_flow_test.wav
+//!   cargo run --example test_s2s_full_simple -- test_output/s2s_flow_test.wav --direction en-zh
+//!   cargo run --example test_s2s_full_simple -- test_output/s2s_flow_test.wav --direction zh-en
 //! 
 //! 前提条件：
 //!   1. WSL2 中已启动 Piper HTTP 服务（http://127.0.0.1:5005/tts）
 //!   2. Whisper ASR 模型已下载到 core/engine/models/asr/whisper-base/
-//!   3. Marian NMT 模型已下载到 core/engine/models/nmt/marian-zh-en/
+//!   3. Marian NMT 模型已下载：
+//!      - core/engine/models/nmt/marian-en-zh/ (英文→中文)
+//!      - core/engine/models/nmt/marian-zh-en/ (中文→英文)
 //!   4. 输入音频文件（WAV 格式）
 
 use std::fs;
@@ -84,6 +87,58 @@ fn load_wav_to_audio_frame(wav_path: &PathBuf) -> Result<Vec<AudioFrame>, Box<dy
     Ok(frames)
 }
 
+/// 翻译方向配置
+#[derive(Debug, Clone)]
+enum TranslationDirection {
+    EnToZh,  // 英文 → 中文
+    ZhToEn,  // 中文 → 英文
+}
+
+impl TranslationDirection {
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "en-zh" | "en_zh" => Ok(TranslationDirection::EnToZh),
+            "zh-en" | "zh_en" => Ok(TranslationDirection::ZhToEn),
+            _ => Err(format!("无效的方向: {}，支持的方向: en-zh, zh-en", s)),
+        }
+    }
+
+    fn nmt_model_name(&self) -> &'static str {
+        match self {
+            TranslationDirection::EnToZh => "marian-en-zh",
+            TranslationDirection::ZhToEn => "marian-zh-en",
+        }
+    }
+
+    fn source_language_hint(&self) -> &'static str {
+        match self {
+            TranslationDirection::EnToZh => "en",
+            TranslationDirection::ZhToEn => "zh",
+        }
+    }
+
+    fn target_language(&self) -> &'static str {
+        match self {
+            TranslationDirection::EnToZh => "zh",
+            TranslationDirection::ZhToEn => "en",
+        }
+    }
+
+    fn tts_voice(&self) -> &'static str {
+        match self {
+            TranslationDirection::EnToZh => "zh_CN-huayan-medium",  // 中文 TTS
+            TranslationDirection::ZhToEn => "zh_CN-huayan-medium",  // 暂时使用中文，未来可添加英文 TTS
+        }
+    }
+
+    fn tts_locale(&self) -> &'static str {
+        match self {
+            TranslationDirection::EnToZh => "zh-CN",
+            TranslationDirection::ZhToEn => "zh-CN",  // 暂时使用中文，未来可添加英文 TTS
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== 完整 S2S 流集成测试（简化版 - 真实 ASR + NMT + Piper TTS） ===\n");
@@ -91,8 +146,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 解析命令行参数
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("用法: cargo run --example test_s2s_full_simple -- <input_wav_file>");
-        eprintln!("示例: cargo run --example test_s2s_full_simple -- test_output/s2s_flow_test.wav");
+        eprintln!("用法: cargo run --example test_s2s_full_simple -- <input_wav_file> [--direction <en-zh|zh-en>]");
+        eprintln!("示例: cargo run --example test_s2s_full_simple -- test_output/s2s_flow_test.wav --direction en-zh");
+        eprintln!("      cargo run --example test_s2s_full_simple -- test_output/s2s_flow_test.wav --direction zh-en");
         return Err("缺少输入音频文件路径".into());
     }
     
@@ -100,6 +156,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !input_wav.exists() {
         return Err(format!("输入文件不存在: {}", input_wav.display()).into());
     }
+
+    // 解析翻译方向参数（默认为 en-zh）
+    let direction = if args.len() >= 4 && args[2] == "--direction" {
+        TranslationDirection::from_str(&args[3])?
+    } else {
+        println!("[INFO] 未指定 --direction，默认使用 en-zh（英文→中文）");
+        TranslationDirection::EnToZh
+    };
+
+    println!("[配置] 翻译方向: {} → {}", 
+        direction.source_language_hint(), 
+        direction.target_language());
+    println!("[配置] NMT 模型: {}", direction.nmt_model_name());
+    println!("[配置] TTS 声库: {}", direction.tts_voice());
 
     // 检查服务是否运行
     println!("[1/7] 检查 Piper HTTP 服务状态...");
@@ -148,13 +218,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     AsrStreaming::initialize(&asr).await
         .map_err(|e| format!("Failed to initialize ASR: {}", e))?;
 
-    // 加载 NMT
+    // 加载 NMT（根据翻译方向选择模型）
     println!("\n[4/7] 加载 Marian NMT...");
-    let nmt_model_dir = crate_root.join("models/nmt/marian-zh-en");
+    let nmt_model_name = direction.nmt_model_name();
+    let nmt_model_dir = crate_root.join("models/nmt").join(nmt_model_name);
     if !nmt_model_dir.exists() {
-        return Err(format!("Marian NMT 模型目录不存在: {}", nmt_model_dir.display()).into());
+        return Err(format!("Marian NMT 模型目录不存在: {}，请确保模型已下载", nmt_model_dir.display()).into());
     }
     
+    println!("  模型路径: {}", nmt_model_dir.display());
     let nmt = core_engine::MarianNmtOnnx::new_from_dir(&nmt_model_dir)
         .map_err(|e| format!("Failed to load Marian NMT: {}", e))?;
     println!("[OK] Marian NMT 加载成功");
@@ -170,7 +242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (i, frame) in audio_frames.iter().enumerate() {
         let asr_request = AsrRequest {
             frame: frame.clone(),
-            language_hint: Some("zh".to_string()), // 中文
+            language_hint: Some(direction.source_language_hint().to_string()),
         };
         
         let asr_result = AsrStreaming::infer(&asr, asr_request).await
@@ -193,10 +265,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     println!("[OK] ASR 识别完成");
-    println!("  源文本（中文）: {}", source_text);
+    println!("  源文本（{}）: {}", direction.source_language_hint(), source_text);
 
     // 步骤 2: NMT 翻译
     println!("\n[6/7] 执行 NMT 翻译...");
+    println!("  翻译方向: {} → {}", direction.source_language_hint(), direction.target_language());
     
     // 创建 PartialTranscript 用于翻译请求
     let transcript = core_engine::types::PartialTranscript {
@@ -207,7 +280,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let translation_request = TranslationRequest {
         transcript,
-        target_language: "en".to_string(),
+        target_language: direction.target_language().to_string(),
         wait_k: None,
     };
     
@@ -216,23 +289,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let target_text = translation_response.translated_text;
     println!("[OK] NMT 翻译完成");
-    println!("  目标文本（英文）: {}", target_text);
+    println!("  目标文本（{}）: {}", direction.target_language(), target_text);
     println!("  翻译稳定: {}", translation_response.is_stable);
+    
+    // 日志：NMT 输出的纯文本（送进 TTS 之前）
+    println!("\n[日志] NMT 输出文本（送进 TTS 之前）: \"{}\"", target_text);
 
-    // 步骤 3: TTS 合成（使用 Piper HTTP TTS 合成中文语音）
+    // 步骤 3: TTS 合成（使用 Piper HTTP TTS 合成目标语言语音）
     println!("\n[7/7] 执行 TTS 合成（Piper HTTP）...");
-    println!("  说明: 合成中文语音用于回放源语言");
+    println!("  说明: 合成{}语音用于回放翻译结果", direction.target_language());
     
     // 创建 TTS 客户端
     let config = core_engine::tts_streaming::PiperHttpConfig::default();
     let tts_client = core_engine::tts_streaming::PiperHttpTts::new(config)
         .map_err(|e| format!("Failed to create PiperHttpTts: {}", e))?;
     
+    // 修复：使用 target_text 而不是 source_text
     let tts_request = TtsRequest {
-        text: source_text.clone(), // 使用源文本（中文）进行 TTS
-        voice: "zh_CN-huayan-medium".to_string(),
-        locale: "zh-CN".to_string(),
+        text: target_text.clone(), // 使用翻译后的目标文本进行 TTS
+        voice: direction.tts_voice().to_string(),
+        locale: direction.tts_locale().to_string(),
     };
+    
+    // 日志：送进 Piper 的文本（如果中间有任何正则/分词/拼音转换，要看转换后的结果）
+    println!("\n[日志] 送进 Piper TTS 的文本: \"{}\"", tts_request.text);
     
     let start_time = std::time::Instant::now();
     let chunk = TtsStreaming::synthesize(&tts_client, tts_request).await
@@ -276,17 +356,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n完整 S2S 流程测试总结：");
     println!("  ✅ 步骤 1: ASR 识别（真实 Whisper）");
     println!("    输入: 音频文件 {}", input_wav.display());
-    println!("    输出: \"{}\"", source_text);
+    println!("    输出（{}）: \"{}\"", direction.source_language_hint(), source_text);
     println!();
-    println!("  ✅ 步骤 2: NMT 翻译（真实 Marian）");
-    println!("    输入: \"{}\"", source_text);
-    println!("    输出: \"{}\"", target_text);
+    println!("  ✅ 步骤 2: NMT 翻译（真实 Marian，{}）", direction.nmt_model_name());
+    println!("    输入（{}）: \"{}\"", direction.source_language_hint(), source_text);
+    println!("    输出（{}）: \"{}\"", direction.target_language(), target_text);
     println!();
     println!("  ✅ 步骤 3: TTS 合成（Piper HTTP）");
-    println!("    输入: \"{}\"", source_text);
+    println!("    输入（{}）: \"{}\"", direction.target_language(), target_text);
     println!("    输出: {} 字节 WAV 音频", chunk.audio.len());
     println!();
-    println!("  完整流程: 中文语音 → 中文文本 → 英文文本 → 中文语音");
+    println!("  完整流程: {}语音 → {}文本 → {}文本 → {}语音", 
+        direction.source_language_hint(),
+        direction.source_language_hint(),
+        direction.target_language(),
+        direction.target_language());
     println!();
     println!("下一步：");
     println!("  1. 播放音频文件验证语音质量: {}", output_file.display());

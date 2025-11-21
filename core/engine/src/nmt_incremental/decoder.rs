@@ -132,10 +132,12 @@ impl MarianNmtOnnx {
             state.input_ids.clone(),
         )?;
         
-        println!(
-            "[decoder_step] input_ids shape: {:?}",
-            decoder_input_ids.shape()
-        );
+        // 打印输入信息（在转换为 Value 之前）
+        println!("[Input Construction] Basic inputs:");
+        println!("  - encoder_attention_mask: shape {:?}", encoder_attention_mask.shape());
+        println!("  - decoder_input_ids: shape {:?}", decoder_input_ids.shape());
+        println!("  - encoder_hidden_states: shape {:?}", encoder_hidden_states.shape());
+        println!("  - use_cache_branch: {}", state.use_cache_branch);
 
         // 2. use_cache_branch: [1]，类型是 Bool（根据模型输入定义）
         let use_cache_array = Array1::<bool>::from_vec(vec![state.use_cache_branch]);
@@ -152,7 +154,7 @@ impl MarianNmtOnnx {
             }};
         }
 
-        let input_ids_value = array_to_value!(decoder_input_ids, i64)?;
+        let input_ids_value = array_to_value!(decoder_input_ids.clone(), i64)?;
         let encoder_states_value = array_to_value!(encoder_hidden_states.clone(), f32)?;
         let encoder_mask_value = array_to_value!(encoder_attention_mask.clone(), i64)?;
         let use_cache_value = array_to_value!(use_cache_array, bool)?;
@@ -176,41 +178,62 @@ impl MarianNmtOnnx {
         // 准备 decoder KV cache
         let decoder_kv = if state.use_cache_branch && state.decoder_kv_cache.is_some() {
             // 正常模式：使用历史 decoder KV cache
+            println!("[KV Cache] Using existing decoder KV cache");
             state.decoder_kv_cache.take().unwrap()
         } else {
             // 第一步：使用零占位符
-            self.build_zero_decoder_kv()?
+            println!("[KV Cache] Building zero decoder KV cache...");
+            let kv = self.build_zero_decoder_kv()?;
+            println!("[KV Cache] Decoder KV cache built: {} layers, shape [1, {}, 1, {}]", 
+                Self::NUM_LAYERS, Self::NUM_HEADS, Self::HEAD_DIM);
+            kv
         };
         
         // 构建完整的 KV cache 输入（模型需要 4 个值：dec_k, dec_v, enc_k, enc_v）
         // 根据 marian_nmt_interface_spec.md：Encoder KV 始终使用静态占位符
         // 注意：由于 Value 不支持 Clone，我们需要在每次步骤中重新创建 encoder KV
         // 但由于 encoder KV 是静态的（全零），每次创建相同的值
+        println!("[KV Cache] Building static encoder KV cache for encoder_seq_len={}...", encoder_seq_len);
         let static_enc_kv = self.build_static_encoder_kv(encoder_seq_len)?;
+        println!("[KV Cache] Encoder KV cache built: {} layers, shape [1, {}, {}, {}]", 
+            Self::NUM_LAYERS, Self::NUM_HEADS, encoder_seq_len, Self::HEAD_DIM);
         let mut decoder_kv_iter = decoder_kv.into_iter();
         let mut static_enc_kv_iter = static_enc_kv.into_iter();
         
+        println!("[KV Cache] Assembling KV cache inputs for {} layers...", Self::NUM_LAYERS);
         for layer_idx in 0..Self::NUM_LAYERS {
             // Decoder KV
             let (dec_k, dec_v) = decoder_kv_iter.next()
                 .ok_or_else(|| anyhow!("insufficient decoder KV cache for layer {}", layer_idx))?;
+            println!("[KV Cache] Layer {}: decoder_k shape [1, {}, 1, {}], decoder_v shape [1, {}, 1, {}]", 
+                layer_idx, Self::NUM_HEADS, Self::HEAD_DIM, Self::NUM_HEADS, Self::HEAD_DIM);
             input_values.push(dec_k);
             input_values.push(dec_v);
             
             // Encoder KV: 使用静态占位符（每次步骤都相同）
             let (enc_k, enc_v) = static_enc_kv_iter.next()
                 .ok_or_else(|| anyhow!("insufficient static encoder KV for layer {}", layer_idx))?;
+            println!("[KV Cache] Layer {}: encoder_k shape [1, {}, {}, {}], encoder_v shape [1, {}, {}, {}]", 
+                layer_idx, Self::NUM_HEADS, encoder_seq_len, Self::HEAD_DIM, 
+                Self::NUM_HEADS, encoder_seq_len, Self::HEAD_DIM);
             input_values.push(enc_k);
             input_values.push(enc_v);
         }
+        println!("[KV Cache] Total KV cache inputs: {} ({} layers × 4 KV per layer)", 
+            Self::NUM_LAYERS * 4, Self::NUM_LAYERS);
 
         // 5. use_cache_branch
         input_values.push(use_cache_value);
 
+        println!("[Input Construction] Total inputs prepared: {}", input_values.len());
+        println!("[Input Construction] Input order: encoder_attention_mask, input_ids, encoder_hidden_states, past_key_values.* ({} KV), use_cache_branch", Self::NUM_LAYERS * 4);
+
         // 5. 调用 session.run
+        println!("[Decoder] Calling decoder_session.run() with {} inputs...", input_values.len());
         let decoder_session = self.decoder_session.lock().unwrap();
         let outputs: Vec<Value<'static>> = decoder_session.run(input_values)
             .map_err(|e| anyhow!("failed to run decoder model: {e}"))?;
+        println!("[Decoder] decoder_session.run() completed, got {} outputs", outputs.len());
 
         // 6. 从输出中提取 logits + 新 KV
         // logits 是唯一需要转回 ndarray 的
