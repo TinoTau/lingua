@@ -18,6 +18,7 @@ pub use tokenizer::MarianTokenizer;
 pub use m2m100_tokenizer::M2M100Tokenizer;
 pub use language_pair::{LanguageCode, LanguagePair};
 pub use types::{TranslationRequest, TranslationResponse};
+pub use crate::types::PartialTranscript;
 pub use nmt_trait::NmtIncremental;
 pub use utils::{load_marian_onnx_for_smoke_test, translate_full_sentence_stub};
 pub use stub::MarianNmtStub;

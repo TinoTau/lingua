@@ -17,6 +17,9 @@ pub mod onnx_utils;
 pub mod health_check;
 pub mod post_processing;
 pub mod performance_logger;
+pub mod text_segmentation;
+pub mod translation_quality;
+pub mod tts_audio_enhancement;
 
 pub use bootstrap::{CoreEngine, CoreEngineBuilder, ProcessResult};
 pub use cache_manager::CacheManager;
@@ -37,3 +40,5 @@ pub use asr_streaming::{AsrRequest, AsrResult, AsrStreaming};
 pub use health_check::{HealthChecker, ServiceHealth};
 pub use post_processing::TextPostProcessor;
 pub use performance_logger::{PerformanceLog, PerformanceLogger};
+pub use tts_audio_enhancement::{AudioEnhancer, AudioEnhancementConfig};
+pub use translation_quality::TranslationQualityChecker;

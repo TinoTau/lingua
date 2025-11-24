@@ -1,5 +1,8 @@
 // tests/nmt_quick_test.rs
 // 快速测试脚本：测试 NMT 的核心功能
+// 
+// ⚠️ 已废弃：此测试使用 ONNX decoder，已不再使用。
+// 当前系统已切换为 Python NMT 服务（HTTP 调用）。
 
 use std::path::PathBuf;
 use core_engine::nmt_incremental::MarianNmtOnnx;
@@ -7,6 +10,7 @@ use core_engine::onnx_utils;
 
 /// 快速测试：模型加载和基本翻译
 #[test]
+#[ignore] // 已废弃：使用 ONNX decoder，不再参与 CI
 fn test_quick_nmt() {
     println!("\n========== Quick NMT Test ==========");
     

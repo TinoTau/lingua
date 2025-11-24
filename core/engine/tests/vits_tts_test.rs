@@ -2,6 +2,8 @@ use std::path::PathBuf;
 use core_engine::tts_streaming::{TtsStreaming, TtsRequest, VitsTtsEngine};
 use std::sync::Arc;
 
+const TEST_OUTPUT_DIR: &str = r"D:\Programs\github\lingua\test_output";
+
 /// 测试 VITS TTS 引擎加载
 #[test]
 fn test_vits_tts_engine_load() {
@@ -59,7 +61,7 @@ async fn test_vits_tts_synthesize_english() {
             println!("   Is last: {}", chunk.is_last);
             
             // 保存音频文件用于验证
-            let output_dir = crate_root.join("test_output");
+            let output_dir = PathBuf::from(TEST_OUTPUT_DIR);
             std::fs::create_dir_all(&output_dir).ok();
             let output_path = output_dir.join("vits_tts_test_english.wav");
             
@@ -162,7 +164,7 @@ async fn test_vits_tts_synthesize_chinese() {
             println!("   Is last: {}", chunk.is_last);
             
             // 保存音频文件用于验证
-            let output_dir = crate_root.join("test_output");
+            let output_dir = PathBuf::from(TEST_OUTPUT_DIR);
             std::fs::create_dir_all(&output_dir).ok();
             let output_path = output_dir.join("vits_tts_test_chinese.wav");
             

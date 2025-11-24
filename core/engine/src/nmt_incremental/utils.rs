@@ -1,5 +1,7 @@
-use anyhow::{Result, anyhow};
-use std::path::Path;
+use anyhow::{Result, anyhow, Context};
+use std::path::{Path, PathBuf};
+
+use super::m2m100_onnx::M2M100NmtOnnx;
 
 /// 仅用于测试：尝试加载 Marian NMT 的 ONNX 模型，确认文件与 ORT 兼容。
 pub fn load_marian_onnx_for_smoke_test(model_path: &Path) -> Result<()> {
@@ -31,20 +33,33 @@ pub fn load_marian_onnx_for_smoke_test(model_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 简单的整句翻译入口（暂时是 stub 版，只检查模型能否加载，再返回一个占位结果）
-/// 后面会用真正的 Marian 推理替换这里的实现。
+/// 整句翻译入口（调用实际的 Marian ONNX 推理）
 pub fn translate_full_sentence_stub(input: &str, model_path: &Path) -> Result<String> {
-    // 先确保 ORT + 模型文件是好的（重用前面的 smoke test）
-    load_marian_onnx_for_smoke_test(model_path)?;
+    let model_dir = resolve_model_dir(model_path)
+        .with_context(|| format!("无法定位 M2M100 模型目录: {}", model_path.display()))?;
 
-    // TODO: 这里将来会：
-    //  1. 加载 tokenizer / vocab
-    //  2. 把 input 切分成子词 ID
-    //  3. 构造 ONNX 输入张量
-    //  4. 调用 Session.run()
-    //  5. 把输出 token ID 解码回字符串
-    //
-    // 现在先返回一个可预期的占位结果，方便前端和其它模块联调。
-    Ok(format!("[NMT stub en→zh] {}", input))
+    let translator = M2M100NmtOnnx::new_from_dir(&model_dir)
+        .with_context(|| format!("加载 M2M100 模型失败: {}", model_dir.display()))?;
+
+    translator
+        .translate(input)
+        .with_context(|| "M2M100 翻译失败".to_string())
+}
+
+fn resolve_model_dir(model_path: &Path) -> Result<PathBuf> {
+    if model_path.is_dir() {
+        return Ok(model_path.to_path_buf());
+    }
+
+    if let Some(parent) = model_path.parent() {
+        if parent.exists() {
+            return Ok(parent.to_path_buf());
+        }
+    }
+
+    Err(anyhow!(
+        "模型路径既不是目录，也找不到上层目录: {}",
+        model_path.display()
+    ))
 }
 

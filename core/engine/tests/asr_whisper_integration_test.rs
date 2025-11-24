@@ -94,10 +94,13 @@ async fn test_wav_file_to_transcript() {
 
     // 3. 预处理并转录
     println!("\n3. 进行转录...");
-    let transcript = engine.transcribe_frames(&frames)
+    let (transcript, detected_lang) = engine.transcribe_frames(&frames)
         .expect("Failed to transcribe");
     println!("   ✓ 转录完成");
     println!("\n转录结果: {}", transcript);
+    if let Some(lang) = detected_lang {
+        println!("检测到的语言: {}", lang);
+    }
 
     // 4. 验证结果
     assert!(!transcript.is_empty(), "转录结果不应该为空");
@@ -238,7 +241,7 @@ async fn test_performance() {
     // 2. 测试推理延迟
     println!("\n2. 测试推理延迟...");
     let start = std::time::Instant::now();
-    let _transcript = engine.transcribe_frame(&frame)
+    let (_transcript, _detected_lang) = engine.transcribe_frame(&frame)
         .expect("Failed to transcribe");
     let inference_time = start.elapsed();
     println!("   推理延迟: {:.2} 秒", inference_time.as_secs_f64());
@@ -251,7 +254,7 @@ async fn test_performance() {
     
     for i in 0..num_iterations {
         let start = std::time::Instant::now();
-        let _transcript = engine.transcribe_frame(&frame)
+        let (_transcript, _detected_lang) = engine.transcribe_frame(&frame)
             .expect("Failed to transcribe");
         let elapsed = start.elapsed();
         total_time += elapsed;

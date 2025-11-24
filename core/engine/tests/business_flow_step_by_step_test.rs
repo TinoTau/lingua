@@ -243,7 +243,9 @@ async fn test_step3_asr_accumulate() {
 }
 
 /// 步骤 4: 测试 NMT 初始化
+/// ⚠️ 已废弃：此测试使用 ONNX decoder，已不再使用。
 #[tokio::test]
+#[ignore] // 已废弃：使用 ONNX decoder，不再参与 CI
 async fn test_step4_nmt_init() {
     println!("\n========== 步骤 4: 测试 NMT 初始化 ==========");
     

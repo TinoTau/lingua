@@ -1,12 +1,17 @@
 //! M2M100 NMT 单元测试
 //! 
 //! 测试 NMT 翻译功能和翻译质量
+//! 
+//! ⚠️ 已废弃：此测试使用 ONNX decoder，已不再使用。
+//! 当前系统已切换为 Python NMT 服务（HTTP 调用）。
+//! 请使用 `s2s_pipeline_integration_test.rs` 进行集成测试。
 
 use std::path::PathBuf;
 use core_engine::nmt_incremental::{TranslationRequest, NmtIncremental, M2M100NmtOnnx};
 use core_engine::types::PartialTranscript;
 
 #[tokio::test]
+#[ignore] // 已废弃：使用 ONNX decoder，不再参与 CI
 async fn test_nmt_zh_to_en() {
     println!("\n=== 测试 M2M100 中文→英文翻译 ===");
     
@@ -84,6 +89,7 @@ async fn test_nmt_zh_to_en() {
 }
 
 #[tokio::test]
+#[ignore] // 已废弃：使用 ONNX decoder，不再参与 CI
 async fn test_nmt_en_to_zh() {
     println!("\n=== 测试 M2M100 英文→中文翻译 ===");
     

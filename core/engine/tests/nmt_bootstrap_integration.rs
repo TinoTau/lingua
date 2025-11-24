@@ -1,5 +1,8 @@
 // tests/nmt_bootstrap_integration.rs
 // 测试 bootstrap.rs 中使用真实的 MarianNmtOnnx 的业务功能
+// 
+// ⚠️ 已废弃：此测试使用 ONNX decoder，已不再使用。
+// 当前系统已切换为 Python NMT 服务（HTTP 调用）。
 
 use std::sync::Arc;
 use async_trait::async_trait;
@@ -144,6 +147,7 @@ impl TelemetrySink for DummyTelemetry {
 
 /// 测试 1: CoreEngine 使用真实的 MarianNmtOnnx 能否正常启动和关闭
 #[tokio::test]
+#[ignore] // 已废弃：使用 ONNX decoder，不再参与 CI
 async fn test_core_engine_with_real_nmt_boot_shutdown() {
     println!("\n========== Test 1: CoreEngine Boot/Shutdown with Real NMT ==========");
     
@@ -175,6 +179,7 @@ async fn test_core_engine_with_real_nmt_boot_shutdown() {
 
 /// 测试 2: 直接测试 MarianNmtOnnx 的 NmtIncremental trait 实现
 #[tokio::test]
+#[ignore] // 已废弃：使用 ONNX decoder，不再参与 CI
 async fn test_marian_nmt_onnx_trait_implementation() {
     println!("\n========== Test 2: MarianNmtOnnx NmtIncremental Trait ==========");
     
@@ -238,6 +243,7 @@ async fn test_marian_nmt_onnx_trait_implementation() {
 
 /// 测试 3: 测试完整的业务流程（模拟 ASR → NMT → Emotion → Persona → TTS 链）
 #[tokio::test]
+#[ignore] // 已废弃：使用 ONNX decoder，不再参与 CI
 async fn test_nmt_integration_full_pipeline() {
     println!("\n========== Test 3: NMT Integration Full Pipeline ==========");
     

@@ -1,9 +1,13 @@
+// ⚠️ 已废弃：此测试使用 ONNX decoder，已不再使用。
+// 当前系统已切换为 Python NMT 服务（HTTP 调用）。
+
 use std::path::PathBuf;
 
 use core_engine::nmt_incremental::MarianNmtOnnx;
 
 /// 测试：能否成功加载 Marian NMT 的 ONNX 模型并打印 I/O 信息
 #[test]
+#[ignore] // 已废弃：使用 ONNX decoder，不再参与 CI
 fn test_load_marian_onnx_model() {
     // 通过 CARGO_MANIFEST_DIR 找到 core/engine 目录
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

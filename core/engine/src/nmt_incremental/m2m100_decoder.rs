@@ -116,6 +116,8 @@ impl M2M100NmtOnnx {
         // 3. 构造全零 KV cache（每次都是新的）
         // 注意：非增量解码时，decoder KV 的形状应该是 [1, 16, tgt_seq_len, 64]
         // 而不是固定的 [1, 16, 1, 64]
+        // ⚠️ 问题：传入全零 KV cache 会导致模型无法正确理解上下文，从而产生重复
+        // 但 M2M100 的 ONNX decoder 模型要求传入 past_key_values，无法跳过
         let decoder_kv = self.build_zero_decoder_kv_for_seq_len(tgt_seq_len)?;
         let encoder_kv = self.build_static_encoder_kv(encoder_seq_len)?;
 
@@ -218,12 +220,10 @@ impl M2M100NmtOnnx {
 
     /// 执行 decoder 的单次步进（增量解码版本）
     /// 
-    /// ⚠️ **已废弃**：工程版实时翻译改造后，M2M100 使用非增量解码
-    /// 此函数保留用于参考，不再被 `m2m100_translation.rs` 调用
+    /// 执行 decoder 的单次步进（增量解码版本）
     /// 
     /// 新格式：51 个输入（3 base + 48 KV，没有 use_cache_branch）
     /// 旧格式：52 个输入（3 base + 48 KV + 1 flag）
-    #[allow(dead_code)]  // 保留用于参考，但不再使用
     pub(crate) fn decoder_step(
         &self,
         encoder_hidden_states: &Array3<f32>,

@@ -97,11 +97,14 @@ fn test_whisper_engine_transcribe_frame() {
     println!("  数据长度: {} 样本", frame.data.len());
 
     // 进行转录
-    let result = engine.transcribe_frame(&frame)
+    let (result, detected_lang) = engine.transcribe_frame(&frame)
         .expect("Failed to transcribe frame");
 
     println!("\n转录结果:");
     println!("{}", result);
+    if let Some(lang) = detected_lang {
+        println!("检测到的语言: {}", lang);
+    }
 
     // 验证结果
     let result_lower = result.to_lowercase();
@@ -171,11 +174,14 @@ fn test_whisper_engine_transcribe_frames() {
     println!("  每帧大小: ~{} 样本", chunk_size);
 
     // 进行转录
-    let result = engine.transcribe_frames(&frames)
+    let (result, detected_lang) = engine.transcribe_frames(&frames)
         .expect("Failed to transcribe frames");
 
     println!("\n转录结果:");
     println!("{}", result);
+    if let Some(lang) = detected_lang {
+        println!("检测到的语言: {}", lang);
+    }
 
     // 验证结果
     assert!(!result.trim().is_empty(), "转录结果不应为空");

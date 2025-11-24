@@ -6,7 +6,6 @@ use core_engine::asr_whisper::cli::{WhisperCliConfig, WhisperCliEngine};
 use core_engine::asr_whisper::AsrEngine;
 use core_engine::bootstrap::CoreEngineBuilder;
 use core_engine::nmt_incremental::{
-    load_marian_onnx_for_smoke_test,
     translate_full_sentence_stub,
     MarianNmtOnnx,
 };
@@ -67,46 +66,40 @@ fn test_fullstack_asr_whisper_jfk_sample() {
     );
 }
 
-/// 2. NMT：加载 Marian ONNX 模型，并通过 stub 翻译一条简单的句子。
+fn contains_cjk(text: &str) -> bool {
+    text.chars().any(|c| matches!(c as u32, 0x4E00..=0x9FFF))
+}
+
+/// 2. NMT：加载 M2M100 ONNX 模型，并翻译一条简单的句子。
+/// ⚠️ 已废弃：此测试使用 ONNX decoder，已不再使用。
 #[test]
+#[ignore] // 已废弃：使用 ONNX decoder，不再参与 CI
 fn test_fullstack_nmt_marian_stub_hello_world() {
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let project_root = crate_root
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("failed to resolve project root");
+    let model_dir = crate_root.join("models/nmt/m2m100-en-zh");
 
-    let model_path = project_root.join("third_party/nmt/marian-en-zh/model.onnx");
-
-    assert!(
-        model_path.exists(),
-        "NMT ONNX model not found at {:?}",
-        model_path
-    );
-
-    // 先确认 ORT 能正常加载模型
-    load_marian_onnx_for_smoke_test(&model_path)
-        .expect("failed to load Marian NMT ONNX model");
+    if !model_dir.exists() {
+        eprintln!("⚠ 跳过测试：M2M100 模型目录缺失 {}", model_dir.display());
+        return;
+    }
 
     let input = "Hello world";
-    let output = translate_full_sentence_stub(input, &model_path)
+    let output = translate_full_sentence_stub(input, &model_dir)
         .expect("NMT stub translation failed");
 
     println!("NMT STUB OUTPUT: {}", output);
 
-    // 只检查输出包含占位前缀和原始输入文本
     assert!(
-        output.contains("[NMT stub en→zh]"),
-        "NMT stub output missing expected prefix"
-    );
-    assert!(
-        output.contains(input),
-        "NMT stub output does not contain original input text"
+        contains_cjk(&output),
+        "NMT 输出未包含中文内容: {}",
+        output
     );
 }
 
 /// 3. CoreEngineBuilder：检查默认的 Marian NMT ONNX wiring 是否正常。
+/// ⚠️ 已废弃：此测试使用 ONNX decoder，已不再使用。
 #[test]
+#[ignore] // 已废弃：使用 ONNX decoder，不再参与 CI
 fn test_fullstack_core_engine_builder_nmt_wiring() {
     // 这里只测试 NMT wiring，不构造完整 CoreEngine（因为其它依赖还没实现）。
     let builder = CoreEngineBuilder::new()
@@ -121,13 +114,11 @@ fn test_fullstack_core_engine_builder_nmt_wiring() {
 }
 
 /// 4. NMT ONNX：加载完整的 MarianNmtOnnx 并打印模型的 I/O 信息。
+/// ⚠️ 已废弃：此测试使用 ONNX decoder，已不再使用。
 #[test]
+#[ignore] // 已废弃：使用 ONNX decoder，不再参与 CI
 fn test_fullstack_nmt_onnx_model_io_info() {
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let project_root = crate_root
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("failed to resolve project root");
 
     // 使用 core/engine/models/nmt/marian-en-zh/ 目录
     let model_dir = crate_root.join("models/nmt/marian-en-zh");

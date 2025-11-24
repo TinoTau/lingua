@@ -1,6 +1,9 @@
 // tests/nmt_comprehensive_test.rs
 // 全面的 NMT 功能测试脚本
 // 测试模型加载、Encoder 推理、Decoder 推理、完整翻译流程等
+// 
+// ⚠️ 已废弃：此测试使用 ONNX decoder，已不再使用。
+// 当前系统已切换为 Python NMT 服务（HTTP 调用）。
 
 use std::path::PathBuf;
 use core_engine::nmt_incremental::{MarianNmtOnnx, LanguagePair, LanguageCode};
@@ -8,6 +11,7 @@ use core_engine::onnx_utils;
 
 /// 测试 1: 模型加载和初始化
 #[test]
+#[ignore] // 已废弃：使用 ONNX decoder，不再参与 CI
 fn test_01_model_loading() {
     println!("\n========== Test 1: Model Loading ==========");
     
@@ -35,6 +39,7 @@ fn test_01_model_loading() {
 
 /// 测试 2: Encoder 推理（通过完整翻译流程间接测试）
 #[test]
+#[ignore] // 已废弃：使用 ONNX decoder，不再参与 CI
 fn test_02_encoder_inference() {
     println!("\n========== Test 2: Encoder Inference ==========");
     
@@ -66,6 +71,7 @@ fn test_02_encoder_inference() {
 
 /// 测试 3: Decoder 单步推理（通过完整翻译流程间接测试）
 #[test]
+#[ignore] // 已废弃：使用 ONNX decoder，不再参与 CI
 fn test_03_decoder_single_step() {
     println!("\n========== Test 3: Decoder Single Step ==========");
     
@@ -92,6 +98,7 @@ fn test_03_decoder_single_step() {
 
 /// 测试 4: 完整翻译流程（短句）
 #[test]
+#[ignore] // 已废弃：使用 ONNX decoder，不再参与 CI
 fn test_04_full_translation_short() {
     println!("\n========== Test 4: Full Translation (Short Sentences) ==========");
     
@@ -131,6 +138,7 @@ fn test_04_full_translation_short() {
 
 /// 测试 5: 完整翻译流程（中等长度句子）
 #[test]
+#[ignore] // 已废弃：使用 ONNX decoder，不再参与 CI
 fn test_05_full_translation_medium() {
     println!("\n========== Test 5: Full Translation (Medium Sentences) ==========");
     
@@ -170,6 +178,7 @@ fn test_05_full_translation_medium() {
 
 /// 测试 6: Tokenizer 编码/解码往返测试
 #[test]
+#[ignore] // 已废弃：使用 ONNX decoder，不再参与 CI
 fn test_06_tokenizer_roundtrip() {
     println!("\n========== Test 6: Tokenizer Roundtrip ==========");
     
@@ -209,6 +218,7 @@ fn test_06_tokenizer_roundtrip() {
 
 /// 测试 7: 多语言对支持（如果可用）
 #[test]
+#[ignore] // 已废弃：使用 ONNX decoder，不再参与 CI
 fn test_07_language_pair_support() {
     println!("\n========== Test 7: Language Pair Support ==========");
     
@@ -243,6 +253,7 @@ fn test_07_language_pair_support() {
 
 /// 测试 8: 错误处理
 #[test]
+#[ignore] // 已废弃：使用 ONNX decoder，不再参与 CI
 fn test_08_error_handling() {
     println!("\n========== Test 8: Error Handling ==========");
     
@@ -277,6 +288,7 @@ fn test_08_error_handling() {
 
 /// 测试 9: 性能基准（简单）
 #[test]
+#[ignore] // 已废弃：使用 ONNX decoder，不再参与 CI
 fn test_09_performance_benchmark() {
     println!("\n========== Test 9: Performance Benchmark ==========");
     
@@ -317,6 +329,7 @@ fn test_09_performance_benchmark() {
 
 /// 测试 10: 完整功能集成测试
 #[test]
+#[ignore] // 已废弃：使用 ONNX decoder，不再参与 CI
 fn test_10_integration_test() {
     println!("\n========== Test 10: Integration Test ==========");
     

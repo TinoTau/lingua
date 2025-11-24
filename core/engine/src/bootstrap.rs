@@ -18,6 +18,9 @@ use crate::vad::VoiceActivityDetector;
 use crate::health_check::HealthChecker;
 use crate::post_processing::TextPostProcessor;
 use crate::performance_logger::{PerformanceLog, PerformanceLogger};
+use crate::text_segmentation::TextSegmenter;
+use crate::translation_quality::TranslationQualityChecker;
+use crate::tts_audio_enhancement::{AudioEnhancer, AudioEnhancementConfig};
 use serde_json::json;
 use std::path::Path;
 use std::time::Instant;
@@ -38,9 +41,15 @@ pub struct CoreEngine {
     // 优化模块
     post_processor: Option<Arc<TextPostProcessor>>,
     perf_logger: Option<Arc<PerformanceLogger>>,
+    text_segmenter: Option<Arc<TextSegmenter>>,
+    audio_enhancer: Option<Arc<AudioEnhancer>>,
+    quality_checker: Option<Arc<TranslationQualityChecker>>,
     // 服务 URL（用于健康检查）
     nmt_service_url: Option<String>,
     tts_service_url: Option<String>,
+    // TTS 增量播放配置
+    tts_incremental_enabled: bool,
+    tts_buffer_sentences: usize,
 }
 
 pub struct CoreEngineBuilder {
@@ -57,9 +66,15 @@ pub struct CoreEngineBuilder {
     // 优化模块
     post_processor: Option<Arc<TextPostProcessor>>,
     perf_logger: Option<Arc<PerformanceLogger>>,
+    text_segmenter: Option<Arc<TextSegmenter>>,
+    audio_enhancer: Option<Arc<AudioEnhancer>>,
+    quality_checker: Option<Arc<TranslationQualityChecker>>,
     // 服务 URL（用于健康检查）
     nmt_service_url: Option<String>,
     tts_service_url: Option<String>,
+    // TTS 增量播放配置
+    tts_incremental_enabled: bool,
+    tts_buffer_sentences: usize,
 }
 
 impl CoreEngineBuilder {
@@ -77,8 +92,13 @@ impl CoreEngineBuilder {
             telemetry: None,
             post_processor: None,
             perf_logger: None,
+            text_segmenter: None,
+            audio_enhancer: None,
+            quality_checker: None,
             nmt_service_url: None,
             tts_service_url: None,
+            tts_incremental_enabled: false,
+            tts_buffer_sentences: 0,
         }
     }
 
@@ -409,6 +429,50 @@ impl CoreEngineBuilder {
         self.perf_logger = Some(Arc::new(logger));
         self
     }
+    
+    /// 启用 TTS 增量播放
+    /// 
+    /// # Arguments
+    /// * `enabled` - 是否启用增量播放
+    /// * `buffer_sentences` - 缓冲的短句数量（0 = 立即播放，> 0 = 缓冲模式）
+    /// * `max_sentence_length` - 最大句子长度（字符）
+    pub fn with_tts_incremental_playback(
+        mut self,
+        enabled: bool,
+        buffer_sentences: usize,
+        max_sentence_length: usize,
+    ) -> Self {
+        if enabled {
+            // 使用支持逗号分割的分段器（用于在逗号处添加停顿）
+            let segmenter = TextSegmenter::new_with_comma_splitting(max_sentence_length);
+            self.text_segmenter = Some(Arc::new(segmenter));
+            self.tts_incremental_enabled = true;
+            self.tts_buffer_sentences = buffer_sentences;
+        }
+        self
+    }
+    
+    /// 启用 TTS 音频增强（fade in/out、停顿）
+    /// 
+    /// # Arguments
+    /// * `config` - 音频增强配置
+    pub fn with_audio_enhancement(mut self, config: AudioEnhancementConfig) -> Self {
+        let enhancer = AudioEnhancer::new(config);
+        self.audio_enhancer = Some(Arc::new(enhancer));
+        self
+    }
+    
+    /// 启用翻译质量检查
+    /// 
+    /// # Arguments
+    /// * `enabled` - 是否启用质量检查
+    pub fn with_translation_quality_check(mut self, enabled: bool) -> Self {
+        if enabled {
+            let checker = TranslationQualityChecker::new(true);
+            self.quality_checker = Some(Arc::new(checker));
+        }
+        self
+    }
 
     pub fn build(self) -> EngineResult<CoreEngine> {
         Ok(CoreEngine {
@@ -424,8 +488,13 @@ impl CoreEngineBuilder {
             telemetry: self.telemetry.ok_or_else(|| EngineError::new("telemetry is missing"))?,
             post_processor: self.post_processor,
             perf_logger: self.perf_logger,
+            text_segmenter: self.text_segmenter,
+            audio_enhancer: self.audio_enhancer,
+            quality_checker: self.quality_checker,
             nmt_service_url: self.nmt_service_url,
             tts_service_url: self.tts_service_url,
+            tts_incremental_enabled: self.tts_incremental_enabled,
+            tts_buffer_sentences: self.tts_buffer_sentences,
         })
     }
 }
@@ -735,13 +804,23 @@ impl CoreEngine {
         // 3. 执行翻译
         let mut translation_response = self.nmt.translate(translation_request).await?;
         
-        // 4. 文本后处理
+        // 4. 应用翻译质量检查
+        if let Some(ref checker) = self.quality_checker {
+            let checked_text = checker.check_and_fix(
+                &transcript.text,
+                &translation_response.translated_text,
+                &target_language,
+            );
+            translation_response.translated_text = checked_text;
+        }
+        
+        // 5. 应用文本后处理
         if let Some(ref processor) = self.post_processor {
             let processed_text = processor.process(&translation_response.translated_text, &target_language);
             translation_response.translated_text = processed_text;
         }
         
-        // 5. 发布翻译事件
+        // 6. 发布翻译事件
         self.publish_translation_event(&translation_response, timestamp_ms).await?;
         
         Ok(translation_response)
@@ -828,6 +907,12 @@ impl CoreEngine {
         translation: &TranslationResponse,
         timestamp_ms: u64,
     ) -> EngineResult<TtsStreamChunk> {
+        // 如果启用增量播放，使用增量合成方法
+        if self.tts_incremental_enabled {
+            return self.synthesize_and_publish_incremental(translation, timestamp_ms).await;
+        }
+
+        // 原有的一次性合成逻辑
         // 1. 获取目标语言（用于 TTS locale）
         let config = self.config.current().await?;
         let target_language = config.target_language.clone();
@@ -846,6 +931,122 @@ impl CoreEngine {
         self.publish_tts_event(&tts_chunk, timestamp_ms).await?;
         
         Ok(tts_chunk)
+    }
+
+    /// TTS 增量合成并发布事件
+    /// 
+    /// 将文本分割成短句，每个短句合成完成后立即发布（或缓冲后发布）
+    async fn synthesize_and_publish_incremental(
+        &self,
+        translation: &TranslationResponse,
+        timestamp_ms: u64,
+    ) -> EngineResult<TtsStreamChunk> {
+        // 1. 获取目标语言（用于 TTS locale）
+        let config = self.config.current().await?;
+        let target_language = config.target_language.clone();
+        
+        // 2. 分割文本为短句（使用带停顿类型的分段）
+        let segmenter = self.text_segmenter.as_ref()
+            .ok_or_else(|| EngineError::new("Text segmenter not initialized".to_string()))?;
+        
+        // 尝试使用带停顿类型的分段（如果支持）
+        let segments_with_pause = if segmenter.split_on_comma {
+            segmenter.segment_with_pause_type(&translation.translated_text)
+        } else {
+            // 向后兼容：使用旧的分段方法
+            segmenter.segment(&translation.translated_text)
+                .into_iter()
+                .map(|text| {
+                    let pause_type = if text.ends_with('.') 
+                        || text.ends_with('!') 
+                        || text.ends_with('?')
+                        || text.ends_with('。')
+                        || text.ends_with('！')
+                        || text.ends_with('？') {
+                        crate::text_segmentation::PauseType::SentenceEnd
+                    } else {
+                        crate::text_segmentation::PauseType::None
+                    };
+                    crate::text_segmentation::TextSegment { text, pause_type }
+                })
+                .collect()
+        };
+        
+        if segments_with_pause.is_empty() {
+            return Err(EngineError::new("No segments to synthesize".to_string()));
+        }
+
+        // 3. 对每个短句进行 TTS 合成
+        let mut chunks = Vec::new();
+        let mut buffer = Vec::new();
+        let mut current_timestamp = timestamp_ms;
+
+        for (idx, segment) in segments_with_pause.iter().enumerate() {
+            let is_last = idx == segments_with_pause.len() - 1;
+            
+            // 构造 TTS 请求
+            let tts_request = TtsRequest {
+                text: segment.text.clone(),
+                voice: "default".to_string(),
+                locale: target_language.clone(),
+            };
+            
+            // 合成短句
+            let mut chunk = self.tts.synthesize(tts_request).await?;
+            
+            // 应用音频增强（fade in/out、停顿，根据停顿类型）
+            if let Some(ref enhancer) = self.audio_enhancer {
+                let pause_type = if segment.pause_type != crate::text_segmentation::PauseType::None {
+                    Some(segment.pause_type)
+                } else {
+                    None
+                };
+                
+                let enhanced_audio = enhancer.enhance_audio_with_pause_type(
+                    &chunk.audio,
+                    idx == 0,  // is_first
+                    is_last,   // is_last
+                    pause_type,
+                ).await?;
+                chunk.audio = enhanced_audio;
+            }
+            
+            chunk.timestamp_ms = current_timestamp;
+            chunk.is_last = is_last;
+
+            if self.tts_buffer_sentences == 0 {
+                // 立即播放模式：立即发布
+                self.publish_tts_event(&chunk, current_timestamp).await?;
+            } else {
+                // 缓冲模式：加入缓冲区
+                buffer.push(chunk.clone());
+                
+                // 如果缓冲区满了，发布最早的短句
+                if buffer.len() > self.tts_buffer_sentences {
+                    let first_chunk = buffer.remove(0);
+                    self.publish_tts_event(&first_chunk, first_chunk.timestamp_ms).await?;
+                }
+            }
+            
+            chunks.push(chunk);
+            
+            // 更新时间戳（简单递增，实际可以根据音频长度计算）
+            current_timestamp += 100; // 假设每个短句间隔 100ms
+        }
+        
+        // 4. 缓冲模式：发布剩余的短句
+        if self.tts_buffer_sentences > 0 {
+            for chunk in buffer {
+                self.publish_tts_event(&chunk, chunk.timestamp_ms).await?;
+            }
+        }
+        
+        // 5. 返回最后一个 chunk（保持兼容性）
+        Ok(chunks.last().cloned().unwrap_or_else(|| TtsStreamChunk {
+            audio: vec![],
+            timestamp_ms: timestamp_ms,
+            is_last: true,
+        }))
     }
 
     /// 发布 TTS 事件

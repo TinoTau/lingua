@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+
+const TEST_OUTPUT_DIR: &str = r"D:\Programs\github\lingua\test_output";
 use core_engine::tts_streaming::{FastSpeech2TtsEngine, TtsRequest, TtsStreaming};
 
 /// 测试完整的 TTS 流程（需要模型文件）
@@ -37,8 +39,10 @@ async fn test_tts_synthesize_chinese() {
                 // 保存音频文件以便检查
                 if !chunk.audio.is_empty() {
                     use core_engine::tts_streaming::save_pcm_to_wav;
-                    let output_path = Path::new("test_output_chinese.wav");
-                    match save_pcm_to_wav(&chunk.audio, output_path, 16000, 1) {
+                    let output_dir = Path::new(TEST_OUTPUT_DIR);
+                    let _ = std::fs::create_dir_all(output_dir);
+                    let output_path = output_dir.join("tts_integration_chinese.wav");
+                    match save_pcm_to_wav(&chunk.audio, &output_path, 16000, 1) {
                         Ok(_) => {
                             println!("   ✅ Audio saved to: {}", output_path.display());
                             println!("   💡 Please play this file to check audio quality");
@@ -95,8 +99,10 @@ async fn test_tts_synthesize_english() {
                 // 保存音频文件以便检查
                 if !chunk.audio.is_empty() {
                     use core_engine::tts_streaming::save_pcm_to_wav;
-                    let output_path = Path::new("test_output_english.wav");
-                    match save_pcm_to_wav(&chunk.audio, output_path, 16000, 1) {
+                    let output_dir = Path::new(TEST_OUTPUT_DIR);
+                    let _ = std::fs::create_dir_all(output_dir);
+                    let output_path = output_dir.join("tts_integration_english.wav");
+                    match save_pcm_to_wav(&chunk.audio, &output_path, 16000, 1) {
                         Ok(_) => {
                             println!("   ✅ Audio saved to: {}", output_path.display());
                             println!("   💡 Please play this file to check audio quality");

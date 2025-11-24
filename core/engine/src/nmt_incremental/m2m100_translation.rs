@@ -7,8 +7,7 @@ use crate::error::{EngineError, EngineResult};
 use super::nmt_trait::NmtIncremental;
 use super::types::{TranslationRequest, TranslationResponse};
 use super::m2m100_onnx::M2M100NmtOnnx;
-// ✅ 工程版实时翻译改造：不再需要 DecoderState
-// 非增量解码直接使用 Vec<i64> 管理生成序列，不需要复杂的状态管理
+// ✅ 使用非增量解码，每次传入完整序列，使用全零 KV cache，不维护状态
 
 impl M2M100NmtOnnx {
     /// 执行完整的翻译流程
@@ -38,8 +37,7 @@ impl M2M100NmtOnnx {
         println!("[Config] tgt_lang_id: {}, eos_token_id: {} (from tokenizer), pad_token_id: {}", 
             tgt_lang_id, eos_token_id, self.pad_token_id);
 
-        // 4. 进入解码循环（非增量解码版本）
-        // ✅ 工程版实时翻译改造：使用句级非增量解码，不维护 KV cache
+        // 4. 进入解码循环（非增量解码版本，不维护 KV cache）
         let max_steps = self.max_length.min(128);
         let encoder_seq_len = encoder_hidden_states.shape()[1];
 
@@ -104,14 +102,20 @@ impl M2M100NmtOnnx {
             // ✅ 加入生成序列
             generated_ids.push(next_token_id);
             
-            // ⚠️ 临时安全措施：检查重复 token 模式（防止无限循环）
+            // ⚠️ 重复检测：检查是否陷入重复模式
             if generated_ids.len() >= 4 {
                 let last_four: Vec<i64> = generated_ids.iter().rev().take(4).copied().collect();
                 if last_four.len() >= 4 && last_four[0] == last_four[2] && last_four[1] == last_four[3] {
                     println!("[Step {}] ⚠️  检测到 2-token 重复模式: {:?}, 停止解码", step, last_four);
-                    println!("[WARNING] 这通常表示解码逻辑有问题，请检查实现");
+                    println!("[WARNING] 解码陷入重复循环，可能是模型或 KV cache 处理有问题");
                     break;
                 }
+            }
+            
+            // ⚠️ 长度限制：防止无限循环
+            if generated_ids.len() >= 128 {
+                println!("[Step {}] ⚠️  达到最大长度限制 (128), 强制停止", step);
+                break;
             }
         }
 
@@ -124,6 +128,15 @@ impl M2M100NmtOnnx {
             .filter(|&&id| id != eos_token_id)  // ✅ 过滤掉 EOS token
             .copied()
             .collect();
+        
+        // 调试：打印每个 token 对应的文本
+        println!("[NMT][translate] Translated IDs (after filtering): {:?}", translated_ids);
+        for &id in &translated_ids {
+            if let Some(piece) = self.tokenizer.id_to_piece(id) {
+                println!("  Token {} -> '{}'", id, piece);
+            }
+        }
+        
         let translated_text = self.tokenizer.decode(&translated_ids, true)?;
         println!("[NMT][translate] Translated text: '{}'", translated_text);
 

@@ -1,24 +1,35 @@
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use tokenizers::models::bpe::BPE;
-use tokenizers::Tokenizer;
 
 /// M2M100 Tokenizer 实现
 /// 
-/// 使用 HuggingFace tokenizers crate 从 sentencepiece.bpe.model 和 vocab.json 构建 tokenizer
-/// 支持语言 token 和编码/解码功能
+/// 基于 vocab.json 的最长匹配分词，支持语言 token 和解码
 pub struct M2M100Tokenizer {
-    /// HuggingFace tokenizer 实例
-    tokenizer: Tokenizer,
+    /// token -> id 映射
+    vocab: HashMap<String, i64>,
+    /// id -> token 映射
+    id_to_piece: Vec<String>,
+    /// 子词最长匹配 Trie
+    trie: Vec<TrieNode>,
     /// 语言代码到 token ID 的映射（如 "en" -> 128022）
     lang_id_map: HashMap<String, i64>,
+    /// 语言 token ID 集合（用于解码时过滤）
+    lang_token_ids: HashSet<i64>,
     /// Pad token ID
     pad_token_id: i64,
     /// EOS token ID
     eos_token_id: i64,
+    /// UNK token ID
+    unk_token_id: i64,
+}
+
+#[derive(Default)]
+struct TrieNode {
+    children: HashMap<char, usize>,
+    token_id: Option<i64>,
 }
 
 /// tokenizer_config.json 结构
@@ -41,22 +52,13 @@ impl M2M100Tokenizer {
     /// * `model_dir` - 模型目录路径（如 `models/nmt/m2m100-en-zh/`）
     /// 
     /// # Files Required
-    /// - `sentencepiece.bpe.model` - SentencePiece BPE 模型
     /// - `vocab.json` - 词汇表
+    /// - `lang_ids.json` - 语言 ID 映射（推荐）
     /// - `tokenizer_config.json` - Tokenizer 配置（可选）
     pub fn from_model_dir(model_dir: &Path) -> Result<Self> {
         // 1. 检查必需文件
-        let sp_model_path = model_dir.join("sentencepiece.bpe.model");
         let vocab_path = model_dir.join("vocab.json");
-        
-        if !sp_model_path.exists() {
-            return Err(anyhow!(
-                "sentencepiece.bpe.model not found at {}\n\
-                Please ensure the model files are properly exported.",
-                sp_model_path.display()
-            ));
-        }
-        
+
         if !vocab_path.exists() {
             return Err(anyhow!(
                 "vocab.json not found at {}\n\
@@ -83,76 +85,80 @@ impl M2M100Tokenizer {
             }
         }
 
-        // 如果 vocab.json 中没有找到语言 token，使用已知的 M2M100 418M 模型的标准语言 ID（作为后备）
+        // 如果 vocab.json 中没有找到语言 token，尝试从 lang_ids.json 加载
+        let lang_ids_path = model_dir.join("lang_ids.json");
+        if lang_id_map.is_empty() && lang_ids_path.exists() {
+            if let Ok(lang_ids_str) = fs::read_to_string(&lang_ids_path) {
+                if let Ok(extra_map) = serde_json::from_str::<HashMap<String, i64>>(&lang_ids_str) {
+                    lang_id_map.extend(extra_map);
+                }
+            }
+        }
+
+        // 如果仍然没有找到语言 token，使用已知的标准语言 ID（作为后备）
         if lang_id_map.is_empty() {
             eprintln!("Warning: Language tokens not found in vocab.json. Using fallback IDs.");
             lang_id_map.insert("en".to_string(), 128022);
             lang_id_map.insert("zh".to_string(), 128102);
         }
 
-        // 4. 构建 tokenizer
-        // tokenizers crate 需要 vocab.json 和 merges.txt 来构建 BPE tokenizer
-        // 但 M2M100 只有 sentencepiece.bpe.model，没有 merges.txt
-        // 
-        // 解决方案：尝试使用 vocab.json 构建 BPE tokenizer，merges.txt 可以为空或使用默认值
-        // 或者，我们需要从 sentencepiece.bpe.model 提取 merges.txt
-        
-        let merges_path = model_dir.join("merges.txt");
-        
-        // 尝试使用 BPE 模型构建 tokenizer
-        let tokenizer = if merges_path.exists() {
-            // 如果 merges.txt 存在，使用它
-            // BPE::from_file 返回 BpeBuilder，需要调用 build() 方法
-            let bpe = BPE::from_file(
-                vocab_path.to_str().ok_or_else(|| anyhow!("Invalid vocab.json path"))?,
-                merges_path.to_str().ok_or_else(|| anyhow!("Invalid merges.txt path"))?,
-            )
-            .build()
-            .map_err(|e| anyhow!("Failed to load BPE from vocab.json and merges.txt: {e}"))?;
-            Tokenizer::new(bpe)
-        } else {
-            // 如果 merges.txt 不存在，尝试使用 vocab.json 构建（可能需要默认 merges）
-            // 注意：这可能需要创建一个基本的 merges.txt
-            return Err(anyhow!(
-                "merges.txt not found at {}\n\
-                M2M100 model requires merges.txt to build BPE tokenizer.\n\
-                Please convert sentencepiece.bpe.model to merges.txt using:\n\
-                python scripts/convert_sentencepiece_to_merges.py --model {} --vocab-output {} --merges-output {}",
-                merges_path.display(),
-                sp_model_path.display(),
-                vocab_path.display(),
-                merges_path.display()
-            ));
-        };
+        // 4. 构建 id -> piece 映射（按最大 ID 分配）
+        let max_id = vocab.values().copied().max().unwrap_or(0) as usize;
+        let mut id_to_piece = vec![String::new(); max_id + 1];
+        for (piece, &id) in &vocab {
+            let idx = id as usize;
+            if idx >= id_to_piece.len() {
+                id_to_piece.resize(idx + 1, String::new());
+            }
+            id_to_piece[idx] = piece.clone();
+        }
+
+        // 构建 Trie
+        let mut trie = TrieNode::default();
+        let mut nodes = vec![trie];
+        for (piece, &id) in &vocab {
+            if should_skip_piece(piece) {
+                continue;
+            }
+            insert_piece(&mut nodes, piece, id);
+        }
 
         // 5. 从 tokenizer_config.json 或 vocab.json 获取特殊 token ID
         let config_path = model_dir.join("tokenizer_config.json");
-        let (pad_token, eos_token) = if config_path.exists() {
+        let (pad_token, eos_token, unk_token) = if config_path.exists() {
             if let Ok(config_str) = fs::read_to_string(&config_path) {
                 if let Ok(config) = serde_json::from_str::<TokenizerConfig>(&config_str) {
                     (
                         config.pad_token.unwrap_or_else(|| "<pad>".to_string()),
                         config.eos_token.unwrap_or_else(|| "</s>".to_string()),
+                        config.unk_token.unwrap_or_else(|| "<unk>".to_string()),
                     )
                 } else {
-                    ("<pad>".to_string(), "</s>".to_string())
+                    ("<pad>".to_string(), "</s>".to_string(), "<unk>".to_string())
                 }
             } else {
-                ("<pad>".to_string(), "</s>".to_string())
+                ("<pad>".to_string(), "</s>".to_string(), "<unk>".to_string())
             }
         } else {
-            ("<pad>".to_string(), "</s>".to_string())
+            ("<pad>".to_string(), "</s>".to_string(), "<unk>".to_string())
         };
 
         // 从 vocab.json 获取特殊 token ID
         let pad_token_id = vocab.get(&pad_token).copied().unwrap_or(1);
         let eos_token_id = vocab.get(&eos_token).copied().unwrap_or(2);
+        let unk_token_id = vocab.get(&unk_token).copied().unwrap_or(3);
+
+        let lang_token_ids = lang_id_map.values().copied().collect();
 
         Ok(Self {
-            tokenizer,
+            vocab,
+            id_to_piece,
+            trie: nodes,
             lang_id_map,
+            lang_token_ids,
             pad_token_id,
             eos_token_id,
+            unk_token_id,
         })
     }
 
@@ -176,23 +182,48 @@ impl M2M100Tokenizer {
         
         // 1. 获取语言 token ID
         let lang_token_id = self.get_lang_id(src_lang);
-        
-        // 2. 编码文本（不添加语言 token 字符串）
-        let encoding = self.tokenizer
-            .encode(text, add_special_tokens)
-            .map_err(|e| anyhow!("failed to encode text: {e}"))?;
+        let normalized_chars = normalize_text(text);
 
-        // 3. 转换为 Vec<i64>
-        let mut ids: Vec<i64> = encoding
-            .get_ids()
-            .iter()
-            .map(|&id| id as i64)
-            .collect();
+        let mut ids = Vec::with_capacity(normalized_chars.len() + 2);
+        ids.push(lang_token_id);
 
-        // 4. 在开头添加语言 token ID
-        ids.insert(0, lang_token_id);
-        
-        // 5. 如果 add_special_tokens 为 true，在末尾添加 EOS token
+        let mut pos = 0;
+        while pos < normalized_chars.len() {
+            let mut node_idx = 0usize;
+            let mut last_match: Option<(usize, i64)> = None;
+            let mut inner = pos;
+            while inner < normalized_chars.len() {
+                let ch = normalized_chars[inner];
+                if let Some(&next_idx) = self.trie[node_idx].children.get(&ch) {
+                    node_idx = next_idx;
+                    if let Some(token_id) = self.trie[node_idx].token_id {
+                        last_match = Some((inner - pos + 1, token_id));
+                    }
+                    inner += 1;
+                } else {
+                    break;
+                }
+            }
+
+            if let Some((len, token_id)) = last_match {
+                ids.push(token_id);
+                pos += len;
+            } else {
+                // 回退为单字符（若不存在则使用 UNK）
+                let ch = normalized_chars[pos];
+                let mut fallback = ch.to_string();
+                if ch == '▁' {
+                    fallback = "▁".to_string();
+                }
+                if let Some(token_id) = self.vocab.get(&fallback).copied() {
+                    ids.push(token_id);
+                } else {
+                    ids.push(self.unk_token_id);
+                }
+                pos += 1;
+            }
+        }
+
         if add_special_tokens {
             ids.push(self.eos_token_id);
         }
@@ -209,15 +240,32 @@ impl M2M100Tokenizer {
     /// # Returns
     /// 解码后的文本
     pub fn decode(&self, ids: &[i64], skip_special_tokens: bool) -> Result<String> {
-        // 转换为 u32 数组（tokenizers 需要的类型）
-        let ids_u32: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
+        let mut filtered_pieces: Vec<String> = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if skip_special_tokens {
+                if id == self.pad_token_id || id == self.eos_token_id || self.lang_token_ids.contains(&id) {
+                    continue;
+                }
+            }
+            let idx = id as usize;
+            if idx < self.id_to_piece.len() {
+                filtered_pieces.push(self.id_to_piece[idx].clone());
+            }
+        }
 
-        // 使用 tokenizer 解码
-        let text = self.tokenizer
-            .decode(&ids_u32, skip_special_tokens)
-            .map_err(|e| anyhow!("failed to decode ids: {e}"))?;
+        let mut text = filtered_pieces.join("");
+        text = text.replace('▁', " ");
+        Ok(text.trim().to_string())
+    }
 
-        Ok(text)
+    /// 获取 token ID 对应的文本片段（用于调试）
+    pub fn id_to_piece(&self, id: i64) -> Option<String> {
+        let idx = id as usize;
+        if idx < self.id_to_piece.len() {
+            Some(self.id_to_piece[idx].clone())
+        } else {
+            None
+        }
     }
 
     /// 获取语言 token ID
@@ -248,6 +296,57 @@ impl M2M100Tokenizer {
     pub fn eos_token_id(&self) -> i64 {
         self.eos_token_id
     }
+
+    /// 获取 unk token ID
+    pub fn unk_token_id(&self) -> i64 {
+        self.unk_token_id
+    }
+}
+
+fn should_skip_piece(piece: &str) -> bool {
+    if piece.starts_with('<') && piece.ends_with('>') {
+        return true;
+    }
+    if piece.starts_with("__") && piece.ends_with("__") {
+        return true;
+    }
+    piece.is_empty()
+}
+
+fn insert_piece(nodes: &mut Vec<TrieNode>, piece: &str, token_id: i64) {
+    let mut current_idx = 0usize;
+    for ch in piece.chars() {
+        let next_idx = if let Some(&idx) = nodes[current_idx].children.get(&ch) {
+            idx
+        } else {
+            let idx = nodes.len();
+            nodes.push(TrieNode::default());
+            nodes[current_idx].children.insert(ch, idx);
+            idx
+        };
+        current_idx = next_idx;
+    }
+    nodes[current_idx].token_id = Some(token_id);
+}
+
+fn normalize_text(text: &str) -> Vec<char> {
+    let mut chars = Vec::new();
+    let mut prev_space = true;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            prev_space = true;
+            continue;
+        }
+        if prev_space {
+            chars.push('▁');
+            prev_space = false;
+        }
+        chars.push(ch);
+    }
+    if chars.is_empty() {
+        chars.push('▁');
+    }
+    chars
 }
 
 #[cfg(test)]

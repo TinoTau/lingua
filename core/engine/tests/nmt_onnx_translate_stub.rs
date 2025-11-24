@@ -2,20 +2,22 @@ use std::path::PathBuf;
 
 use core_engine::nmt_incremental::translate_full_sentence_stub;
 
-/// 测试：调用 NMT 模块的“整句翻译入口”（目前是 stub 实现）
+fn contains_cjk(text: &str) -> bool {
+    text.chars().any(|c| matches!(c as u32, 0x4E00..=0x9FFF))
+}
+
+/// 测试：调用 NMT 模块的整句翻译入口（真实 Marian 推理）
 #[test]
 fn test_translate_full_sentence_stub() {
     // 通过 CARGO_MANIFEST_DIR 定位到 core/engine
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
-    // 项目根目录：D:\Programs\github\lingua
-    let project_root = crate_root
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("failed to resolve project root");
-
-    // 使用你刚才已经验证过的模型路径
-    let model_path = project_root.join("third_party/nmt/marian-en-zh/model.onnx");
+    // 使用 core/engine 提供的 M2M100 模型
+    let model_path = crate_root.join("models/nmt/m2m100-en-zh");
+    if !model_path.exists() {
+        eprintln!("⚠ 跳过测试：M2M100 模型目录缺失 {}", model_path.display());
+        return;
+    }
 
     let input = "Hello world";
     let output = translate_full_sentence_stub(input, &model_path)
@@ -23,7 +25,9 @@ fn test_translate_full_sentence_stub() {
 
     println!("NMT STUB OUTPUT: {}", output);
 
-    // 确认输出有我们预期的前缀和原文
-    assert!(output.contains("[NMT stub en→zh]"));
-    assert!(output.contains(input));
+    assert!(
+        contains_cjk(&output),
+        "M2M100 翻译未生成中文文本: {}",
+        output
+    );
 }

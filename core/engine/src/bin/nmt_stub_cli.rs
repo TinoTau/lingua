@@ -25,13 +25,9 @@ fn real_main() -> anyhow::Result<()> {
 
     // 2. 通过 CARGO_MANIFEST_DIR 定位到 core/engine，再推到项目根目录
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let project_root = crate_root
-        .parent()  // ...\lingua\core
-        .and_then(|p| p.parent())  // ...\lingua
-        .expect("failed to resolve project root");
 
-    // 3. 复用你测试里用的 NMT 模型路径
-    let model_path = project_root.join("third_party/nmt/marian-en-zh/model.onnx");
+    // 3. 使用 core/engine 内部的 M2M100 模型目录
+    let model_path = crate_root.join("models/nmt/m2m100-en-zh");
 
     // 4. 调用你已经写好的 stub 翻译函数
     let output = translate_full_sentence_stub(&input, &model_path)?;

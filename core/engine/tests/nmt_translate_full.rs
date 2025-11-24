@@ -1,11 +1,15 @@
 // tests/nmt_translate_full.rs
 // 测试完整的翻译流程：tokenizer 编码 -> ONNX 推理 -> tokenizer 解码
+// 
+// ⚠️ 已废弃：此测试使用 ONNX decoder，已不再使用。
+// 当前系统已切换为 Python NMT 服务（HTTP 调用）。
 
 use std::path::PathBuf;
 use core_engine::nmt_incremental::MarianNmtOnnx;
 
 /// 测试完整的翻译流程
 #[test]
+#[ignore] // 已废弃：使用 ONNX decoder，不再参与 CI
 fn test_full_translation_pipeline() {
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let model_dir = crate_root.join("models/nmt/marian-en-zh");

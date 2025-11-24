@@ -20,11 +20,11 @@ use super::vits_zh_aishell3_tokenizer::VitsZhAishell3Tokenizer;
 /// 支持多语言，根据 locale 选择对应的模型
 pub struct VitsTtsEngine {
     /// 英文模型会话
-    session_en: Mutex<Session>,
+    session_en: Option<Mutex<Session>>,
     /// 中文模型会话（可选）
     session_zh: Option<Mutex<Session>>,
     /// 英文 tokenizer（MMS TTS 格式）
-    tokenizer_en: VitsTokenizer,
+    tokenizer_en: Option<VitsTokenizer>,
     /// 中文 tokenizer（可选，可能是 MMS TTS 或 vits-zh-aishell3 格式）
     tokenizer_zh: Option<VitsTokenizer>,
     /// 中文 AISHELL3 tokenizer（可选，用于 vits-zh-aishell3 模型）
@@ -184,19 +184,49 @@ impl VitsTtsEngine {
 
         // 1. 加载英文模型（必需）
         let model_dir_en = models_root.join("mms-tts-eng");
-        let tokenizer_en = VitsTokenizer::from_model_dir(&model_dir_en)?;
-        let onnx_dir_en = model_dir_en.join("onnx");
-        let model_path_en = if onnx_dir_en.join("model.onnx").exists() {
-            onnx_dir_en.join("model.onnx")
-        } else if onnx_dir_en.join("model_fp16.onnx").exists() {
-            onnx_dir_en.join("model_fp16.onnx")
+        let (session_en, tokenizer_en) = if model_dir_en.exists() {
+            match VitsTokenizer::from_model_dir(&model_dir_en) {
+                Ok(tokenizer_en) => {
+                    let onnx_dir_en = model_dir_en.join("onnx");
+                    let model_path_en = if onnx_dir_en.join("model.onnx").exists() {
+                        Some(onnx_dir_en.join("model.onnx"))
+                    } else if onnx_dir_en.join("model_fp16.onnx").exists() {
+                        Some(onnx_dir_en.join("model_fp16.onnx"))
+                    } else {
+                        eprintln!(
+                            "[WARN] English MMS TTS ONNX model not found in {}. English TTS will be unavailable.",
+                            onnx_dir_en.display()
+                        );
+                        None
+                    };
+
+                    if let Some(model_path_en) = model_path_en {
+                        match SessionBuilder::new(&env)
+                            .map_err(|e| anyhow!("failed to create VITS Session builder: {e}"))?
+                            .with_model_from_file(&model_path_en)
+                        {
+                            Ok(session) => (Some(Mutex::new(session)), Some(tokenizer_en)),
+                            Err(e) => {
+                                eprintln!("[WARN] Failed to load English VITS model: {e}. English TTS will be unavailable.");
+                                (None, None)
+                            }
+                        }
+                    } else {
+                        (None, None)
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[WARN] Failed to load English tokenizer: {e}. English TTS will be unavailable.");
+                    (None, None)
+                }
+            }
         } else {
-            return Err(anyhow!("No ONNX model found in {}", onnx_dir_en.display()));
+            eprintln!(
+                "[WARN] English MMS TTS directory not found at {}. English TTS will be unavailable.",
+                model_dir_en.display()
+            );
+            (None, None)
         };
-        let session_en = SessionBuilder::new(&env)
-            .map_err(|e| anyhow!("failed to create VITS Session builder: {e}"))?
-            .with_model_from_file(&model_path_en)
-            .map_err(|e| anyhow!("failed to load English VITS model: {e}"))?;
 
         // 2. 尝试加载中文模型（可选）
         // 优先尝试 vits-zh-aishell3，如果没有则尝试 mms-tts-zh-Hans
@@ -249,7 +279,7 @@ impl VitsTtsEngine {
         };
 
         Ok(Self {
-            session_en: Mutex::new(session_en),
+            session_en,
             session_zh,
             tokenizer_en,
             tokenizer_zh,
@@ -344,8 +374,11 @@ impl VitsTtsEngine {
                 }
             }
             _ => {
-                // 默认使用英文模型（MMS TTS 格式）
-                return self.run_inference_mms(&self.session_en, &self.tokenizer_en, text);
+                if let (Some(ref session_en), Some(ref tokenizer_en)) = (&self.session_en, &self.tokenizer_en) {
+                    return self.run_inference_mms(session_en, tokenizer_en, text);
+                } else {
+                    return Err(anyhow!("English TTS model not available. Please provide mms-tts-eng assets."));
+                }
             }
         }
     }
