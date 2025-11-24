@@ -1,0 +1,10 @@
+[nmt]
+url = "http://127.0.0.1:9001/translate"
+
+[tts]
+url = "http://127.0.0.1:9002/tts"
+
+[engine]
+port = 9000
+whisper_model_path = "models/asr/whisper-base"
+
