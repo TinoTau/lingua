@@ -1,0 +1,17 @@
+{
+  "Whisper": "Whisper",
+  "Piper": "Piper",
+  "M2M100": "M2M100",
+  "ONNX": "ONNX",
+  "FastAPI": "FastAPI",
+  "Rust": "Rust",
+  "Python": "Python",
+  "HTTP": "HTTP",
+  "REST": "REST",
+  "API": "API",
+  "WSL2": "WSL2",
+  "TTS": "TTS",
+  "ASR": "ASR",
+  "NMT": "NMT"
+}
+

@@ -1,18 +1,18 @@
 //! 完整 S2S 流集成测试（简化版）：使用真实的 ASR 和 NMT
 //! 
 //! 使用方法：
-//!   cargo run --example test_s2s_full_simple -- <input_wav_file> [--direction <en-zh|zh-en>]
+//!   cargo run --example test_s2s_full_simple -- <input_wav_file> [--direction <en-zh|zh-en>] [--nmt-model <marian|m2m100>]
 //! 
 //! 示例：
-//!   cargo run --example test_s2s_full_simple -- test_output/s2s_flow_test.wav --direction en-zh
-//!   cargo run --example test_s2s_full_simple -- test_output/s2s_flow_test.wav --direction zh-en
+//!   cargo run --example test_s2s_full_simple -- test_output/s2s_flow_test.wav --direction en-zh --nmt-model m2m100
+//!   cargo run --example test_s2s_full_simple -- test_output/s2s_flow_test.wav --direction zh-en --nmt-model marian
 //! 
 //! 前提条件：
 //!   1. WSL2 中已启动 Piper HTTP 服务（http://127.0.0.1:5005/tts）
 //!   2. Whisper ASR 模型已下载到 core/engine/models/asr/whisper-base/
-//!   3. Marian NMT 模型已下载：
-//!      - core/engine/models/nmt/marian-en-zh/ (英文→中文)
-//!      - core/engine/models/nmt/marian-zh-en/ (中文→英文)
+//!   3. NMT 模型已下载（根据 --nmt-model 参数选择）：
+//!      - Marian: core/engine/models/nmt/marian-en-zh/ 或 marian-zh-en/
+//!      - M2M100: core/engine/models/nmt/m2m100-en-zh/ 或 m2m100-zh-en/
 //!   4. 输入音频文件（WAV 格式）
 
 use std::fs;
@@ -21,7 +21,7 @@ use std::env;
 use hound::WavReader;
 use core_engine::types::AudioFrame;
 use core_engine::asr_streaming::{AsrRequest, AsrStreaming};
-use core_engine::nmt_incremental::{TranslationRequest, NmtIncremental};
+use core_engine::nmt_incremental::{TranslationRequest, NmtIncremental, MarianNmtOnnx, M2M100NmtOnnx};
 use core_engine::tts_streaming::{TtsRequest, TtsStreaming};
 
 /// 加载 WAV 文件并转换为 AudioFrame
@@ -103,10 +103,17 @@ impl TranslationDirection {
         }
     }
 
-    fn nmt_model_name(&self) -> &'static str {
+    fn nmt_model_name_marian(&self) -> &'static str {
         match self {
             TranslationDirection::EnToZh => "marian-en-zh",
             TranslationDirection::ZhToEn => "marian-zh-en",
+        }
+    }
+
+    fn nmt_model_name_m2m100(&self) -> &'static str {
+        match self {
+            TranslationDirection::EnToZh => "m2m100-en-zh",
+            TranslationDirection::ZhToEn => "m2m100-zh-en",
         }
     }
 
@@ -146,9 +153,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 解析命令行参数
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("用法: cargo run --example test_s2s_full_simple -- <input_wav_file> [--direction <en-zh|zh-en>]");
-        eprintln!("示例: cargo run --example test_s2s_full_simple -- test_output/s2s_flow_test.wav --direction en-zh");
-        eprintln!("      cargo run --example test_s2s_full_simple -- test_output/s2s_flow_test.wav --direction zh-en");
+        eprintln!("用法: cargo run --example test_s2s_full_simple -- <input_wav_file> [--direction <en-zh|zh-en>] [--nmt-model <marian|m2m100>]");
+        eprintln!("示例: cargo run --example test_s2s_full_simple -- test_output/s2s_flow_test.wav --direction en-zh --nmt-model m2m100");
+        eprintln!("      cargo run --example test_s2s_full_simple -- test_output/s2s_flow_test.wav --direction zh-en --nmt-model marian");
         return Err("缺少输入音频文件路径".into());
     }
     
@@ -158,17 +165,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 解析翻译方向参数（默认为 en-zh）
-    let direction = if args.len() >= 4 && args[2] == "--direction" {
-        TranslationDirection::from_str(&args[3])?
-    } else {
+    let mut direction = TranslationDirection::EnToZh;
+    let mut nmt_model_type = "m2m100"; // 默认使用 M2M100
+    
+    let mut i = 2;
+    while i < args.len() {
+        if args[i] == "--direction" && i + 1 < args.len() {
+            direction = TranslationDirection::from_str(&args[i + 1])?;
+            i += 2;
+        } else if args[i] == "--nmt-model" && i + 1 < args.len() {
+            nmt_model_type = &args[i + 1];
+            if nmt_model_type != "marian" && nmt_model_type != "m2m100" {
+                return Err(format!("无效的 NMT 模型类型: {}，支持: marian, m2m100", nmt_model_type).into());
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
+    if i == 2 {
         println!("[INFO] 未指定 --direction，默认使用 en-zh（英文→中文）");
-        TranslationDirection::EnToZh
-    };
+        println!("[INFO] 未指定 --nmt-model，默认使用 m2m100");
+    }
 
     println!("[配置] 翻译方向: {} → {}", 
         direction.source_language_hint(), 
         direction.target_language());
-    println!("[配置] NMT 模型: {}", direction.nmt_model_name());
+    println!("[配置] NMT 模型类型: {}", nmt_model_type);
     println!("[配置] TTS 声库: {}", direction.tts_voice());
 
     // 检查服务是否运行
@@ -218,31 +242,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     AsrStreaming::initialize(&asr).await
         .map_err(|e| format!("Failed to initialize ASR: {}", e))?;
 
-    // 加载 NMT（根据翻译方向选择模型）
-    println!("\n[4/7] 加载 Marian NMT...");
-    let nmt_model_name = direction.nmt_model_name();
+    // 加载 NMT（根据翻译方向和模型类型选择）
+    println!("\n[4/7] 加载 NMT 模型（{}）...", nmt_model_type);
+    let nmt_model_name = if nmt_model_type == "m2m100" {
+        direction.nmt_model_name_m2m100()
+    } else {
+        direction.nmt_model_name_marian()
+    };
     let nmt_model_dir = crate_root.join("models/nmt").join(nmt_model_name);
     if !nmt_model_dir.exists() {
-        return Err(format!("Marian NMT 模型目录不存在: {}，请确保模型已下载", nmt_model_dir.display()).into());
+        return Err(format!("{} NMT 模型目录不存在: {}，请确保模型已下载", nmt_model_type, nmt_model_dir.display()).into());
     }
     
     println!("  模型路径: {}", nmt_model_dir.display());
-    let nmt = core_engine::MarianNmtOnnx::new_from_dir(&nmt_model_dir)
-        .map_err(|e| format!("Failed to load Marian NMT: {}", e))?;
-    println!("[OK] Marian NMT 加载成功");
+    
+    // 根据模型类型加载（使用枚举来统一处理）
+    enum NmtModel {
+        Marian(MarianNmtOnnx),
+        M2M100(M2M100NmtOnnx),
+    }
+    
+    let nmt = if nmt_model_type == "m2m100" {
+        let m2m100 = M2M100NmtOnnx::new_from_dir(&nmt_model_dir)
+            .map_err(|e| format!("Failed to load M2M100 NMT: {}", e))?;
+        println!("[OK] M2M100 NMT 加载成功");
+        NmtModel::M2M100(m2m100)
+    } else {
+        let marian = MarianNmtOnnx::new_from_dir(&nmt_model_dir)
+            .map_err(|e| format!("Failed to load Marian NMT: {}", e))?;
+        println!("[OK] Marian NMT 加载成功");
+        NmtModel::Marian(marian)
+    };
     
     // 初始化 NMT
-    NmtIncremental::initialize(&nmt).await
-        .map_err(|e| format!("Failed to initialize NMT: {}", e))?;
+    match &nmt {
+        NmtModel::Marian(m) => NmtIncremental::initialize(m).await
+            .map_err(|e| format!("Failed to initialize Marian NMT: {}", e))?,
+        NmtModel::M2M100(m) => NmtIncremental::initialize(m).await
+            .map_err(|e| format!("Failed to initialize M2M100 NMT: {}", e))?,
+    }
 
-    // 步骤 1: ASR 识别
-    println!("\n[5/7] 执行 ASR 识别...");
-    let mut all_transcripts = Vec::new();
+    // 步骤 1: ASR 识别（自动检测语言）
+    println!("\n[4/7] 执行 ASR 识别（自动检测语言）...");
+    let mut all_transcript_texts = Vec::new();
+    let mut detected_language: Option<String> = None;
     
     for (i, frame) in audio_frames.iter().enumerate() {
+        // 使用 None 进行自动语言检测
+        // 根据产品需求，应该支持自动检测，所以使用 None
         let asr_request = AsrRequest {
             frame: frame.clone(),
-            language_hint: Some(direction.source_language_hint().to_string()),
+            language_hint: None,  // None 表示自动检测语言
         };
         
         let asr_result = AsrStreaming::infer(&asr, asr_request).await
@@ -254,22 +304,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         if let Some(ref final_transcript) = asr_result.final_transcript {
             println!("  最终结果 [帧 {}]: {}", i + 1, final_transcript.text);
-            all_transcripts.push(final_transcript.text.clone());
+            all_transcript_texts.push(final_transcript.text.clone());
+            // 获取检测到的语言（从第一个有效结果中获取）
+            if detected_language.is_none() {
+                detected_language = Some(final_transcript.language.clone());
+            }
         }
     }
     
-    // 合并所有转录结果
-    let source_text = all_transcripts.join(" ");
+    let source_text = all_transcript_texts.join(" ");
     if source_text.is_empty() {
         return Err("ASR 未返回任何转录结果".into());
     }
     
+    // 根据检测到的语言动态选择翻译方向
+    let mut detected_lang = detected_language.as_deref().unwrap_or("unknown");
+    
+    // 如果检测到的语言是 "unknown"，尝试从文本内容推断语言
+    if detected_lang == "unknown" {
+        // 简单的语言推断：检查文本中是否包含中文字符
+        let has_chinese = source_text.chars().any(|c| {
+            let code = c as u32;
+            // 中文字符范围：CJK 统一汉字 (0x4E00-0x9FFF)
+            (0x4E00..=0x9FFF).contains(&code)
+        });
+        
+        // 检查文本中是否主要是英文字符
+        let english_ratio = source_text.chars()
+            .filter(|c| c.is_ascii_alphabetic() || c.is_whitespace() || c.is_ascii_punctuation())
+            .count() as f32 / source_text.chars().count().max(1) as f32;
+        
+        if has_chinese {
+            detected_lang = "zh";
+            println!("[INFO] 从文本内容推断语言: 中文（检测到中文字符）");
+        } else if english_ratio > 0.7 {
+            detected_lang = "en";
+            println!("[INFO] 从文本内容推断语言: 英文（文本主要为英文字符）");
+        }
+    }
+    
     println!("[OK] ASR 识别完成");
-    println!("  源文本（{}）: {}", direction.source_language_hint(), source_text);
-
-    // 步骤 2: NMT 翻译
-    println!("\n[6/7] 执行 NMT 翻译...");
-    println!("  翻译方向: {} → {}", direction.source_language_hint(), direction.target_language());
+    println!("  检测到的语言: {}", detected_lang);
+    println!("  源文本: {}", source_text);
+    
+    // 根据检测到的语言选择翻译方向
+    let (src_lang, tgt_lang) = match detected_lang {
+        "zh" | "chinese" => ("zh", "en"),  // 中文 → 英文
+        "en" | "english" => ("en", "zh"),  // 英文 → 中文
+        _ => {
+            // 如果无法识别，使用默认方向
+            println!("[WARNING] 无法识别语言 '{}'，使用默认翻译方向: {} → {}", 
+                detected_lang, direction.source_language_hint(), direction.target_language());
+            (direction.source_language_hint(), direction.target_language())
+        }
+    };
+    
+    println!("\n[5/7] 加载 NMT 模型（{}）...", nmt_model_type);
+    println!("  翻译方向: {} → {} (根据 ASR 检测到的语言自动选择)", src_lang, tgt_lang);
     
     // 创建 PartialTranscript 用于翻译请求
     let transcript = core_engine::types::PartialTranscript {
@@ -280,16 +371,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let translation_request = TranslationRequest {
         transcript,
-        target_language: direction.target_language().to_string(),
+        target_language: tgt_lang.to_string(),
         wait_k: None,
     };
     
-    let translation_response = NmtIncremental::translate(&nmt, translation_request).await
-        .map_err(|e| format!("Translation failed: {}", e))?;
+    // 根据翻译方向动态加载 NMT 模型
+    let nmt_model_name = if nmt_model_type == "m2m100" {
+        if src_lang == "zh" && tgt_lang == "en" {
+            "m2m100-zh-en"
+        } else if src_lang == "en" && tgt_lang == "zh" {
+            "m2m100-en-zh"
+        } else {
+            return Err(format!("不支持的翻译方向: {} → {}", src_lang, tgt_lang).into());
+        }
+    } else {
+        if src_lang == "zh" && tgt_lang == "en" {
+            "marian-zh-en"
+        } else if src_lang == "en" && tgt_lang == "zh" {
+            "marian-en-zh"
+        } else {
+            return Err(format!("不支持的翻译方向: {} → {}", src_lang, tgt_lang).into());
+        }
+    };
+    
+    println!("  使用 NMT 模型: {}", nmt_model_name);
+    
+    // 如果模型不匹配，需要重新加载
+    let nmt_model_dir = crate_root.join("models/nmt").join(nmt_model_name);
+    if !nmt_model_dir.exists() {
+        return Err(format!("NMT 模型目录不存在: {}", nmt_model_dir.display()).into());
+    }
+    
+    // 重新加载 NMT 模型（如果需要）
+    let nmt = if nmt_model_type == "m2m100" {
+        let m2m100 = M2M100NmtOnnx::new_from_dir(&nmt_model_dir)
+            .map_err(|e| format!("Failed to load M2M100 NMT: {}", e))?;
+        println!("[OK] M2M100 NMT 加载成功: {}", nmt_model_name);
+        NmtModel::M2M100(m2m100)
+    } else {
+        let marian = MarianNmtOnnx::new_from_dir(&nmt_model_dir)
+            .map_err(|e| format!("Failed to load Marian NMT: {}", e))?;
+        println!("[OK] Marian NMT 加载成功: {}", nmt_model_name);
+        NmtModel::Marian(marian)
+    };
+    
+    // 初始化 NMT
+    match &nmt {
+        NmtModel::Marian(m) => NmtIncremental::initialize(m).await
+            .map_err(|e| format!("Failed to initialize Marian NMT: {}", e))?,
+        NmtModel::M2M100(m) => NmtIncremental::initialize(m).await
+            .map_err(|e| format!("Failed to initialize M2M100 NMT: {}", e))?,
+    }
+    
+    let translation_response = match &nmt {
+        NmtModel::Marian(m) => NmtIncremental::translate(m, translation_request).await
+            .map_err(|e| format!("Translation failed: {}", e))?,
+        NmtModel::M2M100(m) => NmtIncremental::translate(m, translation_request).await
+            .map_err(|e| format!("Translation failed: {}", e))?,
+    };
     
     let target_text = translation_response.translated_text;
     println!("[OK] NMT 翻译完成");
-    println!("  目标文本（{}）: {}", direction.target_language(), target_text);
+    println!("  目标文本（{}）: {}", tgt_lang, target_text);
     println!("  翻译稳定: {}", translation_response.is_stable);
     
     // 日志：NMT 输出的纯文本（送进 TTS 之前）
@@ -350,7 +493,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 清理
     AsrStreaming::finalize(&asr).await?;
-    NmtIncremental::finalize(&nmt).await?;
+    match &nmt {
+        NmtModel::Marian(m) => NmtIncremental::finalize(m).await?,
+        NmtModel::M2M100(m) => NmtIncremental::finalize(m).await?,
+    }
 
     println!("\n=== 测试完成 ===");
     println!("\n完整 S2S 流程测试总结：");
@@ -358,7 +504,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("    输入: 音频文件 {}", input_wav.display());
     println!("    输出（{}）: \"{}\"", direction.source_language_hint(), source_text);
     println!();
-    println!("  ✅ 步骤 2: NMT 翻译（真实 Marian，{}）", direction.nmt_model_name());
+    println!("  ✅ 步骤 2: NMT 翻译（真实 {}，{}）", nmt_model_type, nmt_model_name);
     println!("    输入（{}）: \"{}\"", direction.source_language_hint(), source_text);
     println!("    输出（{}）: \"{}\"", direction.target_language(), target_text);
     println!();

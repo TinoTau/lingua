@@ -1,4 +1,5 @@
 ﻿mod tokenizer;
+mod m2m100_tokenizer;
 mod language_pair;
 mod types;
 mod nmt_trait;
@@ -9,11 +10,16 @@ mod encoder;
 mod decoder;
 mod translation;
 mod marian_onnx;
+mod m2m100_onnx;
+mod m2m100_decoder;
+mod m2m100_translation;
 
 pub use tokenizer::MarianTokenizer;
+pub use m2m100_tokenizer::M2M100Tokenizer;
 pub use language_pair::{LanguageCode, LanguagePair};
 pub use types::{TranslationRequest, TranslationResponse};
 pub use nmt_trait::NmtIncremental;
 pub use utils::{load_marian_onnx_for_smoke_test, translate_full_sentence_stub};
 pub use stub::MarianNmtStub;
 pub use marian_onnx::MarianNmtOnnx;
+pub use m2m100_onnx::M2M100NmtOnnx;

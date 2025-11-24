@@ -28,6 +28,13 @@ tokenizers = "0.15"
 # HTTP 客户端（用于 Piper TTS）
 reqwest = { version = "0.11", features = ["json"] }
 
+# UUID 生成（用于性能日志）
+uuid = { version = "1.0", features = ["v4"] }
+
+# 临时文件（用于测试）
+[dev-dependencies]
+tempfile = "3"
+
 # Patch esaxx-rs to use dynamic CRT (/MD) instead of static CRT (/MT)
 # This fixes the linker error: RuntimeLibrary mismatch between MD_DynamicRelease and MT_StaticRelease
 [patch.crates-io]

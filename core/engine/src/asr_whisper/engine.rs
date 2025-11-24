@@ -84,8 +84,8 @@ impl WhisperAsrEngine {
     /// * `audio_data` - 预处理后的音频数据（16kHz 单声道 PCM f32）
     /// 
     /// # Returns
-    /// 返回转录文本
-    pub fn transcribe_full(&self, audio_data: &[f32]) -> Result<String> {
+    /// 返回 (转录文本, 检测到的语言)
+    pub fn transcribe_full(&self, audio_data: &[f32]) -> Result<(String, Option<String>)> {
         // 创建推理状态
         let mut state = self.ctx.create_state()
             .map_err(|e| anyhow!("Failed to create Whisper state: {:?}", e))?;
@@ -110,6 +110,17 @@ impl WhisperAsrEngine {
         state.full(params, audio_data)
             .map_err(|e| anyhow!("Failed to run inference: {:?}", e))?;
 
+        // 提取检测到的语言
+        // Whisper 会在推理后设置检测到的语言
+        let detected_lang = if self.language.is_none() {
+            // 如果使用自动检测，尝试从 state 中获取检测到的语言
+            // 注意：whisper_rs 可能不直接提供这个 API，我们需要从 segment 中推断
+            // 或者使用其他方法
+            None  // 暂时返回 None，后续可以从 segment 中提取
+        } else {
+            self.language.clone()
+        };
+
         // 提取结果
         let num_segments = state.full_n_segments();
         let mut full_text = String::new();
@@ -133,7 +144,7 @@ impl WhisperAsrEngine {
             }
         }
 
-        Ok(full_text.trim().to_string())
+        Ok((full_text.trim().to_string(), detected_lang))
     }
 
     /// 从 AudioFrame 转录
@@ -142,8 +153,8 @@ impl WhisperAsrEngine {
     /// * `frame` - 音频帧
     /// 
     /// # Returns
-    /// 返回转录文本
-    pub fn transcribe_frame(&self, frame: &AudioFrame) -> Result<String> {
+    /// 返回 (转录文本, 检测到的语言)
+    pub fn transcribe_frame(&self, frame: &AudioFrame) -> Result<(String, Option<String>)> {
         let audio_data = preprocess_audio_frame(frame)?;
         self.transcribe_full(&audio_data)
     }
@@ -154,8 +165,8 @@ impl WhisperAsrEngine {
     /// * `frames` - 音频帧序列
     /// 
     /// # Returns
-    /// 返回转录文本
-    pub fn transcribe_frames(&self, frames: &[AudioFrame]) -> Result<String> {
+    /// 返回 (转录文本, 检测到的语言)
+    pub fn transcribe_frames(&self, frames: &[AudioFrame]) -> Result<(String, Option<String>)> {
         let audio_data = accumulate_audio_frames(frames)?;
         self.transcribe_full(&audio_data)
     }
@@ -274,7 +285,7 @@ mod tests {
 
         // 进行转录
         println!("\n开始转录...");
-        let result = engine.transcribe_full(&audio_16k)
+        let (result, _detected_lang) = engine.transcribe_full(&audio_16k)
             .expect("Failed to transcribe");
 
         println!("\n转录结果:");

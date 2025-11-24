@@ -1,0 +1,45 @@
+# M2M100 实时翻译系统配置文件
+
+[nmt]
+# NMT 服务 URL
+service_url = "http://127.0.0.1:5008"
+# 健康检查超时（秒）
+health_check_timeout = 5
+# 熔断配置
+circuit_breaker = { max_failures = 3, reset_timeout_sec = 30 }
+
+[tts]
+# TTS 服务 URL
+service_url = "http://127.0.0.1:5005"
+# 健康检查超时（秒）
+health_check_timeout = 5
+# 默认语音
+default_voice_zh = "zh_CN-huayan-medium"
+default_voice_en = "en_US-lessac-medium"
+# 请求超时（毫秒）
+timeout_ms = 8000
+
+[asr]
+# ASR 模型路径（相对于 core/engine 目录）
+model_dir = "models/asr/whisper-base"
+
+[translation]
+# 默认源语言
+default_src_lang = "en"
+# 默认目标语言
+default_tgt_lang = "zh"
+
+[logging]
+# 日志级别: trace, debug, info, warn, error
+level = "info"
+# 是否记录性能日志
+enable_performance_log = true
+# 是否记录可疑翻译
+enable_suspect_translation_log = true
+
+[post_processing]
+# 是否启用文本后处理
+enabled = true
+# 术语表文件路径
+terms_file = "config/terms.json"
+

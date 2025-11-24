@@ -84,14 +84,35 @@ def find_model_path(voice: str, model_dir: str) -> Tuple[Optional[str], Optional
     model_dir_path = Path(model_dir).expanduser()
     
     # 尝试不同的可能路径
+    # 根据 Piper 官方模型结构，模型通常按语言组织：
+    # - zh/zh_CN-huayan-medium/zh_CN-huayan-medium.onnx
+    # - en/en_US-lessac-medium/en_US-lessac-medium.onnx
+    # 或者扁平结构：
+    # - zh/zh_CN-huayan-medium.onnx
+    # - en/en_US-lessac-medium.onnx
+    
+    # 从 voice 名称推断语言代码（例如：en_US-lessac-medium -> en）
+    language_code = None
+    if voice.startswith("zh_"):
+        language_code = "zh"
+    elif voice.startswith("en_"):
+        language_code = "en"
+    
     possible_paths = [
+        # 标准结构：{model_dir}/{lang}/{voice}/{voice}.onnx
+        model_dir_path / language_code / voice / f"{voice}.onnx" if language_code else None,
+        # 扁平结构：{model_dir}/{lang}/{voice}.onnx
+        model_dir_path / language_code / f"{voice}.onnx" if language_code else None,
+        # 旧结构：{model_dir}/{voice}/{voice}.onnx
         model_dir_path / voice / f"{voice}.onnx",
+        # 旧结构：{model_dir}/zh/{voice}.onnx（向后兼容）
         model_dir_path / "zh" / f"{voice}.onnx",
+        # 根目录：{model_dir}/{voice}.onnx
         model_dir_path / f"{voice}.onnx",
     ]
     
     for model_path in possible_paths:
-        if model_path.exists():
+        if model_path and model_path.exists():
             config_path = model_path.with_suffix(".onnx.json")
             return str(model_path), str(config_path) if config_path.exists() else None
     

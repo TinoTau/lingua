@@ -205,7 +205,7 @@ impl WhisperAsrStreaming {
         // 5. 运行推理（使用 spawn_blocking 避免阻塞异步运行时）
         let engine_clone = Arc::clone(&self.engine);
         let audio_data_clone = audio_data.clone();
-        let transcript_text = tokio::task::spawn_blocking(move || {
+        let (transcript_text, _detected_lang) = tokio::task::spawn_blocking(move || {
             let engine = engine_clone.lock()
                 .map_err(|e| anyhow::anyhow!("Failed to lock WhisperAsrEngine: {}", e))?;
             engine.transcribe_full(&audio_data_clone)
@@ -261,7 +261,7 @@ impl WhisperAsrStreaming {
         // 6. 运行推理（使用 spawn_blocking 避免阻塞异步运行时）
         let engine_clone = Arc::clone(&self.engine);
         let audio_data_clone = audio_data.clone();
-        let transcript_text = tokio::task::spawn_blocking(move || {
+        let (transcript_text, _detected_lang) = tokio::task::spawn_blocking(move || {
             let engine = engine_clone.lock()
                 .map_err(|e| anyhow::anyhow!("Failed to lock WhisperAsrEngine: {}", e))?;
             engine.transcribe_full(&audio_data_clone)
@@ -386,7 +386,7 @@ impl AsrStreaming for WhisperAsrStreaming {
         // 6. 运行推理（使用 spawn_blocking 避免阻塞异步运行时）
         let engine_clone = Arc::clone(&self.engine);
         let audio_data_clone = audio_data.clone();
-        let transcript_text = tokio::task::spawn_blocking(move || {
+        let (transcript_text, detected_lang) = tokio::task::spawn_blocking(move || {
             let engine = engine_clone.lock()
                 .map_err(|e| anyhow::anyhow!("Failed to lock WhisperAsrEngine: {}", e))?;
             engine.transcribe_full(&audio_data_clone)
@@ -396,7 +396,7 @@ impl AsrStreaming for WhisperAsrStreaming {
         .map_err(|e| EngineError::new(format!("Task join error: {}", e)))?
         .map_err(|e| EngineError::new(format!("Transcription error: {}", e)))?;
 
-        // 7. 构造结果
+        // 8. 构造结果
         let result = if transcript_text.is_empty() {
             AsrResult {
                 partial: None,
@@ -404,6 +404,14 @@ impl AsrStreaming for WhisperAsrStreaming {
             }
         } else {
             let confidence = 0.95;
+            
+            // 使用检测到的语言，如果没有则使用设置的语言，最后使用 "unknown"
+            let final_language = detected_lang
+                .or_else(|| {
+                    let engine = self.engine.lock().ok()?;
+                    engine.language().map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| "unknown".to_string());
 
             AsrResult {
                 partial: Some(PartialTranscript {
@@ -411,17 +419,11 @@ impl AsrStreaming for WhisperAsrStreaming {
                     confidence,
                     is_final: false,
                 }),
-                final_transcript: {
-                    let engine = self.engine.lock()
-                        .map_err(|e| EngineError::new(format!("Failed to lock WhisperAsrEngine: {}", e)))?;
-                    Some(StableTranscript {
-                        text: transcript_text,
-                        speaker_id: None,
-                        language: engine.language()
-                            .unwrap_or("unknown")
-                            .to_string(),
-                    })
-                },
+                final_transcript: Some(StableTranscript {
+                    text: transcript_text,
+                    speaker_id: None,
+                    language: final_language,
+                }),
             }
         };
 

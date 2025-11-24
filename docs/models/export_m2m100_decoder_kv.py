@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-\"\"\"
-Export M2M100 decoder + KV Cache to ONNX.
-Maintains compatibility with existing Marian 28-input interface.
-\"\"\"
-
 import argparse
 from pathlib import Path
 from typing import List
@@ -126,8 +121,14 @@ def export_m2m100_decoder(output_dir: Path, model_id: str):
     export_path = output_dir / "decoder.onnx"
     print(f"[INFO] Exporting decoder to {export_path}")
 
-    # dynamic_axes: keep batch dynamic; seq lengths are also dynamic but not strictly required here
+    # dynamic_axes: keep batch dynamic; seq lengths are also dynamic
     dynamic_axes = {name: {0: "batch"} for name in input_names}
+    # encoder_attention_mask 的序列长度应该是动态的
+    dynamic_axes["encoder_attention_mask"] = {0: "batch", 1: "src_seq"}
+    # encoder_hidden_states 的序列长度也应该是动态的
+    dynamic_axes["encoder_hidden_states"] = {0: "batch", 1: "src_seq"}
+    # input_ids 的序列长度是动态的
+    dynamic_axes["input_ids"] = {0: "batch", 1: "tgt_seq"}
     dynamic_axes["logits"] = {0: "batch", 1: "tgt_seq"}
     for name in output_names:
         if name.startswith("present."):
@@ -140,7 +141,7 @@ def export_m2m100_decoder(output_dir: Path, model_id: str):
         input_names=input_names,
         output_names=output_names,
         dynamic_axes=dynamic_axes,
-        opset_version=13,
+        opset_version=12,  # 使用 opset 12 以确保 IR <= 9，兼容 ort 1.16.3
         do_constant_folding=False,
     )
 

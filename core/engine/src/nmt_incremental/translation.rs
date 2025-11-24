@@ -36,6 +36,7 @@ impl MarianNmtOnnx {
             input_ids: vec![self.decoder_start_token_id],
             generated_ids: vec![self.decoder_start_token_id],  // 一开始就包含 BOS
             decoder_kv_cache: None,
+            encoder_kv_cache: None,  // 第一步使用全零占位符
             use_cache_branch: false,  // 第一步：禁用 KV 分支
         };
 
@@ -54,6 +55,7 @@ impl MarianNmtOnnx {
                     input_ids: vec![last_token],  // 关键：只包含新 token
                     generated_ids: state.generated_ids.clone(),
                     decoder_kv_cache: state.decoder_kv_cache.take(),  // 使用历史 decoder KV cache
+                    encoder_kv_cache: state.encoder_kv_cache.take(),  // 使用历史 encoder KV cache
                     use_cache_branch: true,  // 启用 KV 分支
                 }
             } else {
@@ -63,6 +65,7 @@ impl MarianNmtOnnx {
                     input_ids: current_generated_ids.clone(),  // 使用完整历史序列
                     generated_ids: current_generated_ids.clone(),
                     decoder_kv_cache: None,
+                    encoder_kv_cache: None,  // 使用全零占位符
                     use_cache_branch: false,  // 禁用 KV 分支
                 }
             };

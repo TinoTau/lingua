@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 \"\"\"
-Export M2M100 encoder to ONNX (opset 13).
-Compatible with existing Lingua NMT pipeline.
+Export M2M100 encoder to ONNX (opset 12, IR <= 9).
+Compatible with existing Lingua NMT pipeline and ort 1.16.3.
 \"\"\"
 
 import argparse
@@ -49,7 +49,7 @@ def export_m2m100_encoder(output_dir: Path, model_id: str):
             "attention_mask": {0: "batch", 1: "seq"},
             "last_hidden_state": {0: "batch", 1: "seq"},
         },
-        opset_version=13,
+        opset_version=12,  # 使用 opset 12 以确保 IR <= 9，兼容 ort 1.16.3
         do_constant_folding=True,
     )
 

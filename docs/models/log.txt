@@ -1,0 +1,363 @@
+(.marian_zh_en_ir9) (base) PS D:\work\pure_python310> & ".marian_zh_en_ir9\Scripts\python.exe" scripts/test_m2m100_hf_baseline.py
+============================================================
+测试 A：HF 官方 PyTorch 对照实验
+============================================================
+
+[1/4] 加载模型和 tokenizer...
+D:\work\pure_python310\.marian_zh_en_ir9\lib\site-packages\huggingface_hub\file_download.py:942: FutureWarning: `resume_download` is deprecated and will be removed in version 1.0.0. Downloads always resume when possible. If you want to force a new download, use `force_download=True`.
+  warnings.warn(
+
+[2/4] 关键参数（开发必须记录）：
+  eos_token_id = 2
+  pad_token_id = 1
+  bos_token_id = 0
+  lang_id(en) = 128022
+  lang_id(zh) = 128102
+  decoder_start_token_id = 2
+
+[3/4] 测试 en->zh 翻译...
+  输入文本: Hello, welcome to the test.
+  encoder input_ids: [128022, 65761, 4, 119259, 128, 1197, 4183, 5, 2]
+  encoder attention_mask: [1, 1, 1, 1, 1, 1, 1, 1, 1]
+D:\work\pure_python310\.marian_zh_en_ir9\lib\site-packages\transformers\generation\configuration_utils.py:535: UserWarning: `num_beams` is set to 1. However, `early_stopping` is set to `True` -- this flag is only used in beam-based generation modes. You should set `num_beams>1` or unset `early_stopping`.
+  warnings.warn(
+
+[4/4] HF 生成结果:
+  生成的 token IDs: [2, 128102, 22, 11961, 3051, 4, 75543, 109524, 100489, 37, 2]
+  解码文本（含特殊token）: </s> __zh__ 您好,欢迎来到测试。</s>
+  解码文本（清理后）: 您好,欢迎来到测试。
+  ✅ EOS 出现在位置: [0, 10]
+
+  前 10 个 token 详情:
+    Step 0: token_id=2, token='</s>'
+    Step 1: token_id=128102, token='__zh__'
+    Step 2: token_id=22, token=''
+    Step 3: token_id=11961, token='您'
+    Step 4: token_id=3051, token='好'
+    Step 5: token_id=4, token=','
+    Step 6: token_id=75543, token='欢迎'
+    Step 7: token_id=109524, token='来到'
+    Step 8: token_id=100489, token='测试'
+    Step 9: token_id=37, token='。'
+
+============================================================
+测试 zh->en 翻译...
+============================================================
+  输入文本: 你好，欢迎参加测试。
+  encoder input_ids: [128102, 78023, 3051, 4, 75543, 17359, 100489, 37, 2]
+
+  HF 生成结果:
+  生成的 token IDs: [2, 128022, 108938, 128, 1197, 4183, 5, 2]
+  解码文本: Welcome to the test.
+  ✅ EOS 出现在位置: [0, 7]
+
+============================================================
+✅ HF 基线测试完成
+============================================================
+(.marian_zh_en_ir9) (base) PS D:\work\pure_python310> & ".marian_zh_en_ir9\Scripts\python.exe" scripts/test_m2m100_onnx_decoder.py core/engine/models/nmt/m2m100-en-zh en-zh 20
+============================================================
+测试 B & C：ONNX Decoder Step-by-Step 检查 (en-zh)
+============================================================
+
+[1/5] 加载 tokenizer 和 config...
+D:\work\pure_python310\.marian_zh_en_ir9\lib\site-packages\huggingface_hub\file_download.py:942: FutureWarning: `resume_download` is deprecated and will be removed in version 1.0.0. Downloads always resume when possible. If you want to force a new download, use `force_download=True`.
+  warnings.warn(
+
+[2/5] 关键参数（对照 HF 基线）：
+  eos_token_id = 2
+  pad_token_id = 1
+  lang_id(en) = 128022
+  lang_id(zh) = 128102
+
+[3/5] 加载 ONNX decoder...
+  输入数量: 52
+  输出数量: 49
+  推断层数: 12
+
+[4/5] 准备 encoder 输出...
+  使用真实的 encoder ONNX 模型: core\engine\models\nmt\m2m100-en-zh\encoder.onnx
+  ✅ 使用真实 encoder 输出，形状: (1, 9, 1024)
+  源语言: en, 目标语言: zh
+  语言 token ID: 128102
+  测试文本: Hello, welcome to the test.
+
+[5/5] 开始解码循环...
+============================================================
+  第一个 KV cache 输入: past_key_values.0.decoder.key
+  期望形状: ['batch', 16, 'past_seq', 64]
+  初始 past_seq_len: 1 (模型期望的 past_seq_len 维度)
+  decoder_start_token_id (from config): 2
+  语言 token ID (forced_bos): 128102
+
+[STEP 0]
+  decoder_input_ids (current) = [2]
+  decoder_input_ids (accumulated) = [2]
+  decoder_start_token_id = 2
+  forced_bos_token_id (lang) = 128102
+  eos_token_id = 2
+  top5 logits = [(128028, 11.195165634155273), (128045, 10.3345947265625), (128075, 10.320469856262207), (128067, 10.24941635131836), (128087, 10.20112133026123)]
+  next_id = 128102 (forced_bos_token_id)
+  present KV shape[0]: (1, 16, 2, 64)
+  present KV[0] first step value: 0.000000, last step value: 0.179302
+  KV_changed = False
+
+[STEP 1]
+  decoder_input_ids (current) = [128102]
+  decoder_input_ids (accumulated) = [2, 128102]
+  decoder_start_token_id = 2
+  forced_bos_token_id (lang) = 128102
+  eos_token_id = 2
+  top5 logits = [(22, 9.89493465423584), (78023, 8.850655555725098), (41, 7.178529262542725), (7812, 6.014849662780762), (20015, 5.905239105224609)]
+  next_id = 22
+  present KV shape[0]: (1, 16, 3, 64)
+  previous KV shape[0]: (1, 16, 2, 64)
+  present KV[0] first step value: 0.000000, last step value: 0.801613
+  KV_changed = True
+
+[STEP 2]
+  decoder_input_ids (current) = [22]
+  decoder_input_ids (accumulated) = [2, 128102, 22]
+  decoder_start_token_id = 2
+  forced_bos_token_id (lang) = 128102
+  eos_token_id = 2
+  top5 logits = [(11961, 10.01452922821045), (75543, 8.924580574035645), (3051, 8.460770606994629), (11127, 7.9873809814453125), (122799, 7.367211818695068)]
+  next_id = 11961
+  present KV shape[0]: (1, 16, 4, 64)
+  previous KV shape[0]: (1, 16, 3, 64)
+  present KV[0] first step value: 0.000000, last step value: -0.296829
+  KV_changed = True
+
+[STEP 3]
+  decoder_input_ids (current) = [11961]
+  decoder_input_ids (accumulated) = [2, 128102, 22, 11961]
+  decoder_start_token_id = 2
+  forced_bos_token_id (lang) = 128102
+  eos_token_id = 2
+  top5 logits = [(3051, 12.810251235961914), (4, 7.583219051361084), (75543, 7.38447380065918), (2139, 6.671354293823242), (3218, 6.451910018920898)]
+  next_id = 3051
+  present KV shape[0]: (1, 16, 5, 64)
+  previous KV shape[0]: (1, 16, 4, 64)
+  present KV[0] first step value: 0.000000, last step value: 0.257181
+  KV_changed = True
+
+[STEP 4]
+  decoder_input_ids (current) = [3051]
+  decoder_input_ids (accumulated) = [2, 128102, 22, 11961, 3051]
+  decoder_start_token_id = 2
+  forced_bos_token_id (lang) = 128102
+  eos_token_id = 2
+  top5 logits = [(4, 10.091798782348633), (30, 7.5868449211120605), (22, 7.208230495452881), (75543, 5.958914756774902), (221, 5.251532077789307)]
+  next_id = 4
+  present KV shape[0]: (1, 16, 6, 64)
+  previous KV shape[0]: (1, 16, 5, 64)
+  present KV[0] first step value: 0.000000, last step value: 0.391168
+  KV_changed = True
+
+[STEP 5]
+  decoder_input_ids (current) = [4]
+  decoder_input_ids (accumulated) = [2, 128102, 22, 11961, 3051, 4]
+  decoder_start_token_id = 2
+  forced_bos_token_id (lang) = 128102
+  eos_token_id = 2
+  top5 logits = [(75543, 11.030293464660645), (11961, 7.1766252517700195), (95397, 6.8473052978515625), (3051, 6.81896448135376), (22, 6.140810966491699)]
+  next_id = 75543
+  present KV shape[0]: (1, 16, 7, 64)
+  previous KV shape[0]: (1, 16, 6, 64)
+  present KV[0] first step value: 0.000000, last step value: -0.683477
+  KV_changed = True
+
+[STEP 6]
+  decoder_input_ids (current) = [75543]
+  decoder_input_ids (accumulated) = [2, 128102, 22, 11961, 3051, 4, 75543]
+  decoder_start_token_id = 2
+  forced_bos_token_id (lang) = 128102
+  eos_token_id = 2
+  top5 logits = [(109524, 10.030925750732422), (17359, 9.92349910736084), (36439, 8.375741958618164), (1885, 8.095625877380371), (3218, 8.05474853515625)]
+  next_id = 109524
+  present KV shape[0]: (1, 16, 8, 64)
+  previous KV shape[0]: (1, 16, 7, 64)
+  present KV[0] first step value: 0.000000, last step value: 0.845622
+  KV_changed = True
+
+[STEP 7]
+  decoder_input_ids (current) = [109524]
+  decoder_input_ids (accumulated) = [2, 128102, 22, 11961, 3051, 4, 75543, 109524]
+  decoder_start_token_id = 2
+  forced_bos_token_id (lang) = 128102
+  eos_token_id = 2
+  top5 logits = [(100489, 10.451924324035645), (75606, 9.459041595458984), (14482, 8.544478416442871), (21503, 7.809900283813477), (65349, 6.6426544189453125)]
+  next_id = 100489
+  present KV shape[0]: (1, 16, 9, 64)
+  previous KV shape[0]: (1, 16, 8, 64)
+  present KV[0] first step value: 0.000000, last step value: 0.246840
+  KV_changed = True
+
+[STEP 8]
+  decoder_input_ids (current) = [100489]
+  decoder_input_ids (accumulated) = [2, 128102, 22, 11961, 3051, 4, 75543, 109524, 100489]
+  decoder_start_token_id = 2
+  forced_bos_token_id (lang) = 128102
+  eos_token_id = 2
+  top5 logits = [(37, 9.642326354980469), (1203, 9.344390869140625), (2, 8.484436988830566), (30, 7.49749231338501), (13284, 5.7300896644592285)]
+  next_id = 37
+  present KV shape[0]: (1, 16, 10, 64)
+  previous KV shape[0]: (1, 16, 9, 64)
+  present KV[0] first step value: 0.000000, last step value: 0.829212
+  KV_changed = True
+
+[STEP 9]
+  decoder_input_ids (current) = [37]
+  decoder_input_ids (accumulated) = [2, 128102, 22, 11961, 3051, 4, 75543, 109524, 100489, 37]
+  decoder_start_token_id = 2
+  forced_bos_token_id (lang) = 128102
+  eos_token_id = 2
+  top5 logits = [(2, 10.579913139343262), (22, 0.002382516860961914), (5124, -0.03522968292236328), (10, -0.14001625776290894), (237, -0.33103081583976746)]
+  next_id = 2
+  present KV shape[0]: (1, 16, 11, 64)
+  previous KV shape[0]: (1, 16, 10, 64)
+  present KV[0] first step value: 0.000000, last step value: -0.959700
+  KV_changed = True
+  ✅ EOS detected at step 9
+
+============================================================
+解码结果总结:
+============================================================
+  生成的 token IDs: [128102, 22, 11961, 3051, 4, 75543, 109524, 100489, 37, 2]
+  解码文本（含特殊token）: __zh__ 您好,欢迎来到测试。</s>
+  解码文本（清理后）: 您好,欢迎来到测试。
+  ✅ EOS 出现在位置: [9]
+============================================================
+(.marian_zh_en_ir9) (base) PS D:\work\pure_python310> & ".marian_zh_en_ir9\Scripts\python.exe" scripts/test_m2m100_onnx_decoder.py core/engine/models/nmt/m2m100-zh-en zh-en 20
+============================================================
+测试 B & C：ONNX Decoder Step-by-Step 检查 (zh-en)
+============================================================
+
+[1/5] 加载 tokenizer 和 config...
+D:\work\pure_python310\.marian_zh_en_ir9\lib\site-packages\huggingface_hub\file_download.py:942: FutureWarning: `resume_download` is deprecated and will be removed in version 1.0.0. Downloads always resume when possible. If you want to force a new download, use `force_download=True`.
+  warnings.warn(
+
+[2/5] 关键参数（对照 HF 基线）：
+  eos_token_id = 2
+  pad_token_id = 1
+  lang_id(en) = 128022
+  lang_id(zh) = 128102
+
+[3/5] 加载 ONNX decoder...
+  输入数量: 52
+  输出数量: 49
+  推断层数: 12
+
+[4/5] 准备 encoder 输出...
+  使用真实的 encoder ONNX 模型: core\engine\models\nmt\m2m100-zh-en\encoder.onnx
+  ✅ 使用真实 encoder 输出，形状: (1, 9, 1024)
+  源语言: zh, 目标语言: en
+  语言 token ID: 128022
+  测试文本: 你好，欢迎参加测试。
+
+[5/5] 开始解码循环...
+============================================================
+  第一个 KV cache 输入: past_key_values.0.decoder.key
+  期望形状: ['batch', 16, 'past_seq', 64]
+  初始 past_seq_len: 1 (模型期望的 past_seq_len 维度)
+  decoder_start_token_id (from config): 2
+  语言 token ID (forced_bos): 128022
+
+[STEP 0]
+  decoder_input_ids (current) = [2]
+  decoder_input_ids (accumulated) = [2]
+  decoder_start_token_id = 2
+  forced_bos_token_id (lang) = 128022
+  eos_token_id = 2
+  top5 logits = [(128046, 11.617374420166016), (128073, 10.424196243286133), (128087, 10.231477737426758), (128097, 9.970808029174805), (128077, 9.95414924621582)]
+  next_id = 128022 (forced_bos_token_id)
+  present KV shape[0]: (1, 16, 2, 64)
+  present KV[0] first step value: 0.000000, last step value: 0.179302
+  KV_changed = False
+
+[STEP 1]
+  decoder_input_ids (current) = [128022]
+  decoder_input_ids (accumulated) = [2, 128022]
+  decoder_start_token_id = 2
+  forced_bos_token_id (lang) = 128022
+  eos_token_id = 2
+  top5 logits = [(108938, 11.119709968566895), (65761, 9.550055503845215), (7676, 9.077919960021973), (31092, 7.477478981018066), (119259, 7.312143325805664)]
+  next_id = 108938
+  present KV shape[0]: (1, 16, 3, 64)
+  previous KV shape[0]: (1, 16, 2, 64)
+  present KV[0] first step value: 0.000000, last step value: -3.392576
+  KV_changed = True
+
+[STEP 2]
+  decoder_input_ids (current) = [108938]
+  decoder_input_ids (accumulated) = [2, 128022, 108938]
+  decoder_start_token_id = 2
+  forced_bos_token_id (lang) = 128022
+  eos_token_id = 2
+  top5 logits = [(128, 10.551399230957031), (4, 5.4130706787109375), (1484, 5.033153057098389), (193, 4.753653526306152), (120, 4.708080768585205)]
+  next_id = 128
+  present KV shape[0]: (1, 16, 4, 64)
+  previous KV shape[0]: (1, 16, 3, 64)
+  present KV[0] first step value: 0.000000, last step value: 1.710078
+  KV_changed = True
+
+[STEP 3]
+  decoder_input_ids (current) = [128]
+  decoder_input_ids (accumulated) = [2, 128022, 108938, 128]
+  decoder_start_token_id = 2
+  forced_bos_token_id (lang) = 128022
+  eos_token_id = 2
+  top5 logits = [(1197, 11.175768852233887), (14162, 8.213367462158203), (4183, 7.869703769683838), (1658, 7.228743553161621), (122837, 6.727844715118408)]
+  next_id = 1197
+  present KV shape[0]: (1, 16, 5, 64)
+  previous KV shape[0]: (1, 16, 4, 64)
+  present KV[0] first step value: 0.000000, last step value: 0.061181
+  KV_changed = True
+
+[STEP 4]
+  decoder_input_ids (current) = [1197]
+  decoder_input_ids (accumulated) = [2, 128022, 108938, 128, 1197]
+  decoder_start_token_id = 2
+  forced_bos_token_id (lang) = 128022
+  eos_token_id = 2
+  top5 logits = [(4183, 10.798120498657227), (14162, 9.660284042358398), (122837, 8.02193832397461), (115191, 7.275268077850342), (117371, 7.222376823425293)]
+  next_id = 4183
+  present KV shape[0]: (1, 16, 6, 64)
+  previous KV shape[0]: (1, 16, 5, 64)
+  present KV[0] first step value: 0.000000, last step value: -0.271055
+  KV_changed = True
+
+[STEP 5]
+  decoder_input_ids (current) = [4183]
+  decoder_input_ids (accumulated) = [2, 128022, 108938, 128, 1197, 4183]
+  decoder_start_token_id = 2
+  forced_bos_token_id (lang) = 128022
+  eos_token_id = 2
+  top5 logits = [(5, 9.934592247009277), (30, 6.1404242515563965), (2, 4.572732925415039), (237, 4.248051166534424), (4, 2.776068925857544)]
+  next_id = 5
+  present KV shape[0]: (1, 16, 7, 64)
+  previous KV shape[0]: (1, 16, 6, 64)
+  present KV[0] first step value: 0.000000, last step value: 1.244438
+  KV_changed = True
+
+[STEP 6]
+  decoder_input_ids (current) = [5]
+  decoder_input_ids (accumulated) = [2, 128022, 108938, 128, 1197, 4183, 5]
+  decoder_start_token_id = 2
+  forced_bos_token_id (lang) = 128022
+  eos_token_id = 2
+  top5 logits = [(2, 10.523983001708984), (237, 1.0410879850387573), (5, 0.4125820994377136), (15, 0.31513679027557373), (10, 0.2170458436012268)]
+  next_id = 2
+  present KV shape[0]: (1, 16, 8, 64)
+  previous KV shape[0]: (1, 16, 7, 64)
+  present KV[0] first step value: 0.000000, last step value: -0.576422
+  KV_changed = True
+  ✅ EOS detected at step 6
+
+============================================================
+解码结果总结:
+============================================================
+  生成的 token IDs: [128022, 108938, 128, 1197, 4183, 5, 2]
+  解码文本（含特殊token）: __en__ Welcome to the test.</s>
+  解码文本（清理后）: Welcome to the test.
+  ✅ EOS 出现在位置: [6]
+============================================================

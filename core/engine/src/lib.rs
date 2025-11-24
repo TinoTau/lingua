@@ -6,6 +6,7 @@ pub mod emotion_adapter;
 pub mod error;
 pub mod event_bus;
 pub mod nmt_incremental;
+pub mod nmt_client;
 pub mod persona_adapter;
 pub mod telemetry;
 pub mod tts_streaming;
@@ -13,6 +14,9 @@ pub mod types;
 pub mod vad;
 pub mod asr_streaming;
 pub mod onnx_utils;
+pub mod health_check;
+pub mod post_processing;
+pub mod performance_logger;
 
 pub use bootstrap::{CoreEngine, CoreEngineBuilder, ProcessResult};
 pub use cache_manager::CacheManager;
@@ -23,9 +27,13 @@ pub use event_bus::{CoreEvent, EventBus, EventSubscription, EventTopic};
 pub use nmt_incremental::{
     LanguageCode, LanguagePair, MarianNmtOnnx, MarianTokenizer, NmtIncremental, TranslationRequest, TranslationResponse,
 };
+pub use nmt_client::{LocalM2m100HttpClient, RemoteNmtHttpClient, NmtClientAdapter};
 pub use persona_adapter::{PersonaAdapter, PersonaContext, RuleBasedPersonaAdapter, PersonaStub};
 pub use telemetry::{TelemetryDatum, TelemetrySink};
 pub use tts_streaming::{TtsRequest, TtsStreamChunk, TtsStreaming, FastSpeech2TtsEngine, TtsStub};
 pub use types::{AudioFrame, PartialTranscript, StableTranscript};
 pub use vad::{DetectionOutcome, VoiceActivityDetector};
 pub use asr_streaming::{AsrRequest, AsrResult, AsrStreaming};
+pub use health_check::{HealthChecker, ServiceHealth};
+pub use post_processing::TextPostProcessor;
+pub use performance_logger::{PerformanceLog, PerformanceLogger};
