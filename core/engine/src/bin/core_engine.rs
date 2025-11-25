@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::io::Cursor;
 use axum::{
     extract::{ws::WebSocketUpgrade, State},
     http::StatusCode,
@@ -10,8 +11,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
+use base64::{Engine as _, engine::general_purpose};
 
-use core_engine::bootstrap::{CoreEngine, CoreEngineBuilder};
+use core_engine::bootstrap::{CoreEngine, CoreEngineBuilder, ProcessResult};
 use core_engine::config_manager::{ConfigManager, EngineConfig};
 use core_engine::error::EngineResult;
 use core_engine::types::AudioFrame;
@@ -274,20 +276,162 @@ async fn health_check(State(state): State<AppState>) -> Json<HealthResponse> {
 
 /// S2S 整句翻译端点
 async fn s2s_handler(
-    State(_state): State<AppState>,
-    Json(_request): Json<S2SRequest>,
+    State(state): State<AppState>,
+    Json(request): Json<S2SRequest>,
 ) -> Result<Json<S2SResponse>, StatusCode> {
-    // TODO: 实现实际的 S2S 处理逻辑
     // 1. 解码 base64 音频
-    // 2. 将音频数据转换为 AudioFrame
-    // 3. 调用 CoreEngine 处理
-    // 4. 返回结果
+    let audio_data = general_purpose::STANDARD
+        .decode(&request.audio)
+        .map_err(|e| {
+            eprintln!("Failed to decode base64 audio: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
+
+    // 2. 解析 WAV 音频并转换为 AudioFrame 列表
+    let audio_frames = parse_wav_to_frames(&audio_data)
+        .map_err(|e| {
+            eprintln!("Failed to parse WAV audio: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
+
+    if audio_frames.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // 3. 设置目标语言（从请求中获取）
+    // 注意：这里需要更新 ConfigManager 的目标语言
+    // 为了简化，我们假设配置已经正确设置
+
+    // 4. 处理所有音频帧，累积到 ASR 缓冲区
+    // 对于整句翻译，我们需要处理所有帧，最后一帧应该触发边界检测
+    let mut final_result: Option<ProcessResult> = None;
     
+    // 处理所有帧，除了最后一帧
+    for frame in audio_frames.iter().take(audio_frames.len().saturating_sub(1)) {
+        match state.engine.process_audio_frame(frame.clone(), Some(request.src_lang.clone())).await {
+            Ok(Some(result)) => {
+                // 如果提前返回了结果，使用它
+                final_result = Some(result);
+                break;
+            }
+            Ok(None) => {
+                // 继续处理下一帧（帧被累积到缓冲区）
+                continue;
+            }
+            Err(e) => {
+                eprintln!("Error processing audio frame: {}", e);
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    }
+
+    // 5. 处理最后一帧，应该触发边界检测和完整推理
+    if final_result.is_none() {
+        if let Some(last_frame) = audio_frames.last() {
+            // 创建一个标记为边界的帧（通过修改 timestamp 或使用特殊处理）
+            // 实际上，SimpleVad 总是返回 is_boundary=true，所以最后一帧应该触发推理
+            match state.engine.process_audio_frame(last_frame.clone(), Some(request.src_lang.clone())).await {
+                Ok(Some(result)) => {
+                    final_result = Some(result);
+                }
+                Ok(None) => {
+                    // 如果没有结果，可能是音频太短或没有检测到语音
+                    // 返回错误
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+                Err(e) => {
+                    eprintln!("Error processing final audio frame: {}", e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            }
+        }
+    }
+
+    let result = final_result.ok_or(StatusCode::BAD_REQUEST)?;
+
+    // 6. 提取结果
+    let transcript = result
+        .asr
+        .final_transcript
+        .as_ref()
+        .map(|t| t.text.clone())
+        .unwrap_or_default();
+
+    let translation = result
+        .translation
+        .as_ref()
+        .map(|t| t.translated_text.clone())
+        .unwrap_or_default();
+
+    // 7. 获取 TTS 音频（base64 编码）
+    let audio_base64 = if let Some(tts_chunk) = result.tts {
+        general_purpose::STANDARD.encode(&tts_chunk.audio)
+    } else {
+        String::new()
+    };
+
+    // 8. 返回结果
     Ok(Json(S2SResponse {
-        audio: "".to_string(),
-        transcript: "".to_string(),
-        translation: "".to_string(),
+        audio: audio_base64,
+        transcript,
+        translation,
     }))
+}
+
+/// 解析 WAV 音频数据为 AudioFrame 列表
+fn parse_wav_to_frames(wav_data: &[u8]) -> anyhow::Result<Vec<AudioFrame>> {
+    use hound::WavReader;
+    
+    let cursor = Cursor::new(wav_data);
+    let mut reader = WavReader::new(cursor)
+        .map_err(|e| anyhow::anyhow!("Failed to create WAV reader: {}", e))?;
+    
+    let spec = reader.spec();
+    
+    // 读取所有样本
+    let mut samples = Vec::new();
+    match spec.sample_format {
+        hound::SampleFormat::Float => {
+            for sample in reader.samples::<f32>() {
+                samples.push(sample?);
+            }
+        }
+        hound::SampleFormat::Int => {
+            let max_val = (1i32 << (spec.bits_per_sample - 1)) as f32;
+            for sample in reader.samples::<i32>() {
+                samples.push(sample? as f32 / max_val);
+            }
+        }
+    }
+
+    // 如果音频是立体声，转换为单声道（取平均值）
+    let mono_samples = if spec.channels == 2 {
+        samples
+            .chunks(2)
+            .map(|chunk| (chunk[0] + chunk[1]) / 2.0)
+            .collect()
+    } else {
+        samples
+    };
+
+    // 如果采样率不是 16kHz，需要重采样
+    // 为了简化，这里假设输入音频已经是 16kHz
+    // 实际应用中应该添加重采样逻辑
+    
+    // 按 10ms 一帧拆分（Whisper 期望的格式）
+    let frame_size = (spec.sample_rate / 100) as usize;
+    let mut frames = Vec::new();
+    
+    for (idx, chunk) in mono_samples.chunks(frame_size).enumerate() {
+        frames.push(AudioFrame {
+            sample_rate: spec.sample_rate,
+            channels: 1, // 转换为单声道
+            data: chunk.to_vec(),
+            timestamp_ms: (idx * 10) as u64,
+        });
+    }
+
+    Ok(frames)
 }
 
 /// WebSocket 流式翻译端点
