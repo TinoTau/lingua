@@ -74,14 +74,38 @@ impl TextSegmenter {
             let is_comma = matches!(ch, ',' | '，');
 
             if is_sentence_end {
-                // 检查是否为缩写（简单规则：如果后面是小写字母，可能是缩写）
-                let is_abbreviation = if let Some(&next_ch) = chars.peek() {
-                    next_ch.is_alphabetic() && next_ch.is_lowercase()
+                // 对于 '.'，需要检查是否为小数点或缩写
+                let should_split = if ch == '.' {
+                    // 检查前后字符，判断是否为小数点
+                    let prev_is_digit = current_segment
+                        .chars()
+                        .rev()
+                        .nth(1)  // 跳过当前的 '.'
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false);
+                    
+                    let next_is_digit = chars.peek()
+                        .map(|&c| c.is_ascii_digit())
+                        .unwrap_or(false);
+                    
+                    // 如果前后都是数字，这是小数点，不应该分割
+                    if prev_is_digit && next_is_digit {
+                        false
+                    } else {
+                        // 检查是否为缩写（如果后面是小写字母，可能是缩写）
+                        let is_abbreviation = if let Some(&next_ch) = chars.peek() {
+                            next_ch.is_alphabetic() && next_ch.is_lowercase()
+                        } else {
+                            false
+                        };
+                        !is_abbreviation
+                    }
                 } else {
-                    false
+                    // 对于 '!' 和 '?'，直接分割
+                    true
                 };
 
-                if !is_abbreviation {
+                if should_split {
                     // 句子结束
                     let segment_text = current_segment.trim().to_string();
                     if !segment_text.is_empty() {
@@ -183,6 +207,7 @@ impl Default for TextSegmenter {
     fn default() -> Self {
         Self {
             max_sentence_length: 50,
+            split_on_comma: false,
         }
     }
 }
@@ -235,6 +260,41 @@ mod tests {
         let segments = segmenter.segment(text);
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0], "Hello world");
+    }
+
+    #[test]
+    fn test_segment_with_decimal_numbers() {
+        let segmenter = TextSegmenter::default();
+        // 测试数字中的小数点不应该被分割
+        let text = "This is version 1.0. It works well.";
+        let segments = segmenter.segment(text);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0], "This is version 1.0.");
+        assert_eq!(segments[1], "It works well.");
+    }
+
+    #[test]
+    fn test_segment_with_pause_type_decimal_numbers() {
+        let segmenter = TextSegmenter::default();
+        // 测试带停顿类型的数字分割
+        let text = "The price is 3.14 dollars. It's cheap.";
+        let segments = segmenter.segment_with_pause_type(&text);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].text, "The price is 3.14 dollars.");
+        assert_eq!(segments[0].pause_type, PauseType::SentenceEnd);
+        assert_eq!(segments[1].text, "It's cheap.");
+        assert_eq!(segments[1].pause_type, PauseType::SentenceEnd);
+    }
+
+    #[test]
+    fn test_segment_with_version_numbers() {
+        let segmenter = TextSegmenter::default();
+        // 测试版本号
+        let text = "Version 0.26 is released. Version 1.0 is coming.";
+        let segments = segmenter.segment(text);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0], "Version 0.26 is released.");
+        assert_eq!(segments[1], "Version 1.0 is coming.");
     }
 }
 

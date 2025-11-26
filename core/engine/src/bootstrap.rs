@@ -507,23 +507,51 @@ impl CoreEngine {
         self.asr.initialize().await?;
         self.nmt.initialize().await?;
         
-        // 健康检查：检查 NMT 和 TTS 服务
+        // 健康检查：检查 NMT 和 TTS 服务（带重试机制，等待服务就绪）
         if let (Some(nmt_url), Some(tts_url)) = (&self.nmt_service_url, &self.tts_service_url) {
             let checker = HealthChecker::new();
-            let (nmt_health, tts_health) = checker.check_all_services(nmt_url, tts_url).await;
             
-            if !nmt_health.is_healthy {
-                eprintln!("[WARN] NMT service is not healthy: {} - {:?}", nmt_url, nmt_health.error);
-                // 不阻止启动，但记录警告
-            } else {
-                println!("[INFO] NMT service health check passed: {}", nmt_url);
+            // 等待服务就绪，最多重试 15 次，每次间隔 1 秒（总共最多 15 秒）
+            const MAX_RETRIES: u32 = 15;
+            const RETRY_DELAY_MS: u64 = 1000;
+            
+            let mut nmt_healthy = false;
+            let mut tts_healthy = false;
+            let mut final_attempt = 0;
+            
+            eprintln!("[INFO] Waiting for NMT and TTS services to be ready...");
+            
+            for attempt in 1..=MAX_RETRIES {
+                final_attempt = attempt;
+                let (nmt_health, tts_health) = checker.check_all_services(nmt_url, tts_url).await;
+                
+                nmt_healthy = nmt_health.is_healthy;
+                tts_healthy = tts_health.is_healthy;
+                
+                if nmt_healthy && tts_healthy {
+                    // 所有服务都健康，退出重试循环
+                    break;
+                }
+                
+                if attempt < MAX_RETRIES {
+                    // 等待后重试（不打印中间结果，避免日志混乱）
+                    tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                }
             }
             
-            if !tts_health.is_healthy {
-                eprintln!("[WARN] TTS service is not healthy: {} - {:?}", tts_url, tts_health.error);
-                // 不阻止启动，但记录警告
+            // 报告最终状态
+            if nmt_healthy {
+                eprintln!("[INFO] NMT service health check passed: {} (attempt {}/{})", nmt_url, final_attempt, MAX_RETRIES);
             } else {
-                println!("[INFO] TTS service health check passed: {}", tts_url);
+                eprintln!("[WARN] NMT service is not healthy after {} attempts: {} - Please ensure the service is running", final_attempt, nmt_url);
+                // 不阻止启动，但记录警告
+            }
+            
+            if tts_healthy {
+                eprintln!("[INFO] TTS service health check passed: {} (attempt {}/{})", tts_url, final_attempt, MAX_RETRIES);
+            } else {
+                eprintln!("[WARN] TTS service is not healthy after {} attempts: {} - Please ensure the service is running", final_attempt, tts_url);
+                // 不阻止启动，但记录警告
             }
         }
         
@@ -595,6 +623,21 @@ impl CoreEngine {
         unsafe {
             let whisper_asr_ref = whisper_asr_ptr.as_ref();
             if let Some(whisper_asr) = whisper_asr_ref {
+                // 2.1. 如果提供了语言提示，设置 ASR 语言
+                if let Some(ref lang_hint) = language_hint {
+                    // 将语言代码标准化（例如 "zh-CN" -> "zh"）
+                    let normalized_lang = if lang_hint.starts_with("zh") {
+                        Some("zh".to_string())
+                    } else if lang_hint.starts_with("en") {
+                        Some("en".to_string())
+                    } else {
+                        Some(lang_hint.clone())
+                    };
+                    if let Err(e) = whisper_asr.set_language(normalized_lang) {
+                        eprintln!("[ASR] Warning: Failed to set language: {}", e);
+                    }
+                }
+                
                 // 累积帧
                 whisper_asr.accumulate_frame(vad_result.frame.clone())?;
                 
@@ -625,9 +668,18 @@ impl CoreEngine {
                         // 5.4. 如果翻译成功，进行 TTS 合成
                         let (tts_result, tts_ms) = if let Some(ref translation) = translation_result {
                             let tts_start = Instant::now();
-                            let result = self.synthesize_and_publish(translation, vad_result.frame.timestamp_ms).await.ok();
-                            let tts_ms = tts_start.elapsed().as_millis() as u64;
-                            (result, tts_ms)
+                            match self.synthesize_and_publish(translation, vad_result.frame.timestamp_ms).await {
+                                Ok(result) => {
+                                    let tts_ms = tts_start.elapsed().as_millis() as u64;
+                                    eprintln!("[TTS] Synthesis successful: {} bytes, took {}ms", result.audio.len(), tts_ms);
+                                    (Some(result), tts_ms)
+                                }
+                                Err(e) => {
+                                    let tts_ms = tts_start.elapsed().as_millis() as u64;
+                                    eprintln!("[TTS] Synthesis failed: {} (took {}ms)", e, tts_ms);
+                                    (None, tts_ms)
+                                }
+                            }
                         } else {
                             (None, 0)
                         };
@@ -803,22 +855,33 @@ impl CoreEngine {
         
         // 3. 执行翻译
         let mut translation_response = self.nmt.translate(translation_request).await?;
+        eprintln!("[NMT] Raw translation result: '{}'", translation_response.translated_text);
         
         // 4. 应用翻译质量检查
         if let Some(ref checker) = self.quality_checker {
+            let before_check = translation_response.translated_text.clone();
             let checked_text = checker.check_and_fix(
                 &transcript.text,
                 &translation_response.translated_text,
                 &target_language,
             );
+            if before_check != checked_text {
+                eprintln!("[NMT] After quality check: '{}' (was: '{}')", checked_text, before_check);
+            }
             translation_response.translated_text = checked_text;
         }
         
         // 5. 应用文本后处理
         if let Some(ref processor) = self.post_processor {
+            let before_process = translation_response.translated_text.clone();
             let processed_text = processor.process(&translation_response.translated_text, &target_language);
+            if before_process != processed_text {
+                eprintln!("[NMT] After post-processing: '{}' (was: '{}')", processed_text, before_process);
+            }
             translation_response.translated_text = processed_text;
         }
+        
+        eprintln!("[NMT] Final translation: '{}'", translation_response.translated_text);
         
         // 6. 发布翻译事件
         self.publish_translation_event(&translation_response, timestamp_ms).await?;
@@ -917,17 +980,24 @@ impl CoreEngine {
         let config = self.config.current().await?;
         let target_language = config.target_language.clone();
         
-        // 2. 构造 TTS 请求
+        // 2. 对中文文本进行预处理：将小数转换为中文读法
+        let processed_text = if target_language.starts_with("zh") {
+            Self::convert_decimals_to_chinese(&translation.translated_text)
+        } else {
+            translation.translated_text.clone()
+        };
+        
+        // 3. 构造 TTS 请求（使用空字符串作为 voice，让 TTS 客户端使用默认 voice）
         let tts_request = TtsRequest {
-            text: translation.translated_text.clone(),
-            voice: "default".to_string(),  // TODO: 后续可以从配置或 Emotion 结果中选择 voice
+            text: processed_text,
+            voice: String::new(),  // 空字符串，使用 TTS 客户端的默认 voice
             locale: target_language.clone(),
         };
         
-        // 3. 执行 TTS 合成
+        // 4. 执行 TTS 合成
         let tts_chunk = self.tts.synthesize(tts_request).await?;
         
-        // 4. 发布 TTS 事件
+        // 5. 发布 TTS 事件
         self.publish_tts_event(&tts_chunk, timestamp_ms).await?;
         
         Ok(tts_chunk)
@@ -984,12 +1054,26 @@ impl CoreEngine {
         for (idx, segment) in segments_with_pause.iter().enumerate() {
             let is_last = idx == segments_with_pause.len() - 1;
             
-            // 构造 TTS 请求
+            // 对中文文本进行预处理：将小数转换为中文读法
+            let processed_text = if target_language.starts_with("zh") {
+                Self::convert_decimals_to_chinese(&segment.text)
+            } else {
+                segment.text.clone()
+            };
+            
+            // 构造 TTS 请求（使用空字符串作为 voice，让 TTS 客户端使用默认 voice）
             let tts_request = TtsRequest {
-                text: segment.text.clone(),
-                voice: "default".to_string(),
+                text: processed_text.clone(),
+                voice: String::new(),  // 空字符串，使用 TTS 客户端的默认 voice
                 locale: target_language.clone(),
             };
+            
+            if processed_text != segment.text {
+                eprintln!("[TTS] Synthesizing segment {:2}: '{}' -> '{}' (locale: {})", 
+                    idx + 1, segment.text, processed_text, target_language);
+            } else {
+                eprintln!("[TTS] Synthesizing segment {:2}: '{}' (locale: {})", idx + 1, segment.text, target_language);
+            }
             
             // 合成短句
             let mut chunk = self.tts.synthesize(tts_request).await?;
@@ -1009,6 +1093,8 @@ impl CoreEngine {
                     pause_type,
                 ).await?;
                 chunk.audio = enhanced_audio;
+                eprintln!("[TTS] Segment {:2}: '{}' (pause_type: {:?}, audio_size: {} bytes)", 
+                    idx + 1, segment.text, segment.pause_type, chunk.audio.len());
             }
             
             chunk.timestamp_ms = current_timestamp;
@@ -1041,12 +1127,122 @@ impl CoreEngine {
             }
         }
         
-        // 5. 返回最后一个 chunk（保持兼容性）
-        Ok(chunks.last().cloned().unwrap_or_else(|| TtsStreamChunk {
-            audio: vec![],
+        // 5. 合并所有 chunks 的音频数据，返回完整的音频
+        let mut merged_audio = Vec::new();
+        for chunk in &chunks {
+            merged_audio.extend_from_slice(&chunk.audio);
+        }
+        
+        eprintln!("[TTS] Synthesized {} segments, total audio size: {} bytes", chunks.len(), merged_audio.len());
+        
+        Ok(TtsStreamChunk {
+            audio: merged_audio,
             timestamp_ms: timestamp_ms,
             is_last: true,
-        }))
+        })
+    }
+
+    /// 将中文文本中的小数转换为中文读法
+    /// 
+    /// 例如："版本1.4" -> "版本一点四"
+    ///      "价格3.14" -> "价格三点一四"
+    ///      "版本1.0" -> "版本一点零"
+    fn convert_decimals_to_chinese(text: &str) -> String {
+        let mut result = String::new();
+        let mut chars = text.chars().peekable();
+        
+        while let Some(ch) = chars.next() {
+            if ch.is_ascii_digit() {
+                // 开始读取数字
+                let mut num_str = String::new();
+                num_str.push(ch);
+                
+                // 检查下一个字符是否是小数点
+                let mut has_decimal = false;
+                if let Some(&'.') = chars.peek() {
+                    chars.next(); // 跳过小数点
+                    has_decimal = true;
+                    num_str.push('.');
+                    
+                    // 读取小数点后的数字
+                    while let Some(&next_ch) = chars.peek() {
+                        if next_ch.is_ascii_digit() {
+                            num_str.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    // 继续读取整数部分
+                    while let Some(&next_ch) = chars.peek() {
+                        if next_ch.is_ascii_digit() {
+                            num_str.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                
+                // 如果是小数，转换为中文读法
+                if has_decimal && num_str.contains('.') {
+                    let parts: Vec<&str> = num_str.split('.').collect();
+                    if parts.len() == 2 {
+                        // 转换整数部分
+                        let int_part = parts[0];
+                        let mut chinese_num = String::new();
+                        for digit_char in int_part.chars() {
+                            if let Some(digit) = digit_char.to_digit(10) {
+                                chinese_num.push_str(match digit {
+                                    0 => "零",
+                                    1 => "一",
+                                    2 => "二",
+                                    3 => "三",
+                                    4 => "四",
+                                    5 => "五",
+                                    6 => "六",
+                                    7 => "七",
+                                    8 => "八",
+                                    9 => "九",
+                                    _ => "",
+                                });
+                            }
+                        }
+                        
+                        // 添加"点"
+                        chinese_num.push_str("点");
+                        
+                        // 转换小数部分
+                        for digit_char in parts[1].chars() {
+                            if let Some(digit) = digit_char.to_digit(10) {
+                                chinese_num.push_str(match digit {
+                                    0 => "零",
+                                    1 => "一",
+                                    2 => "二",
+                                    3 => "三",
+                                    4 => "四",
+                                    5 => "五",
+                                    6 => "六",
+                                    7 => "七",
+                                    8 => "八",
+                                    9 => "九",
+                                    _ => "",
+                                });
+                            }
+                        }
+                        
+                        result.push_str(&chinese_num);
+                        continue;
+                    }
+                }
+                
+                // 如果不是小数，保持原样
+                result.push_str(&num_str);
+            } else {
+                result.push(ch);
+            }
+        }
+        
+        result
     }
 
     /// 发布 TTS 事件

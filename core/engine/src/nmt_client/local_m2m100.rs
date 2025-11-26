@@ -34,6 +34,9 @@ impl NmtClient for LocalM2m100HttpClient {
     ) -> anyhow::Result<NmtTranslateResponse> {
         let url = format!("{}/v1/translate", self.base_url);
         
+        eprintln!("[NMT Client] Sending request to {}: text='{}', src_lang='{}', tgt_lang='{}'", 
+            url, req.text, req.src_lang, req.tgt_lang);
+        
         let response = self
             .http
             .post(&url)
@@ -41,15 +44,25 @@ impl NmtClient for LocalM2m100HttpClient {
             .send()
             .await?;
         
-        if !response.status().is_success() {
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            eprintln!("[NMT Client] HTTP error: {} - {}", status, error_text);
             return Err(anyhow::anyhow!(
                 "HTTP error: {} - {}",
-                response.status(),
-                response.text().await.unwrap_or_default()
+                status,
+                error_text
             ));
         }
         
         let body: NmtTranslateResponse = response.json().await?;
+        if let Some(ref text) = body.text {
+            eprintln!("[NMT Client] Received response: '{}'", text);
+        } else if let Some(ref error) = body.error {
+            eprintln!("[NMT Client] Received error response: '{}'", error);
+        } else {
+            eprintln!("[NMT Client] Received response: ok={}", body.ok);
+        }
         Ok(body)
     }
 }

@@ -72,8 +72,25 @@ impl TtsStreaming for PiperHttpTts {
     async fn synthesize(&self, request: TtsRequest) -> EngineResult<TtsStreamChunk> {
         // 确定使用的语音
         let voice = if request.voice.is_empty() {
-            &self.config.default_voice
+            // 根据 locale 选择默认 voice
+            let locale_lower = request.locale.to_lowercase();
+            eprintln!("[Piper TTS] Request locale: '{}' (lowercase: '{}')", request.locale, locale_lower);
+            if locale_lower.starts_with("en") {
+                // 英文语音
+                let en_voice = "en_US-lessac-medium";  // 或者根据实际可用的英文 voice 调整
+                eprintln!("[Piper TTS] Using English voice: {}", en_voice);
+                en_voice
+            } else if locale_lower.starts_with("zh") {
+                // 中文语音
+                eprintln!("[Piper TTS] Using Chinese voice: {}", self.config.default_voice);
+                &self.config.default_voice
+            } else {
+                // 默认使用配置的 voice
+                eprintln!("[Piper TTS] Using default voice: {}", self.config.default_voice);
+                &self.config.default_voice
+            }
         } else {
+            eprintln!("[Piper TTS] Using specified voice: {}", request.voice);
             &request.voice
         };
 

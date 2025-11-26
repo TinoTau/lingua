@@ -1,8 +1,8 @@
 [nmt]
-url = "http://127.0.0.1:9001/translate"
+url = "http://127.0.0.1:5008"
 
 [tts]
-url = "http://127.0.0.1:9002/tts"
+url = "http://127.0.0.1:5005/tts"
 
 [engine]
 port = 9000

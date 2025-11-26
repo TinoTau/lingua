@@ -85,6 +85,7 @@ struct ServiceHealth {
 struct AppState {
     engine: Arc<CoreEngine>,
     config: RuntimeConfig,
+    simple_config: Arc<SimpleConfig>,  // 用于动态更新语言配置
 }
 
 // 简单的默认实现
@@ -109,31 +110,58 @@ impl EventBus for SimpleEventBus {
     }
 }
 
+const FINAL_FRAME_FLAG: u64 = 1u64 << 63;
+
 struct SimpleVad;
 
 #[async_trait]
 impl VoiceActivityDetector for SimpleVad {
     async fn detect(&self, frame: AudioFrame) -> EngineResult<DetectionOutcome> {
+        let is_final = (frame.timestamp_ms & FINAL_FRAME_FLAG) != 0;
+        let cleaned_timestamp = frame.timestamp_ms & !FINAL_FRAME_FLAG;
+        let mut cleaned_frame = frame.clone();
+        cleaned_frame.timestamp_ms = cleaned_timestamp;
         Ok(DetectionOutcome {
-            is_boundary: true,
+            is_boundary: is_final,
             confidence: 1.0,
-            frame,
+            frame: cleaned_frame,
         })
     }
 }
 
+use tokio::sync::RwLock;
+
 struct SimpleConfig {
-    source_lang: String,
-    target_lang: String,
+    source_lang: Arc<RwLock<String>>,
+    target_lang: Arc<RwLock<String>>,
+}
+
+impl SimpleConfig {
+    fn new(source_lang: String, target_lang: String) -> Self {
+        Self {
+            source_lang: Arc::new(RwLock::new(source_lang)),
+            target_lang: Arc::new(RwLock::new(target_lang)),
+        }
+    }
+
+    async fn set_target_language(&self, lang: String) {
+        *self.target_lang.write().await = lang;
+    }
+
+    async fn set_source_language(&self, lang: String) {
+        *self.source_lang.write().await = lang;
+    }
 }
 
 #[async_trait]
 impl ConfigManager for SimpleConfig {
     async fn load(&self) -> EngineResult<EngineConfig> {
+        let source_lang = self.source_lang.read().await.clone();
+        let target_lang = self.target_lang.read().await.clone();
         Ok(EngineConfig {
             mode: "balanced".to_string(),
-            source_language: self.source_lang.clone(),
-            target_language: self.target_lang.clone(),
+            source_language: source_lang,
+            target_language: target_lang,
         })
     }
 
@@ -175,7 +203,7 @@ async fn main() -> anyhow::Result<()> {
         .map(|s| PathBuf::from(s))
         .unwrap_or_else(|| PathBuf::from("lingua_core_config.toml"));
 
-    println!("Loading config from: {}", config_path.display());
+    eprintln!("[INFO] Loading config from: {}", config_path.display());
 
     // 2. 加载配置文件
     let config_content = std::fs::read_to_string(&config_path)
@@ -183,19 +211,23 @@ async fn main() -> anyhow::Result<()> {
     let runtime_config: RuntimeConfig = toml::from_str(&config_content)
         .map_err(|e| anyhow::anyhow!("Failed to parse config file: {}", e))?;
 
-    println!("Config loaded:");
-    println!("  NMT URL: {}", runtime_config.nmt.url);
-    println!("  TTS URL: {}", runtime_config.tts.url);
-    println!("  Engine Port: {}", runtime_config.engine.port);
+    eprintln!("[INFO] Config loaded:");
+    eprintln!("[INFO]   NMT URL: {}", runtime_config.nmt.url);
+    eprintln!("[INFO]   TTS URL: {}", runtime_config.tts.url);
+    eprintln!("[INFO]   Engine Port: {}", runtime_config.engine.port);
 
-    // 3. 初始化 CoreEngine
-    let engine = initialize_engine(&runtime_config).await?;
-    println!("CoreEngine initialized successfully");
+    // 3. 创建 SimpleConfig（用于动态更新语言）
+    let simple_config = Arc::new(SimpleConfig::new("en".to_string(), "zh".to_string()));
+    
+    // 4. 初始化 CoreEngine
+    let engine = initialize_engine(&runtime_config, simple_config.clone()).await?;
+    eprintln!("[INFO] CoreEngine initialized successfully");
 
-    // 4. 启动 HTTP 服务器
+    // 5. 启动 HTTP 服务器
     let app_state = AppState {
         engine: Arc::new(engine),
         config: runtime_config.clone(),
+        simple_config: simple_config.clone(),
     };
 
     let app = Router::new()
@@ -206,7 +238,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(app_state);
 
     let addr = format!("0.0.0.0:{}", runtime_config.engine.port);
-    println!("Starting HTTP server on {}", addr);
+    eprintln!("[INFO] Starting HTTP server on {}", addr);
 
     let listener = TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
@@ -215,7 +247,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// 初始化 CoreEngine
-async fn initialize_engine(config: &RuntimeConfig) -> EngineResult<CoreEngine> {
+async fn initialize_engine(config: &RuntimeConfig, simple_config: Arc<SimpleConfig>) -> EngineResult<CoreEngine> {
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     
     // 确定 Whisper 模型路径
@@ -239,14 +271,11 @@ async fn initialize_engine(config: &RuntimeConfig) -> EngineResult<CoreEngine> {
             timeout_ms: 8000,
         })
         .map_err(|e| core_engine::error::EngineError::new(format!("Failed to initialize TTS: {}", e)))?
-        .config(Arc::new(SimpleConfig {
-            source_lang: "en".to_string(),
-            target_lang: "zh".to_string(),
-        }))
+        .config(simple_config.clone() as Arc<dyn ConfigManager>)
         .cache(Arc::new(SimpleCache))
         .telemetry(Arc::new(SimpleTelemetry))
-        .with_text_post_processing(true)
-        .with_incremental_tts(true, 0, 50)
+        .with_post_processing(None, true)
+        .with_tts_incremental_playback(true, 0, 50)
         .with_audio_enhancement(core_engine::tts_audio_enhancement::AudioEnhancementConfig::default())
         .build()
         .map_err(|e| core_engine::error::EngineError::new(format!("Failed to build engine: {}", e)))?;
@@ -283,24 +312,41 @@ async fn s2s_handler(
     let audio_data = general_purpose::STANDARD
         .decode(&request.audio)
         .map_err(|e| {
-            eprintln!("Failed to decode base64 audio: {}", e);
+            eprintln!("[ERROR] Failed to decode base64 audio: {}", e);
             StatusCode::BAD_REQUEST
         })?;
 
     // 2. 解析 WAV 音频并转换为 AudioFrame 列表
     let audio_frames = parse_wav_to_frames(&audio_data)
         .map_err(|e| {
-            eprintln!("Failed to parse WAV audio: {}", e);
+            eprintln!("[ERROR] Failed to parse WAV audio: {}", e);
             StatusCode::BAD_REQUEST
         })?;
 
     if audio_frames.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
+    let frame_info = audio_frames.first().map(|frame| {
+        format!(
+            "{}Hz {}ch {} samples",
+            frame.sample_rate,
+            frame.channels,
+            frame.data.len()
+        )
+    }).unwrap_or_else(|| "unknown format".into());
+    eprintln!(
+        "[S2S] Received audio: {} bytes -> {} frames (first frame: {}) [src={}, tgt={}]",
+        audio_data.len(),
+        audio_frames.len(),
+        frame_info,
+        request.src_lang,
+        request.tgt_lang
+    );
 
-    // 3. 设置目标语言（从请求中获取）
-    // 注意：这里需要更新 ConfigManager 的目标语言
-    // 为了简化，我们假设配置已经正确设置
+    // 3. 根据请求更新目标语言配置
+    state.simple_config.set_target_language(request.tgt_lang.clone()).await;
+    state.simple_config.set_source_language(request.src_lang.clone()).await;
+    eprintln!("[S2S] Updated language config: src={}, tgt={}", request.src_lang, request.tgt_lang);
 
     // 4. 处理所有音频帧，累积到 ASR 缓冲区
     // 对于整句翻译，我们需要处理所有帧，最后一帧应该触发边界检测
@@ -310,16 +356,15 @@ async fn s2s_handler(
     for frame in audio_frames.iter().take(audio_frames.len().saturating_sub(1)) {
         match state.engine.process_audio_frame(frame.clone(), Some(request.src_lang.clone())).await {
             Ok(Some(result)) => {
-                // 如果提前返回了结果，使用它
+                // 记录最新结果，但继续处理剩余帧，确保音频被完整消耗
                 final_result = Some(result);
-                break;
             }
             Ok(None) => {
                 // 继续处理下一帧（帧被累积到缓冲区）
                 continue;
             }
             Err(e) => {
-                eprintln!("Error processing audio frame: {}", e);
+                eprintln!("[ERROR] Error processing audio frame: {}", e);
                 return Err(StatusCode::INTERNAL_SERVER_ERROR);
             }
         }
@@ -340,7 +385,7 @@ async fn s2s_handler(
                     return Err(StatusCode::BAD_REQUEST);
                 }
                 Err(e) => {
-                    eprintln!("Error processing final audio frame: {}", e);
+                    eprintln!("[ERROR] Error processing final audio frame: {}", e);
                     return Err(StatusCode::INTERNAL_SERVER_ERROR);
                 }
             }
@@ -363,10 +408,29 @@ async fn s2s_handler(
         .map(|t| t.translated_text.clone())
         .unwrap_or_default();
 
+    if !transcript.trim().is_empty() {
+        eprintln!("[S2S] Transcript: {}", transcript);
+    } else {
+        eprintln!("[S2S] Transcript: <empty>");
+    }
+    if !translation.trim().is_empty() {
+        eprintln!("[S2S] Translation: {}", translation);
+    } else {
+        eprintln!("[S2S] Translation: <empty>");
+    }
+
     // 7. 获取 TTS 音频（base64 编码）
     let audio_base64 = if let Some(tts_chunk) = result.tts {
-        general_purpose::STANDARD.encode(&tts_chunk.audio)
+        let audio_size = tts_chunk.audio.len();
+        eprintln!("[S2S] TTS audio size: {} bytes", audio_size);
+        if audio_size > 0 {
+            general_purpose::STANDARD.encode(&tts_chunk.audio)
+        } else {
+            eprintln!("[S2S] WARNING: TTS audio is empty!");
+            String::new()
+        }
     } else {
+        eprintln!("[S2S] WARNING: TTS result is None!");
         String::new()
     };
 
@@ -429,6 +493,10 @@ fn parse_wav_to_frames(wav_data: &[u8]) -> anyhow::Result<Vec<AudioFrame>> {
             data: chunk.to_vec(),
             timestamp_ms: (idx * 10) as u64,
         });
+    }
+
+    if let Some(last) = frames.last_mut() {
+        last.timestamp_ms |= FINAL_FRAME_FLAG;
     }
 
     Ok(frames)
