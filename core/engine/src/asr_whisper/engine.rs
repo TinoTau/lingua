@@ -37,6 +37,8 @@ impl WhisperAsrEngine {
                 .ok_or_else(|| anyhow!("Invalid model path: {}", model_path.display()))?,
             WhisperContextParameters::default(),
         )?;
+        
+        eprintln!("[ASR] Whisper context initialized (GPU support will be auto-detected at inference time)");
 
         Ok(Self {
             ctx: Arc::new(ctx),
@@ -99,7 +101,12 @@ impl WhisperAsrEngine {
         }
         
         // 设置其他参数
-        params.set_n_threads(4);
+        // 使用所有可用的 CPU 核心（留一个给系统）
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(1).max(1))
+            .unwrap_or(4);
+        params.set_n_threads(num_threads as i32);
+        eprintln!("[ASR] Using {} CPU threads for inference", num_threads);
         params.set_translate(false);
         params.set_print_progress(false);
         params.set_print_special(false);

@@ -644,8 +644,10 @@ impl CoreEngine {
                 // 3. 如果检测到语音边界，触发 ASR 推理（返回最终结果）
                 if vad_result.is_boundary {
                     let asr_start = Instant::now();
+                    eprintln!("[ASR] Starting transcription...");
                     let asr_result = whisper_asr.infer_on_boundary().await?;
                     let asr_ms = asr_start.elapsed().as_millis() as u64;
+                    eprintln!("[ASR] Transcription completed in {}ms", asr_ms);
                     
                     // 4. 发布 ASR 最终结果事件
                     if let Some(ref final_transcript) = asr_result.final_transcript {
@@ -662,31 +664,42 @@ impl CoreEngine {
                         
                         // 5.3. 使用个性化后的 transcript 进行翻译
                         let nmt_start = Instant::now();
+                        eprintln!("[NMT] Starting translation...");
                         let translation_result = self.translate_and_publish(&personalized_transcript, vad_result.frame.timestamp_ms).await.ok();
                         let nmt_ms = nmt_start.elapsed().as_millis() as u64;
+                        eprintln!("[NMT] Translation completed in {}ms", nmt_ms);
                         
                         // 5.4. 如果翻译成功，进行 TTS 合成
                         let (tts_result, tts_ms) = if let Some(ref translation) = translation_result {
                             let tts_start = Instant::now();
+                            eprintln!("[TTS] Starting synthesis...");
                             match self.synthesize_and_publish(translation, vad_result.frame.timestamp_ms).await {
                                 Ok(result) => {
                                     let tts_ms = tts_start.elapsed().as_millis() as u64;
-                                    eprintln!("[TTS] Synthesis successful: {} bytes, took {}ms", result.audio.len(), tts_ms);
+                                    eprintln!("[TTS] Synthesis completed in {}ms (audio size: {} bytes)", tts_ms, result.audio.len());
                                     (Some(result), tts_ms)
                                 }
                                 Err(e) => {
                                     let tts_ms = tts_start.elapsed().as_millis() as u64;
-                                    eprintln!("[TTS] Synthesis failed: {} (took {}ms)", e, tts_ms);
+                                    eprintln!("[TTS] Synthesis failed in {}ms: {}", tts_ms, e);
                                     (None, tts_ms)
                                 }
                             }
                         } else {
+                            eprintln!("[TTS] Skipped (no translation result)");
                             (None, 0)
                         };
                         
                         // 性能日志记录
+                        let total_ms = total_start.elapsed().as_millis() as u64;
+                        eprintln!("[PERF] ===== Pipeline timing summary =====");
+                        eprintln!("[PERF] ASR:  {}ms", asr_ms);
+                        eprintln!("[PERF] NMT:  {}ms", nmt_ms);
+                        eprintln!("[PERF] TTS:  {}ms", tts_ms);
+                        eprintln!("[PERF] Total: {}ms", total_ms);
+                        eprintln!("[PERF] =====================================");
+                        
                         if let Some(ref logger) = self.perf_logger {
-                            let total_ms = total_start.elapsed().as_millis() as u64;
                             let config = self.config.current().await.ok();
                             let src_lang = final_transcript.language.clone();
                             let tgt_lang = config.as_ref().map(|c| c.target_language.clone()).unwrap_or_else(|| "zh".to_string());
@@ -1019,12 +1032,24 @@ impl CoreEngine {
         let segmenter = self.text_segmenter.as_ref()
             .ok_or_else(|| EngineError::new("Text segmenter not initialized".to_string()))?;
         
+        eprintln!("[TTS] Input text for segmentation: '{}'", translation.translated_text);
+        
         // 尝试使用带停顿类型的分段（如果支持）
         let segments_with_pause = if segmenter.split_on_comma {
-            segmenter.segment_with_pause_type(&translation.translated_text)
+            let segments = segmenter.segment_with_pause_type(&translation.translated_text);
+            eprintln!("[TTS] Segmented into {} parts:", segments.len());
+            for (i, seg) in segments.iter().enumerate() {
+                eprintln!("[TTS]   Segment {}: '{}' (pause_type: {:?})", i + 1, seg.text, seg.pause_type);
+            }
+            segments
         } else {
             // 向后兼容：使用旧的分段方法
-            segmenter.segment(&translation.translated_text)
+            let segments = segmenter.segment(&translation.translated_text);
+            eprintln!("[TTS] Segmented into {} parts (legacy method):", segments.len());
+            for (i, text) in segments.iter().enumerate() {
+                eprintln!("[TTS]   Segment {}: '{}'", i + 1, text);
+            }
+            segments
                 .into_iter()
                 .map(|text| {
                     let pause_type = if text.ends_with('.') 

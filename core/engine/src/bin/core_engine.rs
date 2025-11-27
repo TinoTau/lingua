@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::io::Cursor;
+use std::time::Instant;
 use axum::{
     extract::{ws::WebSocketUpgrade, State},
     http::StatusCode,
@@ -308,6 +309,9 @@ async fn s2s_handler(
     State(state): State<AppState>,
     Json(request): Json<S2SRequest>,
 ) -> Result<Json<S2SResponse>, StatusCode> {
+    let s2s_start = Instant::now();
+    eprintln!("[S2S] ===== Request started =====");
+    
     // 1. 解码 base64 音频
     let audio_data = general_purpose::STANDARD
         .decode(&request.audio)
@@ -434,7 +438,10 @@ async fn s2s_handler(
         String::new()
     };
 
-    // 8. 返回结果
+    // 8. 计算总时长并返回结果
+    let s2s_total_ms = s2s_start.elapsed().as_millis() as u64;
+    eprintln!("[S2S] ===== Request completed in {}ms =====", s2s_total_ms);
+    
     Ok(Json(S2SResponse {
         audio: audio_base64,
         transcript,

@@ -1,62 +1,65 @@
 //! 文本分割模块
 //! 
-//! 用于将文本分割成短句，支持 TTS 增量播放
+//! 用于将长文本分割成短句，以便进行增量 TTS 合成
 
-/// 文本分段信息（包含分段文本和停顿类型）
+/// 停顿类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseType {
+    /// 无停顿
+    None,
+    /// 逗号停顿
+    Comma,
+    /// 句子结束停顿
+    SentenceEnd,
+}
+
+/// 文本片段（带停顿类型）
 #[derive(Debug, Clone)]
 pub struct TextSegment {
     pub text: String,
     pub pause_type: PauseType,
 }
 
-/// 停顿类型
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum PauseType {
-    /// 句子结束标点后的停顿（较长，如句号、问号、感叹号）
-    SentenceEnd,
-    /// 逗号后的停顿（较短）
-    Comma,
-    /// 无停顿（最后一段）
-    None,
-}
-
 /// 文本分割器
 pub struct TextSegmenter {
+    /// 最大句子长度（字符数）
     max_sentence_length: usize,
-    /// 是否在逗号处也分割（用于 TTS 停顿）
+    /// 是否在逗号处分割
     pub split_on_comma: bool,
 }
 
 impl TextSegmenter {
     /// 创建新的文本分割器
+    /// 
+    /// # Arguments
+    /// * `max_sentence_length` - 最大句子长度（字符数）
     pub fn new(max_sentence_length: usize) -> Self {
         Self {
             max_sentence_length,
-            split_on_comma: false,  // 默认不在逗号处分割（向后兼容）
+            split_on_comma: false,
         }
     }
 
-    /// 创建新的文本分割器（支持在逗号处分割，用于 TTS）
+    /// 创建支持逗号分割的文本分割器
+    /// 
+    /// # Arguments
+    /// * `max_sentence_length` - 最大句子长度（字符数）
     pub fn new_with_comma_splitting(max_sentence_length: usize) -> Self {
         Self {
             max_sentence_length,
-            split_on_comma: true,  // 在逗号处也分割
+            split_on_comma: true,
         }
     }
 
-    /// 分割文本为短句（返回带停顿类型的分段）
+    /// 分割文本为短句（带停顿类型）
     /// 
     /// 分割规则：
     /// 1. 按句号、问号、感叹号分割（中英文）
-    /// 2. 如果 `split_on_comma` 为 true，也在逗号处分割
+    /// 2. 如果启用，在逗号处也分割
     /// 3. 如果句子过长，按逗号或空格进一步分割
     /// 4. 保留标点符号
+    /// 5. 正确处理小数点和缩写（如 "Dr. Smith", "version 1.0"）
     pub fn segment_with_pause_type(&self, text: &str) -> Vec<TextSegment> {
-        let text = text.trim();
-        if text.is_empty() {
-            return vec![];
-        }
-
         let mut segments = Vec::new();
         let mut current_segment = String::new();
         let mut chars = text.chars().peekable();
@@ -91,8 +94,11 @@ impl TextSegmenter {
                     // 如果前后都是数字，这是小数点，不应该分割
                     if prev_is_digit && next_is_digit {
                         false
+                    } else if prev_is_digit && !next_is_digit {
+                        // 前面是数字，后面不是数字（如 "version 1.0."），这是句号，应该分割
+                        true
                     } else {
-                        // 检查是否为缩写（如果后面是小写字母，可能是缩写）
+                        // 前面不是数字，检查是否为缩写（如果后面是小写字母，可能是缩写）
                         let is_abbreviation = if let Some(&next_ch) = chars.peek() {
                             next_ch.is_alphabetic() && next_ch.is_lowercase()
                         } else {
@@ -116,6 +122,9 @@ impl TextSegmenter {
                     }
                     current_segment.clear();
                     continue;
+                } else {
+                    // 不分割（小数点或缩写），继续累积
+                    // 这里不需要做任何操作，因为 current_segment 已经包含了这个字符
                 }
             } else if is_comma && self.split_on_comma {
                 // 逗号处也分割（如果启用）
@@ -178,8 +187,8 @@ impl TextSegmenter {
             });
         }
 
-        // 如果没有任何分割，返回整个文本
-        if segments.is_empty() {
+        // 如果没有任何分割，返回整个文本（如果文本不为空）
+        if segments.is_empty() && !text.trim().is_empty() {
             segments.push(TextSegment {
                 text: text.to_string(),
                 pause_type: PauseType::None,
@@ -296,5 +305,30 @@ mod tests {
         assert_eq!(segments[0], "Version 0.26 is released.");
         assert_eq!(segments[1], "Version 1.0 is coming.");
     }
-}
 
+    #[test]
+    fn test_segment_sentence_ending_period() {
+        let segmenter = TextSegmenter::default();
+        // 测试句号应该被分割（即使前面是数字）
+        let text = "Great, it's a milestone. I finally wrote this item can run up.";
+        let segments = segmenter.segment_with_pause_type(&text);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].text, "Great, it's a milestone.");
+        assert_eq!(segments[0].pause_type, PauseType::SentenceEnd);
+        assert_eq!(segments[1].text, "I finally wrote this item can run up.");
+        assert_eq!(segments[1].pause_type, PauseType::SentenceEnd);
+    }
+
+    #[test]
+    fn test_segment_version_number_ending() {
+        let segmenter = TextSegmenter::default();
+        // 测试版本号结尾的句号应该被分割
+        let text = "This is version 1.0. It works well.";
+        let segments = segmenter.segment_with_pause_type(&text);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].text, "This is version 1.0.");
+        assert_eq!(segments[0].pause_type, PauseType::SentenceEnd);
+        assert_eq!(segments[1].text, "It works well.");
+        assert_eq!(segments[1].pause_type, PauseType::SentenceEnd);
+    }
+}

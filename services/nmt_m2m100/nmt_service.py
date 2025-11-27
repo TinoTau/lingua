@@ -104,14 +104,32 @@ async def translate(req: TranslateRequest) -> TranslateResponse:
                 num_beams=4,
                 no_repeat_ngram_size=3,
                 repetition_penalty=1.2,
-                max_new_tokens=128,
+                max_new_tokens=256,  # 增加最大 token 数，避免截断
+                early_stopping=False,  # 禁用早停，确保完整翻译
             )
         
         # 调试：打印输入和生成的 token IDs（仅在开发时）
         print(f"[DEBUG] Input text: {req.text}")
-        print(f"[DEBUG] Encoded input_ids: {encoded['input_ids'].cpu().numpy().tolist()}")
+        print(f"[DEBUG] Input length: {len(req.text)} chars")
+        encoded_input_ids = encoded['input_ids'].cpu().numpy().tolist()[0]
+        print(f"[DEBUG] Encoded input_ids: {encoded_input_ids}")
+        print(f"[DEBUG] Encoded input length: {len(encoded_input_ids)} tokens")
         print(f"[DEBUG] Forced BOS token ID: {forced_bos}")
-        print(f"[DEBUG] Generated IDs: {gen[0].cpu().numpy().tolist()}")
+        generated_ids_list = gen[0].cpu().numpy().tolist()
+        print(f"[DEBUG] Generated IDs (full): {generated_ids_list}")
+        print(f"[DEBUG] Generated length: {len(generated_ids_list)} tokens")
+        print(f"[DEBUG] EOS token ID: {tokenizer.eos_token_id}")
+        
+        # 检查生成的序列中是否包含输入序列
+        # M2M100 的 generate 可能返回 [input_ids + generated_ids] 或只返回 generated_ids
+        input_length = len(encoded_input_ids)
+        if len(generated_ids_list) > input_length and generated_ids_list[:input_length] == encoded_input_ids:
+            print(f"[DEBUG] Generated sequence includes input (first {input_length} tokens match)")
+            generated_only = generated_ids_list[input_length:]
+            print(f"[DEBUG] Generated-only IDs: {generated_only}")
+        else:
+            print(f"[DEBUG] Generated sequence does not include input (or format differs)")
+            generated_only = generated_ids_list
         
         # 解码输出
         # M2M100 generate 返回的序列已经包含了完整的输入和目标序列
@@ -128,17 +146,41 @@ async def translate(req: TranslateRequest) -> TranslateResponse:
                 tgt_start_idx = i + 1  # 跳过目标语言 token 本身
                 break
         
+        print(f"[DEBUG] Target lang token ID: {tgt_lang_id}, found at index: {tgt_start_idx}")
+        
         if tgt_start_idx is not None and tgt_start_idx < len(generated_ids):
             # 提取目标语言 token 之后的部分
             target_ids = generated_ids[tgt_start_idx:]
+            print(f"[DEBUG] Target IDs before EOS removal: {target_ids} (length: {len(target_ids)})")
+            
             # 移除 EOS token（如果存在）
-            if len(target_ids) > 0 and target_ids[-1] == eos_token_id:
-                target_ids = target_ids[:-1]
+            # 注意：可能有多处 EOS token，需要找到第一个有效的 EOS
+            eos_positions = [i for i, tid in enumerate(target_ids) if tid == eos_token_id]
+            print(f"[DEBUG] EOS token positions in target: {eos_positions}")
+            
+            if len(eos_positions) > 0:
+                # 使用第一个 EOS token 之前的内容
+                target_ids = target_ids[:eos_positions[0]]
+                print(f"[DEBUG] Truncated at first EOS token (position {eos_positions[0]})")
+            else:
+                print(f"[DEBUG] No EOS token found in target sequence")
+            
+            print(f"[DEBUG] Target IDs after EOS removal: {target_ids} (length: {len(target_ids)})")
+            
             # 解码目标语言部分
             if len(target_ids) > 0:
                 out = tokenizer.decode(target_ids, skip_special_tokens=True)
+                print(f"[DEBUG] Decoded output: '{out}' (length: {len(out)} chars)")
+                
+                # 尝试逐个 token 解码，看看哪里出了问题
+                if len(out) < len(req.text) * 0.5:  # 如果输出明显短于输入
+                    print(f"[DEBUG] WARNING: Output seems truncated. Decoding tokens individually:")
+                    for i, tid in enumerate(target_ids[:min(30, len(target_ids))]):
+                        token_text = tokenizer.decode([tid], skip_special_tokens=False)
+                        print(f"[DEBUG]   Token {i} (ID {tid}): '{token_text}'")
             else:
                 out = ""
+                print(f"[DEBUG] Target IDs empty after processing")
         else:
             # 如果找不到目标语言 token，尝试直接解码（可能格式不同）
             # 先尝试跳过源语言部分
@@ -149,16 +191,31 @@ async def translate(req: TranslateRequest) -> TranslateResponse:
                     src_end_idx = i
                     break
             
+            print(f"[DEBUG] Fallback: src_lang_id={src_lang_id}, src_end_idx={src_end_idx}")
+            
             if src_end_idx is not None:
                 # 跳过源语言部分，解码剩余部分
                 remaining_ids = generated_ids[src_end_idx+1:]
                 # 移除 EOS
-                if len(remaining_ids) > 0 and remaining_ids[-1] == eos_token_id:
-                    remaining_ids = remaining_ids[:-1]
+                eos_positions = [i for i, tid in enumerate(remaining_ids) if tid == eos_token_id]
+                if len(eos_positions) > 0:
+                    remaining_ids = remaining_ids[:eos_positions[0]]
                 out = tokenizer.decode(remaining_ids, skip_special_tokens=True)
             else:
-                # 最后备用方案：直接解码
-                out = tokenizer.decode(gen[0], skip_special_tokens=True)
+                # 最后备用方案：直接解码，但需要跳过输入部分
+                # M2M100 的 generate 返回的是完整序列，需要提取生成部分
+                input_length = encoded['input_ids'].shape[1]
+                if len(generated_ids) > input_length:
+                    generated_only = generated_ids[input_length:]
+                    # 移除 EOS
+                    eos_positions = [i for i, tid in enumerate(generated_only) if tid == eos_token_id]
+                    if len(eos_positions) > 0:
+                        generated_only = generated_only[:eos_positions[0]]
+                    out = tokenizer.decode(generated_only, skip_special_tokens=True)
+                else:
+                    out = tokenizer.decode(gen[0], skip_special_tokens=True)
+            
+            print(f"[DEBUG] Fallback decoded output: '{out}'")
         
         elapsed_ms = int((time.time() - start) * 1000)
         
