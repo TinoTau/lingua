@@ -46,15 +46,52 @@ async def load_model():
         print(f"[NMT Service] Loading model: {MODEL_NAME}")
         print(f"[NMT Service] Device: {DEVICE}")
         
+        # GPU 检查
+        if torch.cuda.is_available():
+            print(f"[NMT Service] ✓ CUDA available: {torch.cuda.is_available()}")
+            print(f"[NMT Service] ✓ CUDA version: {torch.version.cuda}")
+            print(f"[NMT Service] ✓ GPU count: {torch.cuda.device_count()}")
+            print(f"[NMT Service] ✓ GPU name: {torch.cuda.get_device_name(0)}")
+            print(f"[NMT Service] ✓ GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+        else:
+            print(f"[NMT Service] ⚠ WARNING: CUDA not available, using CPU")
+        
         # 检查是否有 HF_TOKEN 环境变量
         hf_token = os.getenv("HF_TOKEN")
         extra = {"token": hf_token} if hf_token else {}
         
+        # 使用 safetensors 格式（避免 PyTorch 2.6 要求）
+        # transformers 4.40.0 版本应该不会强制使用 meta device
+        extra["use_safetensors"] = True
+        
         tokenizer = M2M100Tokenizer.from_pretrained(MODEL_NAME, **extra)
-        model = M2M100ForConditionalGeneration.from_pretrained(MODEL_NAME, **extra)
+        
+        # 禁用所有可能导致 meta tensor 的优化选项
+        # 关键：low_cpu_mem_usage=False 必须设置，否则会使用 meta device
+        os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+        
+        # 加载模型，禁用所有优化选项
+        model = M2M100ForConditionalGeneration.from_pretrained(
+            MODEL_NAME, 
+            **extra,
+            low_cpu_mem_usage=False,  # 禁用低内存模式（这是关键！必须为 False）
+            torch_dtype=torch.float32,  # 明确指定数据类型
+        )
+        
+        # 检查模型是否在 meta 设备上
+        try:
+            first_param = next(model.parameters(), None)
+            if first_param is not None:
+                param_device = str(first_param.device)
+                if param_device == "meta":
+                    raise RuntimeError(f"Model loaded to meta device: {param_device}. This should not happen with low_cpu_mem_usage=False")
+        except StopIteration:
+            pass  # 模型没有参数（不应该发生）
+        
+        # 移动到目标设备
         model = model.to(DEVICE).eval()
         
-        print(f"[NMT Service] Model loaded successfully")
+        print(f"[NMT Service] Model loaded successfully on {DEVICE}")
     except Exception as e:
         print(f"[NMT Service] Failed to load model: {e}")
         raise
@@ -73,7 +110,12 @@ async def health():
 @app.post("/v1/translate", response_model=TranslateResponse)
 async def translate(req: TranslateRequest) -> TranslateResponse:
     """翻译接口"""
-    start = time.time()
+    import datetime
+    request_start = time.time()
+    request_timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    
+    print(f"[NMT Service] [{request_timestamp}] ===== Translation Request Started =====")
+    print(f"[NMT Service] Input: '{req.text[:50]}{'...' if len(req.text) > 50 else ''}' (src={req.src_lang}, tgt={req.tgt_lang})")
     
     if model is None or tokenizer is None:
         return TranslateResponse(
@@ -84,10 +126,13 @@ async def translate(req: TranslateRequest) -> TranslateResponse:
     
     try:
         # 设置源语言（重要：必须在编码前设置）
+        tokenizer_start = time.time()
         tokenizer.src_lang = req.src_lang
         
         # 编码输入文本（M2M100 会在文本前自动添加源语言 token）
         encoded = tokenizer(req.text, return_tensors="pt").to(DEVICE)
+        tokenizer_elapsed = (time.time() - tokenizer_start) * 1000
+        print(f"[NMT Service] [Tokenization] Completed in {tokenizer_elapsed:.2f}ms")
         
         # 获取目标语言 token ID
         forced_bos = tokenizer.get_lang_id(req.tgt_lang)
@@ -97,6 +142,7 @@ async def translate(req: TranslateRequest) -> TranslateResponse:
         print(f"[DEBUG] Tokenizer tgt_lang: {req.tgt_lang}")
         
         # 生成翻译
+        generation_start = time.time()
         with torch.no_grad():
             gen = model.generate(
                 **encoded,
@@ -107,6 +153,8 @@ async def translate(req: TranslateRequest) -> TranslateResponse:
                 max_new_tokens=256,  # 增加最大 token 数，避免截断
                 early_stopping=False,  # 禁用早停，确保完整翻译
             )
+        generation_elapsed = (time.time() - generation_start) * 1000
+        print(f"[NMT Service] [Generation] Completed in {generation_elapsed:.2f}ms")
         
         # 调试：打印输入和生成的 token IDs（仅在开发时）
         print(f"[DEBUG] Input text: {req.text}")
@@ -132,6 +180,7 @@ async def translate(req: TranslateRequest) -> TranslateResponse:
             generated_only = generated_ids_list
         
         # 解码输出
+        decode_start = time.time()
         # M2M100 generate 返回的序列已经包含了完整的输入和目标序列
         # 使用 skip_special_tokens=True 应该能正确解码
         # 但为了确保正确，我们手动提取目标语言部分
@@ -217,7 +266,17 @@ async def translate(req: TranslateRequest) -> TranslateResponse:
             
             print(f"[DEBUG] Fallback decoded output: '{out}'")
         
-        elapsed_ms = int((time.time() - start) * 1000)
+        # 解码步骤完成
+        decode_elapsed = (time.time() - decode_start) * 1000
+        
+        total_elapsed = (time.time() - request_start) * 1000
+        print(f"[NMT Service] [Decoding] Completed in {decode_elapsed:.2f}ms")
+        print(f"[NMT Service] Output: '{out[:50]}{'...' if len(out) > 50 else ''}'")
+        print(f"[NMT Service] ===== Translation Request Completed in {total_elapsed:.2f}ms =====")
+        print(f"[NMT Service]   - Tokenization: {tokenizer_elapsed:.2f}ms")
+        print(f"[NMT Service]   - Generation: {generation_elapsed:.2f}ms")
+        print(f"[NMT Service]   - Decoding: {decode_elapsed:.2f}ms")
+        print(f"[NMT Service]   - Total: {total_elapsed:.2f}ms")
         
         return TranslateResponse(
             ok=True,
@@ -225,15 +284,24 @@ async def translate(req: TranslateRequest) -> TranslateResponse:
             model=MODEL_NAME,
             provider="local-m2m100",
             extra={
-                "elapsed_ms": elapsed_ms,
-                "num_tokens": int(gen.shape[1])
+                "elapsed_ms": int(total_elapsed),
+                "num_tokens": int(gen.shape[1]),
+                "tokenization_ms": int(tokenizer_elapsed),
+                "generation_ms": int(generation_elapsed),
+                "decoding_ms": int(decode_elapsed)
             }
         )
     except Exception as e:
+        total_elapsed = (time.time() - request_start) * 1000
+        print(f"[NMT Service] Error: {e}")
+        print(f"[NMT Service] ===== Translation Request Failed in {total_elapsed:.2f}ms =====")
+        import traceback
+        traceback.print_exc()
         return TranslateResponse(
             ok=False,
             error=str(e),
-            provider="local-m2m100"
+            provider="local-m2m100",
+            extra={"elapsed_ms": int(total_elapsed)}
         )
 
 

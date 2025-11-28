@@ -2,8 +2,10 @@ fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 pydantic>=2.0.0
 torch>=2.0.0
-transformers>=4.35.0
-accelerate>=0.24.0
+transformers>=4.35.0,<4.50.0
+# accelerate>=0.24.0  # 暂时禁用，避免 meta tensor 问题（transformers 4.49.0 不需要）
 huggingface-hub>=0.34.0,<1.0
 sentencepiece>=0.1.99
+safetensors>=0.4.1
+tokenizers>=0.21,<0.22
 

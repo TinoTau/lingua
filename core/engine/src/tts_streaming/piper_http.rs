@@ -70,6 +70,13 @@ struct PiperHttpRequest {
 #[async_trait]
 impl TtsStreaming for PiperHttpTts {
     async fn synthesize(&self, request: TtsRequest) -> EngineResult<TtsStreamChunk> {
+        use std::time::Instant;
+        let tts_start = Instant::now();
+        eprintln!("[Piper TTS] ===== TTS Request Started =====");
+        eprintln!("[Piper TTS] Text: '{}' (voice={}, locale={})", 
+                  if request.text.len() > 50 { &request.text[..50] } else { &request.text },
+                  request.voice, request.locale);
+        
         // 确定使用的语音
         let voice = if request.voice.is_empty() {
             // 根据 locale 选择默认 voice
@@ -106,6 +113,7 @@ impl TtsStreaming for PiperHttpTts {
         };
 
         // 发送 HTTP POST 请求
+        let http_start = Instant::now();
         let response = self
             .client
             .post(&self.config.endpoint)
@@ -118,6 +126,8 @@ impl TtsStreaming for PiperHttpTts {
                     e
                 ))
             })?;
+        let http_elapsed = http_start.elapsed().as_millis();
+        eprintln!("[Piper TTS] [HTTP Request] Completed in {}ms", http_elapsed);
 
         // 检查 HTTP 状态码
         if !response.status().is_success() {
@@ -146,6 +156,12 @@ impl TtsStreaming for PiperHttpTts {
                 "Piper service returned empty audio data".to_string(),
             ));
         }
+
+        let total_elapsed = tts_start.elapsed().as_millis();
+        eprintln!("[Piper TTS] Audio size: {} bytes", audio_data.len());
+        eprintln!("[Piper TTS] ===== TTS Request Completed in {}ms =====", total_elapsed);
+        eprintln!("[Piper TTS]   - HTTP Request: {}ms", http_elapsed);
+        eprintln!("[Piper TTS]   - Total: {}ms", total_elapsed);
 
         // 返回音频块
         Ok(TtsStreamChunk {

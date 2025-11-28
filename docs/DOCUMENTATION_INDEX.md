@@ -21,6 +21,11 @@
   - CUDA 安装步骤
   - 验证 GPU 是否启用
 
+- **[PyTorch CUDA 安装指南](./operational/PyTorch_CUDA_安装指南.md)**
+  - NMT 服务 GPU 加速配置
+  - PyTorch CUDA 版本安装步骤
+  - 验证和故障排查
+
 - **[手动停止服务命令](./手动停止服务命令.md)**
   - 停止所有服务的命令
   - 端口占用检查

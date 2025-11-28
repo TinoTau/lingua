@@ -442,6 +442,9 @@ async fn s2s_handler(
     let s2s_total_ms = s2s_start.elapsed().as_millis() as u64;
     eprintln!("[S2S] ===== Request completed in {}ms =====", s2s_total_ms);
     
+    // 输出详细的时间统计（如果之前记录了各步骤时间）
+    // 注意：这里只输出总时长，各步骤的详细时间需要在 process_audio_frame 中记录
+    
     Ok(Json(S2SResponse {
         audio: audio_base64,
         transcript,
