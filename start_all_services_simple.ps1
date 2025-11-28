@@ -81,7 +81,10 @@ Start-Sleep -Seconds 2
 
 # 启动 NMT 服务
 Write-Host "Starting NMT service (new window)..." -ForegroundColor Cyan
-$nmtCommand = "cd '$nmtServicePath'; .\venv\Scripts\Activate.ps1; Write-Host '=== NMT Service (GPU) ===' -ForegroundColor Green; uvicorn nmt_service:app --host 127.0.0.1 --port 5008"
+# 优先尝试使用本地文件（完全禁用网络验证）
+# 如果失败，会自动从配置文件读取 token
+# 同时清除过期的 token 缓存
+$nmtCommand = "cd '$nmtServicePath'; .\venv\Scripts\Activate.ps1; Remove-Item -Path `"`$env:USERPROFILE\.cache\huggingface\token`" -Force -ErrorAction SilentlyContinue; `$env:HF_LOCAL_FILES_ONLY='true'; Write-Host '=== NMT Service (GPU) ===' -ForegroundColor Green; uvicorn nmt_service:app --host 127.0.0.1 --port 5008"
 Start-Process powershell -ArgumentList "-NoExit", "-Command", $nmtCommand
 
 Start-Sleep -Seconds 3

@@ -40,6 +40,24 @@ source .venv/bin/activate
 export PIPER_MODEL_DIR="$PIPER_MODEL_DIR"
 export PIPER_DEFAULT_VOICE="$DEFAULT_VOICE"
 
+# 设置 CUDA 库路径（确保 cuDNN 和 CUDA 库可被找到）
+export LD_LIBRARY_PATH=/usr/local/cuda-12.4/targets/x86_64-linux/lib:/usr/local/cuda-12.4/lib64:/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+
+# 启用 GPU（默认）
+export PIPER_USE_GPU=true
+
+echo "[INFO] GPU 加速: 已启用"
+echo "[INFO] CUDA 库路径: $LD_LIBRARY_PATH"
+
+# 检查 ONNX Runtime GPU 支持
+echo "[INFO] 检查 GPU 支持..."
+if python -c "import onnxruntime as ort; providers = ort.get_available_providers(); print('CUDA 可用' if 'CUDAExecutionProvider' in providers else 'CUDA 不可用')" 2>/dev/null; then
+    echo "[INFO] GPU 检查完成"
+else
+    echo "[WARN] 无法检查 GPU 状态"
+fi
+echo ""
+
 echo "[INFO] 模型目录: $PIPER_MODEL_DIR"
 echo "[INFO] 默认语音: $DEFAULT_VOICE"
 echo "[INFO] 监听地址: $HOST:$PORT"

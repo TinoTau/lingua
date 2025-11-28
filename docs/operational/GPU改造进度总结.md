@@ -12,7 +12,7 @@
 |------|------------|---------|---------|
 | **ASR (Whisper)** | ✅ 已完成 | ✅ 已配置 | ✅ 已验证 |
 | **NMT (M2M100)** | ✅ 已完成 | ✅ 已配置 | ✅ 已验证 |
-| **TTS** | ❌ 未启用 | ❌ 未配置 | ❌ 未验证 |
+| **TTS (Piper)** | ✅ 已完成 | ✅ 已配置 | ✅ 已验证 |
 
 ---
 
@@ -149,12 +149,62 @@ nvidia-smi -l 1
 
 ---
 
-## ❌ TTS GPU 配置
+## ✅ TTS (Piper) GPU 配置
 
-### 配置状态：未启用 ❌
+### 配置状态：已完成 ✅
 
-- TTS 服务目前未启用 GPU 支持
-- 如果后续需要，可以考虑使用 GPU 加速的 TTS 模型
+#### 1. 代码配置
+- ✅ `piper_http_server.py` 已支持 GPU（通过 `PIPER_USE_GPU` 环境变量）
+- ✅ 使用 ONNX Runtime CUDA 执行提供程序
+- ✅ Piper 库自动检测并使用 GPU
+
+#### 2. cuDNN 安装状态
+- ✅ **已安装并验证**：cuDNN 9.1.1 for CUDA 12.4
+- ✅ cuDNN 运行时库：`libcudnn9-cuda-12` (9.1.1.17-1)
+- ✅ cuDNN 开发文件：`libcudnn9-dev-cuda-12` (9.1.1.17-1)
+- ✅ 库文件位置：`/lib/x86_64-linux-gnu/libcudnn.so.9`
+
+#### 3. ONNX Runtime 验证结果 ✅
+
+**验证时间**: 2025-11-28
+
+**验证输出**：
+```
+可用执行提供程序: ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+CUDA 可用: True
+```
+
+**Piper TTS GPU 测试结果**：
+```
+✓ 模型加载成功（GPU 模式）
+  实际使用的执行提供程序: ['CUDAExecutionProvider', 'CPUExecutionProvider']
+  ✓ 确认使用 GPU 加速
+✓ 合成成功，音频块数: 1, 总大小: 67072 字节
+```
+
+#### 4. 配置说明
+
+**环境变量**：
+- `PIPER_USE_GPU=true`：启用 GPU（默认）
+- `PIPER_USE_GPU=false`：禁用 GPU，使用 CPU
+
+**启动服务**：
+```bash
+# 在 WSL2 中启动 TTS 服务（默认使用 GPU）
+cd ~/piper_env
+source .venv/bin/activate
+export LD_LIBRARY_PATH=/usr/local/cuda-12.4/targets/x86_64-linux/lib:/usr/local/cuda-12.4/lib64:$LD_LIBRARY_PATH
+python /mnt/d/Programs/github/lingua/scripts/wsl2_piper/piper_http_server.py
+```
+
+#### 5. 性能预期
+- **CPU**: 待测试
+- **GPU**: 待测试
+- **预期提升**: 约 3-4 倍
+
+#### 6. 相关文档
+- [TTS GPU 改造方案](./TTS_GPU_改造方案.md)
+- [安装 cuDNN 快速指南](../scripts/wsl2_piper/安装cuDNN_快速指南.md)
 
 ---
 
@@ -175,8 +225,15 @@ nvidia-smi -l 1
 - [x] **已更新**：NMT 服务代码已增强 GPU 日志输出
 - [ ] **待测试**：实际运行时的 GPU 性能提升验证
 
+### TTS (Piper)
+- [x] cuDNN 9.1.1 for CUDA 12.4 已安装
+- [x] ONNX Runtime GPU 支持已启用
+- [x] Piper TTS GPU 已成功验证
+- [x] 服务代码已支持 GPU（通过环境变量）
+
 ### 系统环境
 - [x] CUDA Toolkit 12.4 已安装
+- [x] cuDNN 9.1.1 已安装（WSL2）
 - [x] NVIDIA 驱动已安装（版本 566.26）
 - [x] GPU 可用（NVIDIA GeForce RTX 4060 Laptop GPU）
 
@@ -204,17 +261,19 @@ nvidia-smi -l 1
 
 ### 后续优化
 - [ ] 测试完整的 S2S（语音到语音）流程性能
-- [ ] 对比 CPU vs GPU 性能提升
-- [ ] 考虑 TTS GPU 支持（如果需要）
+- [ ] 对比 CPU vs GPU 性能提升（ASR、NMT、TTS）
+- [ ] 优化 TTS GPU 性能（批处理等）
 
 ---
 
 ## 📚 相关文档
 
 - [ASR GPU 配置完成](./ASR_GPU_配置完成.md)
+- [TTS GPU 改造方案](./TTS_GPU_改造方案.md)
 - [PyTorch CUDA 安装指南](./PyTorch_CUDA_安装指南.md)
 - [CUDA Toolkit 安装指南](./CUDA_Toolkit_安装指南.md)
 - [ASR GPU 编译故障排查](./ASR_GPU_编译故障排查.md)
+- [安装 cuDNN 快速指南](../scripts/wsl2_piper/安装cuDNN_快速指南.md)
 
 ---
 

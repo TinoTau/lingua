@@ -56,15 +56,70 @@ async def load_model():
         else:
             print(f"[NMT Service] ⚠ WARNING: CUDA not available, using CPU")
         
-        # 检查是否有 HF_TOKEN 环境变量
+        # 尝试完全禁用网络验证（使用本地文件）
+        # 如果模型已完全下载到本地，可以使用 local_files_only=True
+        # 这样可以完全避免网络请求和 token 验证
+        try_local_only = os.getenv("HF_LOCAL_FILES_ONLY", "false").lower() == "true"
+        
+        # 检查是否有 HF_TOKEN 环境变量或配置文件
         hf_token = os.getenv("HF_TOKEN")
-        extra = {"token": hf_token} if hf_token else {}
         
-        # 使用 safetensors 格式（避免 PyTorch 2.6 要求）
-        # transformers 4.40.0 版本应该不会强制使用 meta device
-        extra["use_safetensors"] = True
+        # 如果没有环境变量，尝试从配置文件读取
+        if not hf_token:
+            config_file = os.path.join(os.path.dirname(__file__), "hf_token.txt")
+            if os.path.exists(config_file):
+                try:
+                    with open(config_file, "r", encoding="utf-8") as f:
+                        hf_token = f.read().strip()
+                except Exception as e:
+                    print(f"[NMT Service] Warning: Failed to read token from config file: {e}")
         
-        tokenizer = M2M100Tokenizer.from_pretrained(MODEL_NAME, **extra)
+        # 配置加载选项
+        extra = {}
+        
+        # 如果设置了 local_files_only，完全禁用网络验证
+        if try_local_only:
+            extra["local_files_only"] = True
+            # 禁用 safetensors 自动转换（避免网络请求）
+            extra["use_safetensors"] = False
+            print("[NMT Service] Using local files only (no network requests, no token needed)")
+            print("[NMT Service] Note: Disabled safetensors to avoid network requests")
+        else:
+            # 只有当 HF_TOKEN 非空且不是空字符串时才使用
+            if hf_token and hf_token.strip():
+                extra["token"] = hf_token
+                extra["use_safetensors"] = True
+                print("[NMT Service] Using HF_TOKEN from environment or config file")
+            else:
+                # 禁用隐式 token 使用（避免使用过期的缓存 token）
+                os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+                # 尝试不使用 safetensors，避免自动转换的网络请求
+                extra["use_safetensors"] = False
+                print("[NMT Service] No token provided, trying without safetensors")
+        
+        # 清除过期的 token 缓存（通过环境变量）
+        # 这可以防止使用缓存的过期 token
+        os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+        
+        # 如果 local_files_only 失败，尝试使用配置文件中的 token
+        try:
+            tokenizer = M2M100Tokenizer.from_pretrained(MODEL_NAME, **extra)
+        except Exception as e:
+            if try_local_only and "401" in str(e) or "token" in str(e).lower():
+                print(f"[NMT Service] local_files_only failed, trying with token from config file...")
+                # 回退到使用配置文件中的 token
+                if hf_token and hf_token.strip():
+                    extra = {
+                        "token": hf_token,
+                        "use_safetensors": True,
+                    }
+                    os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "0"  # 允许使用 token
+                    tokenizer = M2M100Tokenizer.from_pretrained(MODEL_NAME, **extra)
+                    print("[NMT Service] Successfully loaded with token from config file")
+                else:
+                    raise
+            else:
+                raise
         
         # 禁用所有可能导致 meta tensor 的优化选项
         # 关键：low_cpu_mem_usage=False 必须设置，否则会使用 meta device
