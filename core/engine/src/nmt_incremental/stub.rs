@@ -47,6 +47,10 @@ impl NmtIncremental for MarianNmtStub {
         Ok(TranslationResponse {
             translated_text: translated,
             is_stable: true,
+            speaker_id: None,
+            source_text: None,
+            source_audio_duration_ms: None,
+            quality_metrics: None,
         })
     }
 

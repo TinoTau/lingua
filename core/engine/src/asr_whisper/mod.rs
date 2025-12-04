@@ -4,6 +4,7 @@ pub mod cli;
 pub mod audio_preprocessing;
 pub mod engine;
 pub mod streaming;
+pub mod faster_whisper_streaming;
 
 // 以后你可以在这里定义统一的 trait，比如：
 #[derive(Debug, Clone)]
@@ -29,3 +30,4 @@ pub use engine::WhisperAsrEngine;
 
 // 导出流式实现
 pub use streaming::WhisperAsrStreaming;
+pub use faster_whisper_streaming::FasterWhisperAsrStreaming;

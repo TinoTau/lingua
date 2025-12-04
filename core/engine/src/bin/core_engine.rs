@@ -123,6 +123,7 @@ impl VoiceActivityDetector for SimpleVad {
         let mut cleaned_frame = frame.clone();
         cleaned_frame.timestamp_ms = cleaned_timestamp;
         Ok(DetectionOutcome {
+            boundary_type: None,
             is_boundary: is_final,
             confidence: 1.0,
             frame: cleaned_frame,

@@ -80,6 +80,11 @@ impl WhisperAsrEngine {
         self.language = language;
     }
 
+    /// 获取当前语言设置
+    pub fn get_language(&self) -> Option<String> {
+        self.language.clone()
+    }
+
     /// 对完整音频进行转录
     /// 
     /// # Arguments

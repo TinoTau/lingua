@@ -130,6 +130,20 @@ impl WhisperAsrStreaming {
         }
     }
 
+    /// 获取当前语言设置
+    pub fn get_language(&self) -> EngineResult<Option<String>> {
+        let engine = self.engine.lock()
+            .map_err(|e| EngineError::new(format!("Failed to lock WhisperAsrEngine: {}", e)))?;
+        Ok(engine.get_language())
+    }
+
+    /// 获取累积的音频帧（用于说话者识别等）
+    pub fn get_accumulated_frames(&self) -> EngineResult<Vec<AudioFrame>> {
+        let buffer = self.audio_buffer.lock()
+            .map_err(|e| EngineError::new(format!("Failed to lock audio buffer: {}", e)))?;
+        Ok(buffer.clone())
+    }
+
     /// 只累积音频帧，不进行推理
     /// 
     /// # Arguments
@@ -137,7 +151,7 @@ impl WhisperAsrStreaming {
     /// 
     /// # Returns
     /// 返回累积的帧数
-    pub fn accumulate_frame(&self, frame: AudioFrame) -> EngineResult<usize> {
+    pub fn accumulate_frame_internal(&self, frame: AudioFrame) -> EngineResult<usize> {
         let mut buffer = self.audio_buffer.lock()
             .map_err(|e| EngineError::new(format!("Failed to lock audio buffer: {}", e)))?;
         buffer.push(frame);
@@ -440,6 +454,34 @@ impl AsrStreaming for WhisperAsrStreaming {
         }
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl crate::asr_streaming::AsrStreamingExt for WhisperAsrStreaming {
+    fn accumulate_frame(&self, frame: AudioFrame) -> EngineResult<()> {
+        WhisperAsrStreaming::accumulate_frame_internal(self, frame).map(|_| ())
+    }
+
+    fn get_accumulated_frames(&self) -> EngineResult<Vec<AudioFrame>> {
+        WhisperAsrStreaming::get_accumulated_frames(self)
+    }
+
+    fn clear_buffer(&self) -> EngineResult<()> {
+        WhisperAsrStreaming::clear_buffer(self);
+        Ok(())
+    }
+
+    fn set_language(&self, language: Option<String>) -> EngineResult<()> {
+        WhisperAsrStreaming::set_language(self, language)
+    }
+
+    fn get_language(&self) -> EngineResult<Option<String>> {
+        WhisperAsrStreaming::get_language(self)
+    }
+
+    async fn infer_on_boundary(&self) -> EngineResult<crate::asr_streaming::AsrResult> {
+        WhisperAsrStreaming::infer_on_boundary(self).await
     }
 }
 

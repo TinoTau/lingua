@@ -74,6 +74,10 @@ impl NmtIncremental for NmtClientAdapter {
 
         Ok(TranslationResponse {
             translated_text,
+            speaker_id: None,
+            source_text: None,
+            source_audio_duration_ms: None,
+            quality_metrics: None,
             is_stable: true, // HTTP 服务总是返回稳定结果
         })
     }

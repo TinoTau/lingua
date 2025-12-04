@@ -162,6 +162,10 @@ impl NmtIncremental for M2M100NmtOnnx {
 
         Ok(TranslationResponse {
             translated_text: translated,
+            speaker_id: None,
+            source_text: None,
+            source_audio_duration_ms: None,
+            quality_metrics: None,
             is_stable: request.wait_k.is_none() || request.wait_k == Some(0),
         })
     }

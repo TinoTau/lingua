@@ -20,6 +20,11 @@ pub mod performance_logger;
 pub mod text_segmentation;
 pub mod translation_quality;
 pub mod tts_audio_enhancement;
+pub mod audio_buffer;
+pub mod speaker_identifier;
+pub mod speaker_voice_mapper;
+pub mod asr_filters;
+pub mod asr_http_client;
 
 pub use bootstrap::{CoreEngine, CoreEngineBuilder, ProcessResult};
 pub use cache_manager::CacheManager;

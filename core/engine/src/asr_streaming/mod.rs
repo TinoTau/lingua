@@ -1,8 +1,12 @@
+mod ext;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::error::EngineResult;
 use crate::types::{AudioFrame, PartialTranscript, StableTranscript};
+
+pub use ext::AsrStreamingExt;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AsrRequest {
