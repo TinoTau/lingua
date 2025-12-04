@@ -140,10 +140,13 @@ celerybeat.pid
 .venv
 env/
 venv/
-venv-wsl-*/
 ENV/
 env.bak/
 venv.bak/
+
+# WSL virtual environments (Windows cannot access these)
+venv-wsl/
+venv-wsl-*/
 
 # Spyder project settings
 .spyderproject
