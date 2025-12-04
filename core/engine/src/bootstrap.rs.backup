@@ -1,0 +1,2481 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::asr_streaming::{AsrStreaming, AsrResult};
+use crate::asr_whisper::WhisperAsrStreaming;
+use crate::audio_buffer::{AudioBufferManager, merge_frames};
+use crate::speaker_voice_mapper::SpeakerVoiceMapper;
+use crate::speaker_identifier::{SpeakerIdentifier, SpeakerIdentifierMode, VadBasedSpeakerIdentifier, EmbeddingBasedSpeakerIdentifier};
+use crate::cache_manager::CacheManager;
+use crate::config_manager::ConfigManager;
+use crate::emotion_adapter::{EmotionAdapter, EmotionRequest, EmotionResponse};
+use crate::error::{EngineError, EngineResult};
+use crate::event_bus::{EventBus, CoreEvent, EventTopic};
+use crate::nmt_incremental::{NmtIncremental, MarianNmtOnnx, M2M100NmtOnnx, TranslationRequest, TranslationResponse};
+use crate::nmt_client::{LocalM2m100HttpClient, NmtClientAdapter};
+use crate::persona_adapter::{PersonaAdapter, PersonaContext};
+use crate::telemetry::{TelemetryDatum, TelemetrySink};
+use crate::tts_streaming::{TtsStreaming, TtsRequest, TtsStreamChunk, VitsTtsEngine, PiperHttpTts, PiperHttpConfig, YourTtsHttp, YourTtsHttpConfig};
+use crate::types::{PartialTranscript, StableTranscript};
+use crate::vad::VoiceActivityDetector;
+use crate::health_check::HealthChecker;
+use crate::post_processing::TextPostProcessor;
+use crate::performance_logger::{PerformanceLog, PerformanceLogger};
+use crate::text_segmentation::TextSegmenter;
+use crate::translation_quality::TranslationQualityChecker;
+use crate::tts_audio_enhancement::{AudioEnhancer, AudioEnhancementConfig};
+use serde_json::json;
+use std::path::Path;
+use std::time::Instant;
+use uuid::Uuid;
+use futures::future::join_all;
+
+
+pub struct CoreEngine {
+    event_bus: Arc<dyn EventBus>,
+    vad: Arc<dyn VoiceActivityDetector>,
+    asr: Arc<dyn AsrStreaming>,
+    nmt: Arc<dyn NmtIncremental>,
+    emotion: Arc<dyn EmotionAdapter>,
+    persona: Arc<dyn PersonaAdapter>,
+    tts: Arc<dyn TtsStreaming>,
+    fallback_tts: Option<Arc<dyn TtsStreaming>>,  // 回退 TTS 服务（当主 TTS 不支持该语言时使用）
+    config: Arc<dyn ConfigManager>,
+    cache: Arc<dyn CacheManager>,
+    telemetry: Arc<dyn TelemetrySink>,
+    // 优化模块
+    post_processor: Option<Arc<TextPostProcessor>>,
+    perf_logger: Option<Arc<PerformanceLogger>>,
+    text_segmenter: Option<Arc<TextSegmenter>>,
+    audio_enhancer: Option<Arc<AudioEnhancer>>,
+    quality_checker: Option<Arc<TranslationQualityChecker>>,
+    // 服务 URL（用于健康检查）
+    nmt_service_url: Option<String>,
+    tts_service_url: Option<String>,
+    // TTS 增量播放配置
+    tts_incremental_enabled: bool,
+    tts_buffer_sentences: usize,
+    // 连续输入输出支持
+    audio_buffer: Option<Arc<AudioBufferManager>>,
+    continuous_mode: bool,
+    // TTS 多说话者音色区分
+    speaker_voice_mapper: Option<Arc<SpeakerVoiceMapper>>,
+    // 说话者识别
+    speaker_identifier: Option<Arc<dyn SpeakerIdentifier>>,
+}
+
+impl Clone for CoreEngine {
+    fn clone(&self) -> Self {
+        Self {
+            event_bus: Arc::clone(&self.event_bus),
+            vad: Arc::clone(&self.vad),
+            asr: Arc::clone(&self.asr),
+            nmt: Arc::clone(&self.nmt),
+            emotion: Arc::clone(&self.emotion),
+            persona: Arc::clone(&self.persona),
+            tts: Arc::clone(&self.tts),
+            fallback_tts: self.fallback_tts.as_ref().map(Arc::clone),
+            config: Arc::clone(&self.config),
+            cache: Arc::clone(&self.cache),
+            telemetry: Arc::clone(&self.telemetry),
+            post_processor: self.post_processor.as_ref().map(Arc::clone),
+            perf_logger: self.perf_logger.as_ref().map(Arc::clone),
+            text_segmenter: self.text_segmenter.as_ref().map(Arc::clone),
+            audio_enhancer: self.audio_enhancer.as_ref().map(Arc::clone),
+            quality_checker: self.quality_checker.as_ref().map(Arc::clone),
+            nmt_service_url: self.nmt_service_url.clone(),
+            tts_service_url: self.tts_service_url.clone(),
+            tts_incremental_enabled: self.tts_incremental_enabled,
+            tts_buffer_sentences: self.tts_buffer_sentences,
+            audio_buffer: self.audio_buffer.as_ref().map(Arc::clone),
+            continuous_mode: self.continuous_mode,
+            speaker_voice_mapper: self.speaker_voice_mapper.as_ref().map(Arc::clone),
+            speaker_identifier: self.speaker_identifier.as_ref().map(Arc::clone),
+        }
+    }
+}
+
+pub struct CoreEngineBuilder {
+    event_bus: Option<Arc<dyn EventBus>>,
+    vad: Option<Arc<dyn VoiceActivityDetector>>,
+    asr: Option<Arc<dyn AsrStreaming>>,
+    nmt: Option<Arc<dyn NmtIncremental>>,
+    emotion: Option<Arc<dyn EmotionAdapter>>,
+    persona: Option<Arc<dyn PersonaAdapter>>,
+    tts: Option<Arc<dyn TtsStreaming>>,
+    fallback_tts: Option<Arc<dyn TtsStreaming>>,  // 回退 TTS 服务
+    config: Option<Arc<dyn ConfigManager>>,
+    cache: Option<Arc<dyn CacheManager>>,
+    telemetry: Option<Arc<dyn TelemetrySink>>,
+    // 优化模块
+    post_processor: Option<Arc<TextPostProcessor>>,
+    perf_logger: Option<Arc<PerformanceLogger>>,
+    text_segmenter: Option<Arc<TextSegmenter>>,
+    audio_enhancer: Option<Arc<AudioEnhancer>>,
+    quality_checker: Option<Arc<TranslationQualityChecker>>,
+    // 服务 URL（用于健康检查）
+    nmt_service_url: Option<String>,
+    tts_service_url: Option<String>,
+    // TTS 增量播放配置
+    tts_incremental_enabled: bool,
+    tts_buffer_sentences: usize,
+    // 连续输入输出支持
+    audio_buffer: Option<Arc<AudioBufferManager>>,
+    continuous_mode: bool,
+    // TTS 多说话者音色区分
+    speaker_voice_mapper: Option<Arc<SpeakerVoiceMapper>>,
+    // 说话者识别
+    speaker_identifier: Option<Arc<dyn SpeakerIdentifier>>,
+}
+
+impl CoreEngineBuilder {
+    pub fn new() -> Self {
+        Self {
+            event_bus: None,
+            vad: None,
+            asr: None,
+            nmt: None,
+            emotion: None,
+            persona: None,
+            tts: None,
+            fallback_tts: None,
+            config: None,
+            cache: None,
+            telemetry: None,
+            post_processor: None,
+            perf_logger: None,
+            text_segmenter: None,
+            audio_enhancer: None,
+            quality_checker: None,
+            nmt_service_url: None,
+            tts_service_url: None,
+            tts_incremental_enabled: false,
+            tts_buffer_sentences: 0,
+            audio_buffer: None,
+            continuous_mode: false,
+            speaker_voice_mapper: None,
+            speaker_identifier: None,
+        }
+    }
+
+    pub fn event_bus(mut self, event_bus: Arc<dyn EventBus>) -> Self {
+        self.event_bus = Some(event_bus);
+        self
+    }
+
+    pub fn vad(mut self, vad: Arc<dyn VoiceActivityDetector>) -> Self {
+        self.vad = Some(vad);
+        self
+    }
+
+    pub fn asr(mut self, asr: Arc<dyn AsrStreaming>) -> Self {
+        self.asr = Some(asr);
+        self
+    }
+
+    pub fn nmt(mut self, nmt: Arc<dyn NmtIncremental>) -> Self {
+        self.nmt = Some(nmt);
+        self
+    }
+
+    pub fn emotion(mut self, emotion: Arc<dyn EmotionAdapter>) -> Self {
+        self.emotion = Some(emotion);
+        self
+    }
+
+    pub fn persona(mut self, persona: Arc<dyn PersonaAdapter>) -> Self {
+        self.persona = Some(persona);
+        self
+    }
+
+    pub fn tts(mut self, tts: Arc<dyn TtsStreaming>) -> Self {
+        self.tts = Some(tts);
+        self
+    }
+
+    pub fn config(mut self, config: Arc<dyn ConfigManager>) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    pub fn cache(mut self, cache: Arc<dyn CacheManager>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    pub fn telemetry(mut self, telemetry: Arc<dyn TelemetrySink>) -> Self {
+        self.telemetry = Some(telemetry);
+        self
+    }
+
+    /// 使用默认的 Marian NMT ONNX 模型初始化 NMT 模块
+    /// 
+    /// 模型路径：`core/engine/models/nmt/marian-en-zh/`
+    pub fn nmt_with_default_marian_onnx(mut self) -> EngineResult<Self> {
+        // 1. 找到 core/engine 目录
+        let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        
+        // 2. 约定的 Marian 模型目录路径
+        let model_dir = crate_root.join("models/nmt/marian-en-zh");
+
+        // 3. 检查模型目录是否存在
+        if !model_dir.exists() {
+            return Err(EngineError::new(format!(
+                "Marian NMT model directory not found at: {}. Please ensure the model is exported.",
+                model_dir.display()
+            )));
+        }
+
+        // 4. 加载真实的 ONNX 实现
+        let nmt_impl = MarianNmtOnnx::new_from_dir(&model_dir)
+            .map_err(|e| EngineError::new(format!("Failed to load MarianNmtOnnx: {}", e)))?;
+
+        // 5. 存入 builder 的 nmt 字段
+        self.nmt = Some(Arc::new(nmt_impl));
+
+        Ok(self)
+    }
+
+    /// 使用默认的 M2M100 NMT ONNX 模型初始化 NMT 模块
+    /// 
+    /// 模型路径：`core/engine/models/nmt/m2m100-en-zh/`
+    /// 
+    /// 注意：M2M100 是新的 NMT 模型，推荐使用此方法替代 Marian
+    /// 
+    /// @deprecated 推荐使用 `nmt_with_m2m100_http_client()` 替代，以获得更好的翻译质量和稳定性
+    pub fn nmt_with_default_m2m100_onnx(mut self) -> EngineResult<Self> {
+        // 1. 找到 core/engine 目录
+        let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        
+        // 2. 约定的 M2M100 模型目录路径（默认使用 en-zh）
+        let model_dir = crate_root.join("models/nmt/m2m100-en-zh");
+
+        // 3. 检查模型目录是否存在
+        if !model_dir.exists() {
+            return Err(EngineError::new(format!(
+                "M2M100 NMT model directory not found at: {}. Please ensure the model is exported.",
+                model_dir.display()
+            )));
+        }
+
+        // 4. 加载真实的 ONNX 实现
+        let nmt_impl = M2M100NmtOnnx::new_from_dir(&model_dir)
+            .map_err(|e| EngineError::new(format!("Failed to load M2M100NmtOnnx: {}", e)))?;
+
+        // 5. 存入 builder 的 nmt 字段
+        self.nmt = Some(Arc::new(nmt_impl));
+
+        Ok(self)
+    }
+
+    /// 使用 M2M100 HTTP 客户端初始化 NMT 模块（推荐）
+    /// 
+    /// 此方法连接到本地运行的 Python M2M100 服务，提供更稳定和高质量的翻译。
+    /// 
+    /// # Arguments
+    /// * `service_url` - Python 服务的 URL，默认为 "http://127.0.0.1:5008"
+    /// 
+    /// # 前置条件
+    /// 需要先启动 Python M2M100 服务：
+    /// ```bash
+    /// cd services/nmt_m2m100
+    /// uvicorn nmt_service:app --host 127.0.0.1 --port 5008
+    /// ```
+    /// 
+    /// # 优势
+    /// - 翻译质量更稳定（使用 HuggingFace Transformers）
+    /// - 代码更简洁（无需管理复杂的 KV Cache）
+    /// - 易于维护和调试
+    pub fn nmt_with_m2m100_http_client(mut self, service_url: Option<&str>) -> EngineResult<Self> {
+        let url = service_url.unwrap_or("http://127.0.0.1:5008");
+        
+        // 保存服务 URL（用于健康检查）
+        self.nmt_service_url = Some(url.to_string());
+        
+        // 创建 HTTP 客户端
+        let client = Arc::new(LocalM2m100HttpClient::new(url));
+        
+        // 创建适配器（实现 NmtIncremental trait）
+        let nmt_impl = NmtClientAdapter::new(client);
+        
+        // 存入 builder 的 nmt 字段
+        self.nmt = Some(Arc::new(nmt_impl));
+        
+        Ok(self)
+    }
+
+    /// 使用指定语言对的 M2M100 NMT ONNX 模型初始化 NMT 模块
+    /// 
+    /// # Arguments
+    /// * `direction` - 翻译方向，如 "en-zh" 或 "zh-en"
+    /// 
+    /// 模型路径：
+    /// - `core/engine/models/nmt/m2m100-en-zh/` (en-zh)
+    /// - `core/engine/models/nmt/m2m100-zh-en/` (zh-en)
+    pub fn nmt_with_m2m100_onnx(mut self, direction: &str) -> EngineResult<Self> {
+        // 1. 找到 core/engine 目录
+        let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        
+        // 2. 根据方向确定模型目录
+        let model_dir = if direction == "en-zh" || direction == "en_zh" {
+            crate_root.join("models/nmt/m2m100-en-zh")
+        } else if direction == "zh-en" || direction == "zh_en" {
+            crate_root.join("models/nmt/m2m100-zh-en")
+        } else {
+            return Err(EngineError::new(format!(
+                "Invalid translation direction: {}. Supported: en-zh, zh-en",
+                direction
+            )));
+        };
+
+        // 3. 检查模型目录是否存在
+        if !model_dir.exists() {
+            return Err(EngineError::new(format!(
+                "M2M100 NMT model directory not found at: {}. Please ensure the model is exported.",
+                model_dir.display()
+            )));
+        }
+
+        // 4. 加载真实的 ONNX 实现
+        let nmt_impl = M2M100NmtOnnx::new_from_dir(&model_dir)
+            .map_err(|e| EngineError::new(format!("Failed to load M2M100NmtOnnx: {}", e)))?;
+
+        // 5. 存入 builder 的 nmt 字段
+        self.nmt = Some(Arc::new(nmt_impl));
+
+        Ok(self)
+    }
+
+    /// 使用默认的 Marian NMT Stub（已废弃，保留用于向后兼容）
+    /// 
+    /// @deprecated 请使用 `nmt_with_default_marian_onnx()` 代替
+    #[deprecated(note = "Use nmt_with_default_marian_onnx() instead")]
+    pub fn nmt_with_default_marian_stub(self) -> EngineResult<Self> {
+        // 为了向后兼容，调用新的方法
+        self.nmt_with_default_marian_onnx()
+    }
+
+    /// 使用默认的 Whisper ASR 模型初始化 ASR 模块
+    /// 
+    /// 模型路径：`core/engine/models/asr/whisper-base/`
+    /// 
+    /// # Returns
+    /// 返回 `EngineResult<Self>`，如果模型目录不存在或加载失败则返回错误
+    pub fn asr_with_default_whisper(mut self) -> EngineResult<Self> {
+        // 1. 找到 core/engine 目录
+        let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        
+        // 2. 约定的 Whisper 模型目录路径
+        let model_dir = crate_root.join("models/asr/whisper-base");
+
+        // 3. 检查模型目录是否存在
+        if !model_dir.exists() {
+            return Err(EngineError::new(format!(
+                "Whisper ASR model directory not found at: {}. Please ensure the model is downloaded.",
+                model_dir.display()
+            )));
+        }
+
+        // 4. 加载 Whisper ASR 实现
+        let asr_impl = WhisperAsrStreaming::new_from_dir(&model_dir)
+            .map_err(|e| EngineError::new(format!("Failed to load WhisperAsrStreaming: {}", e)))?;
+
+        // 5. 存入 builder 的 asr 字段
+        self.asr = Some(Arc::new(asr_impl));
+
+        Ok(self)
+    }
+
+    /// 使用默认的 VITS TTS 模型初始化 TTS 模块（支持多语言）
+    /// 
+    /// 模型路径：`core/engine/models/tts/`
+    /// - 英文模型：`mms-tts-eng/`（必需）
+    /// - 中文模型：`mms-tts-zh-Hans/`（可选）
+    /// 
+    /// # Returns
+    /// 返回 `EngineResult<Self>`，如果英文模型目录不存在或加载失败则返回错误
+    pub fn tts_with_default_vits(mut self) -> EngineResult<Self> {
+        // 1. 找到 core/engine 目录
+        let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        
+        // 2. 约定的 VITS TTS 模型根目录路径
+        let models_root = crate_root.join("models/tts");
+
+        // 3. 检查模型根目录是否存在
+        if !models_root.exists() {
+            return Err(EngineError::new(format!(
+                "VITS TTS models root directory not found at: {}. Please ensure the models are downloaded.",
+                models_root.display()
+            )));
+        }
+
+        // 4. 加载 VITS TTS 实现（支持多语言）
+        let tts_impl = VitsTtsEngine::new_from_models_root(&models_root)
+            .map_err(|e| EngineError::new(format!("Failed to load VitsTtsEngine: {}", e)))?;
+
+        // 5. 存入 builder 的 tts 字段
+        self.tts = Some(Arc::new(tts_impl));
+
+        Ok(self)
+    }
+
+    /// 使用默认的 Piper HTTP TTS 服务初始化 TTS 模块
+    /// 
+    /// 配置：
+    /// - 端点：http://127.0.0.1:5005/tts
+    /// - 默认语音：zh_CN-huayan-medium
+    /// - 超时：8000ms
+    /// 
+    /// 注意：此方法需要 WSL2 中运行 Piper HTTP 服务
+    pub fn tts_with_default_piper_http(mut self) -> EngineResult<Self> {
+        let config = PiperHttpConfig::default();
+        
+        // 保存服务 URL（用于健康检查）
+        // 从 endpoint 中提取基础 URL（去掉 /tts 后缀）
+        let base_url = config.endpoint
+            .strip_suffix("/tts")
+            .unwrap_or(&config.endpoint)
+            .to_string();
+        self.tts_service_url = Some(base_url);
+        
+        let tts_impl = PiperHttpTts::new(config)
+            .map_err(|e| EngineError::new(format!("Failed to create PiperHttpTts: {}", e)))?;
+        
+        self.tts = Some(Arc::new(tts_impl));
+        Ok(self)
+    }
+
+    /// 使用自定义配置的 Piper HTTP TTS 服务初始化 TTS 模块
+    /// 
+    /// # Arguments
+    /// * `config` - Piper HTTP 配置
+    pub fn tts_with_piper_http(mut self, config: PiperHttpConfig) -> EngineResult<Self> {
+        // 保存服务 URL（用于健康检查）
+        let base_url = config.endpoint
+            .strip_suffix("/tts")
+            .unwrap_or(&config.endpoint)
+            .to_string();
+        self.tts_service_url = Some(base_url);
+        
+        let tts_impl = PiperHttpTts::new(config)
+            .map_err(|e| EngineError::new(format!("Failed to create PiperHttpTts: {}", e)))?;
+        
+        self.tts = Some(Arc::new(tts_impl));
+        Ok(self)
+    }
+
+    /// 使用 YourTTS HTTP 服务初始化 TTS 模块（支持零样本音色克隆）
+    /// 
+    /// # Arguments
+    /// * `config` - YourTTS HTTP 配置
+    pub fn tts_with_yourtts_http(mut self, config: YourTtsHttpConfig) -> EngineResult<Self> {
+        // 保存服务 URL（用于健康检查）
+        self.tts_service_url = Some(config.endpoint.clone());
+        
+        let tts_impl = YourTtsHttp::new(config)
+            .map_err(|e| EngineError::new(format!("Failed to create YourTtsHttp: {}", e)))?;
+        
+        self.tts = Some(Arc::new(tts_impl));
+        Ok(self)
+    }
+    
+    /// 设置回退 TTS 服务（当主 TTS 不支持某些语言时使用）
+    /// 
+    /// # Arguments
+    /// * `fallback_tts` - 回退 TTS 服务实例
+    pub fn with_fallback_tts(mut self, fallback_tts: Arc<dyn TtsStreaming>) -> Self {
+        self.fallback_tts = Some(fallback_tts);
+        self
+    }
+    
+    /// 启用文本后处理
+    /// 
+    /// # Arguments
+    /// * `terms_file` - 术语表文件路径（可选）
+    /// * `enabled` - 是否启用后处理
+    pub fn with_post_processing(mut self, terms_file: Option<&Path>, enabled: bool) -> Self {
+        let processor = TextPostProcessor::new(terms_file, enabled);
+        self.post_processor = Some(Arc::new(processor));
+        self
+    }
+    
+    /// 启用性能日志
+    /// 
+    /// # Arguments
+    /// * `enabled` - 是否启用性能日志
+    /// * `log_suspect` - 是否记录可疑翻译
+    pub fn with_performance_logging(mut self, enabled: bool, log_suspect: bool) -> Self {
+        let logger = PerformanceLogger::new(enabled, log_suspect);
+        self.perf_logger = Some(Arc::new(logger));
+        self
+    }
+    
+    /// 启用 TTS 增量播放
+    /// 
+    /// # Arguments
+    /// * `enabled` - 是否启用增量播放
+    /// * `buffer_sentences` - 缓冲的短句数量（0 = 立即播放，> 0 = 缓冲模式）
+    /// * `max_sentence_length` - 最大句子长度（字符）
+    pub fn with_tts_incremental_playback(
+        mut self,
+        enabled: bool,
+        buffer_sentences: usize,
+        max_sentence_length: usize,
+    ) -> Self {
+        if enabled {
+            // 使用支持逗号分割的分段器（用于在逗号处添加停顿）
+            let segmenter = TextSegmenter::new_with_comma_splitting(max_sentence_length);
+            self.text_segmenter = Some(Arc::new(segmenter));
+            self.tts_incremental_enabled = true;
+            self.tts_buffer_sentences = buffer_sentences;
+        }
+        self
+    }
+    
+    /// 启用 TTS 音频增强（fade in/out、停顿）
+    /// 
+    /// # Arguments
+    /// * `config` - 音频增强配置
+    pub fn with_audio_enhancement(mut self, config: AudioEnhancementConfig) -> Self {
+        let enhancer = AudioEnhancer::new(config);
+        self.audio_enhancer = Some(Arc::new(enhancer));
+        self
+    }
+    
+    /// 启用翻译质量检查
+    /// 
+    /// # Arguments
+    /// * `enabled` - 是否启用质量检查
+    pub fn with_translation_quality_check(mut self, enabled: bool) -> Self {
+        if enabled {
+            let checker = TranslationQualityChecker::new(true);
+            self.quality_checker = Some(Arc::new(checker));
+        }
+        self
+    }
+    
+    /// 启用连续输入输出模式
+    /// 
+    /// 在此模式下，系统会：
+    /// - 使用音频缓冲管理器累积音频帧
+    /// - 当 VAD 检测到边界时，异步处理当前片段
+    /// - 在处理当前片段的同时，继续接收新的音频输入
+    /// 
+    /// # Arguments
+    /// * `enabled` - 是否启用连续模式
+    /// * `max_buffer_duration_ms` - 最大缓冲时长（毫秒），防止缓冲区溢出
+    /// * `min_segment_duration_ms` - 最小片段时长（毫秒），防止过短片段
+    pub fn with_continuous_mode(
+        mut self,
+        enabled: bool,
+        max_buffer_duration_ms: u64,
+        min_segment_duration_ms: u64,
+    ) -> Self {
+        if enabled {
+            let buffer = AudioBufferManager::with_config(
+                max_buffer_duration_ms,
+                min_segment_duration_ms,
+            );
+            self.audio_buffer = Some(Arc::new(buffer));
+            self.continuous_mode = true;
+        }
+        self
+    }
+    
+    /// 启用 TTS 多说话者音色区分
+    /// 
+    /// 在此模式下，系统会为每个说话者分配不同的 TTS 音色（voice）
+    /// 实现第二阶段目标：TTS 多说话者音色区分
+    /// 
+    /// # Arguments
+    /// * `available_voices` - 可用的 voice 列表（例如：["zh_CN-huayan-medium", "zh_CN-xiaoyan-medium"]）
+    pub fn with_speaker_voice_mapping(
+        mut self,
+        available_voices: Vec<String>,
+    ) -> Self {
+        if !available_voices.is_empty() {
+            let mapper = SpeakerVoiceMapper::new(available_voices);
+            self.speaker_voice_mapper = Some(Arc::new(mapper));
+        }
+        self
+    }
+    
+    /// 启用说话者识别
+    /// 
+    /// 支持两种模式：
+    /// - VadBased: 基于 VAD 边界的简单模式（免费用户）
+    /// - EmbeddingBased: 基于 Speaker Embedding 的准确模式（付费用户）
+    /// 
+    /// # Arguments
+    /// * `mode` - 说话者识别模式
+    pub fn with_speaker_identification(
+        mut self,
+        mode: SpeakerIdentifierMode,
+    ) -> EngineResult<Self> {
+        let identifier: Arc<dyn SpeakerIdentifier> = match mode {
+            SpeakerIdentifierMode::VadBased { min_switch_interval_ms, max_same_speaker_interval_ms } => {
+                Arc::new(VadBasedSpeakerIdentifier::new(
+                    min_switch_interval_ms,
+                    max_same_speaker_interval_ms,
+                ))
+            }
+            SpeakerIdentifierMode::EmbeddingBased { service_url, similarity_threshold } => {
+                Arc::new(EmbeddingBasedSpeakerIdentifier::new(
+                    service_url,
+                    similarity_threshold,
+                )?)
+            }
+        };
+        
+        self.speaker_identifier = Some(identifier);
+        Ok(self)
+    }
+
+    pub fn build(self) -> EngineResult<CoreEngine> {
+        Ok(CoreEngine {
+            event_bus: self.event_bus.ok_or_else(|| EngineError::new("event_bus is missing"))?,
+            vad: self.vad.ok_or_else(|| EngineError::new("vad is missing"))?,
+            asr: self.asr.ok_or_else(|| EngineError::new("asr is missing"))?,
+            nmt: self.nmt.ok_or_else(|| EngineError::new("nmt is missing"))?,
+            emotion: self.emotion.ok_or_else(|| EngineError::new("emotion is missing"))?,
+            persona: self.persona.ok_or_else(|| EngineError::new("persona is missing"))?,
+            tts: self.tts.ok_or_else(|| EngineError::new("tts is missing"))?,
+            fallback_tts: self.fallback_tts,
+            config: self.config.ok_or_else(|| EngineError::new("config is missing"))?,
+            cache: self.cache.ok_or_else(|| EngineError::new("cache is missing"))?,
+            telemetry: self.telemetry.ok_or_else(|| EngineError::new("telemetry is missing"))?,
+            post_processor: self.post_processor,
+            perf_logger: self.perf_logger,
+            text_segmenter: self.text_segmenter,
+            audio_enhancer: self.audio_enhancer,
+            quality_checker: self.quality_checker,
+            nmt_service_url: self.nmt_service_url,
+            tts_service_url: self.tts_service_url,
+            tts_incremental_enabled: self.tts_incremental_enabled,
+            tts_buffer_sentences: self.tts_buffer_sentences,
+            audio_buffer: self.audio_buffer,
+            continuous_mode: self.continuous_mode,
+            speaker_voice_mapper: self.speaker_voice_mapper,
+            speaker_identifier: self.speaker_identifier,
+        })
+    }
+}
+
+impl CoreEngine {
+    pub async fn boot(&self) -> EngineResult<()> {
+        self.event_bus.start().await?;
+        let config = self.config.load().await?;
+        self.cache.warm_up().await?;
+        self.asr.initialize().await?;
+        self.nmt.initialize().await?;
+        
+        // 健康检查：检查 NMT 和 TTS 服务（带重试机制，等待服务就绪）
+        if let (Some(nmt_url), Some(tts_url)) = (&self.nmt_service_url, &self.tts_service_url) {
+            let checker = HealthChecker::new();
+            
+            // 等待服务就绪，最多重试 15 次，每次间隔 1 秒（总共最多 15 秒）
+            const MAX_RETRIES: u32 = 15;
+            const RETRY_DELAY_MS: u64 = 1000;
+            
+            let mut nmt_healthy = false;
+            let mut tts_healthy = false;
+            let mut final_attempt = 0;
+            
+            eprintln!("[INFO] Waiting for NMT and TTS services to be ready...");
+            
+            for attempt in 1..=MAX_RETRIES {
+                final_attempt = attempt;
+                let (nmt_health, tts_health) = checker.check_all_services(nmt_url, tts_url).await;
+                
+                nmt_healthy = nmt_health.is_healthy;
+                tts_healthy = tts_health.is_healthy;
+                
+                if nmt_healthy && tts_healthy {
+                    // 所有服务都健康，退出重试循环
+                    break;
+                }
+                
+                if attempt < MAX_RETRIES {
+                    // 等待后重试（不打印中间结果，避免日志混乱）
+                    tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                }
+            }
+            
+            // 报告最终状态
+            if nmt_healthy {
+                eprintln!("[INFO] NMT service health check passed: {} (attempt {}/{})", nmt_url, final_attempt, MAX_RETRIES);
+            } else {
+                eprintln!("[WARN] NMT service is not healthy after {} attempts: {} - Please ensure the service is running", final_attempt, nmt_url);
+                // 不阻止启动，但记录警告
+            }
+            
+            if tts_healthy {
+                eprintln!("[INFO] TTS service health check passed: {} (attempt {}/{})", tts_url, final_attempt, MAX_RETRIES);
+            } else {
+                eprintln!("[WARN] TTS service is not healthy after {} attempts: {} - Please ensure the service is running", final_attempt, tts_url);
+                // 不阻止启动，但记录警告
+            }
+        }
+        
+        self.telemetry
+            .record(TelemetryDatum {
+                name: "core_engine.boot".to_string(),
+                value: 1.0,
+                unit: "count".to_string(),
+            })
+            .await?;
+        self.telemetry
+            .record(TelemetryDatum {
+                name: format!("core_engine.mode.{}", config.mode),
+                value: 1.0,
+                unit: "count".to_string(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn shutdown(&self) -> EngineResult<()> {
+        self.asr.finalize().await?;
+        self.nmt.finalize().await?;
+        self.tts.close().await?;
+        self.cache.purge().await?;
+        self.event_bus.stop().await?;
+        self.telemetry
+            .record(TelemetryDatum {
+                name: "core_engine.shutdown".to_string(),
+                value: 1.0,
+                unit: "count".to_string(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// 处理音频帧（完整业务流程：VAD → ASR → NMT → 事件发布）
+    /// 
+    /// 流程：
+    /// 1. 通过 VAD 检测语音活动
+    /// 2. 如果检测到语音，累积到 ASR 缓冲区
+    /// 3. 如果检测到语音边界（is_boundary），触发 ASR 推理
+    /// 4. 如果 ASR 返回最终结果，自动触发 NMT 翻译
+    /// 5. 发布事件到 EventBus（ASR 部分结果、ASR 最终结果、翻译结果）
+    /// 
+    /// # Arguments
+    /// * `frame` - 音频帧
+    /// * `language_hint` - 语言提示（可选）
+    /// 
+    /// # Returns
+    /// 返回处理结果（包含 ASR 和 NMT 结果）
+    pub async fn process_audio_frame(
+        &self,
+        frame: crate::types::AudioFrame,
+        language_hint: Option<String>,
+    ) -> EngineResult<Option<ProcessResult>> {
+        // 如果启用了连续模式，使用连续处理逻辑
+        if self.continuous_mode {
+            return self.process_audio_frame_continuous(frame, language_hint).await;
+        }
+        
+        // 原有的处理逻辑（非连续模式）
+        // 性能日志：记录总耗时
+        let total_start = Instant::now();
+        let request_id = Uuid::new_v4().to_string();
+        
+        // 1. 通过 VAD 检测语音活动
+        let vad_result = self.vad.detect(frame).await?;
+
+        // 2. 累积音频帧到 ASR 缓冲区
+        // 尝试将 ASR 转换为 WhisperAsrStreaming
+        let asr_ptr = Arc::as_ptr(&self.asr);
+        let whisper_asr_ptr = asr_ptr as *const WhisperAsrStreaming;
+        
+        unsafe {
+            let whisper_asr_ref = whisper_asr_ptr.as_ref();
+            if let Some(whisper_asr) = whisper_asr_ref {
+                // 2.1. 如果提供了语言提示，设置 ASR 语言
+                // 只在第一次或语言改变时设置语言，避免每帧都设置（减少日志）
+                static LAST_LANGUAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+                if let Some(ref lang_hint) = language_hint {
+                    // 将语言代码标准化（例如 "zh-CN" -> "zh"）
+                    let normalized_lang = if lang_hint.starts_with("zh") {
+                        Some("zh".to_string())
+                    } else if lang_hint.starts_with("en") {
+                        Some("en".to_string())
+                    } else {
+                        Some(lang_hint.clone())
+                    };
+                    
+                    // 检查语言是否改变
+                    let mut last_lang = LAST_LANGUAGE.lock().unwrap();
+                    let should_set = last_lang.as_ref() != normalized_lang.as_ref();
+                    if should_set {
+                        if let Err(e) = whisper_asr.set_language(normalized_lang.clone()) {
+                        eprintln!("[ASR] Warning: Failed to set language: {}", e);
+                        } else {
+                            *last_lang = normalized_lang;
+                        }
+                    }
+                }
+                
+                // 累积帧
+                whisper_asr.accumulate_frame(vad_result.frame.clone())?;
+                
+                // 3. 如果检测到语音边界，触发 ASR 推理（返回最终结果）
+                if vad_result.is_boundary {
+                    // 3.1. 识别说话者（如果启用了说话者识别）
+                    // 在非连续模式下，从 ASR 缓冲区获取累积的音频片段
+                    let (speaker_result, speaker_embedding_ms) = if let Some(ref identifier) = self.speaker_identifier {
+                        let speaker_start = Instant::now();
+                        eprintln!("[SPEAKER] ===== Speaker Identification Started =====");
+                        eprintln!("[SPEAKER] Boundary detected at timestamp: {}ms (confidence: {:.3})", 
+                                 vad_result.frame.timestamp_ms, vad_result.confidence);
+                        
+                        // 从 ASR 缓冲区获取累积的音频帧（用于说话者识别）
+                        // 过滤掉静音帧，只使用包含语音的帧
+                        let all_frames = whisper_asr.get_accumulated_frames()
+                            .unwrap_or_else(|e| {
+                                eprintln!("[SPEAKER] ⚠ Warning: Failed to get accumulated frames: {}, using current frame only", e);
+                                vec![vad_result.frame.clone()]
+                            });
+                        
+                        // 尝试从 VAD 获取上一个语音帧的时间戳，用于过滤静音帧
+                        let last_speech_ts = {
+                            let vad_ptr = Arc::as_ptr(&self.vad);
+                            let silero_vad_ptr = vad_ptr as *const crate::vad::SileroVad;
+                            unsafe {
+                                if let Some(silero_vad) = silero_vad_ptr.as_ref() {
+                                    silero_vad.get_last_speech_timestamp()
+                                } else {
+                                    None
+                                }
+                            }
+                        };
+                        
+                        // 过滤音频帧：只保留包含语音的帧（在最后一个语音帧之前的帧）
+                        // 如果无法确定，则使用所有帧（除了明显的静音帧）
+                        let audio_frames: Vec<_> = if let Some(speech_ts) = last_speech_ts {
+                            // 只使用最后一个语音帧之前的帧（排除静音帧）
+                            all_frames.iter()
+                                .filter(|f| f.timestamp_ms <= speech_ts)
+                                .cloned()
+                                .collect()
+                        } else {
+                            // 如果无法确定，使用所有帧（但排除当前边界帧，因为它可能是静音）
+                            // 保留除了最后一个边界帧之外的所有帧
+                            if all_frames.len() > 1 {
+                                all_frames[..all_frames.len() - 1].to_vec()
+                            } else {
+                                all_frames.clone()
+                            }
+                        };
+                        
+                        // 计算过滤后的音频时长
+                        let filtered_duration_ms = if !audio_frames.is_empty() {
+                            let total_samples: usize = audio_frames.iter().map(|f| f.data.len()).sum();
+                            let sample_rate = audio_frames[0].sample_rate;
+                            (total_samples as f32 / sample_rate as f32 * 1000.0) as u64
+                        } else {
+                            0
+                        };
+                        
+                        // 如果过滤后的音频太短（< 1000ms），使用所有帧（包括静音帧）
+                        // 这样可以确保说话者识别能获取到足够长的音频
+                        let final_audio_frames = if filtered_duration_ms < 1000 && !all_frames.is_empty() {
+                            eprintln!("[SPEAKER] ⚠ Filtered audio too short ({}ms < 1000ms), using all frames (including silence) to ensure sufficient length", filtered_duration_ms);
+                            // 使用所有帧，但排除最后一个边界帧（因为它可能是纯静音）
+                            if all_frames.len() > 1 {
+                                all_frames[..all_frames.len() - 1].to_vec()
+                            } else {
+                                all_frames.clone()
+                            }
+                        } else if !audio_frames.is_empty() {
+                            audio_frames
+                        } else {
+                            eprintln!("[SPEAKER] ⚠ Warning: No speech frames found after filtering, using all frames as fallback");
+                            all_frames.clone()
+                        };
+                        
+                        // 计算输入音频的总时长
+                        if !final_audio_frames.is_empty() {
+                            let total_samples: usize = final_audio_frames.iter().map(|f| f.data.len()).sum();
+                            let sample_rate = final_audio_frames[0].sample_rate;
+                            let total_duration_ms = (total_samples as f32 / sample_rate as f32 * 1000.0) as u64;
+                            let total_duration_sec = total_samples as f32 / sample_rate as f32;
+                            eprintln!("[SPEAKER] Input audio: {} frames (filtered from {} total), {} samples, {:.2}s ({:.0}ms) at {}Hz", 
+                                     final_audio_frames.len(), all_frames.len(), total_samples, total_duration_sec, total_duration_ms, sample_rate);
+                            
+                            // 如果过滤后的音频仍然太短，记录警告
+                            if total_duration_ms < 1000 {
+                                eprintln!("[SPEAKER] ⚠ Warning: Filtered audio is still too short ({}ms < 1000ms required for speaker embedding). History buffer may need more time to accumulate.", total_duration_ms);
+                            }
+                        } else {
+                            eprintln!("[SPEAKER] ⚠ Warning: No frames available for speaker identification");
+                        }
+                        
+                        let audio_frames = final_audio_frames;
+                        
+                        let result = identifier.identify_speaker(&audio_frames, vad_result.frame.timestamp_ms).await;
+                        let speaker_ms = speaker_start.elapsed().as_millis() as u64;
+                        
+                        match result {
+                            Ok(speaker_result) => {
+                                eprintln!("[SPEAKER] ✅ Identified speaker: {} (is_new: {}, confidence: {:.2})", 
+                                    speaker_result.speaker_id, speaker_result.is_new_speaker, speaker_result.confidence);
+                                eprintln!("[SPEAKER] Voice embedding: {} (dim: {})", 
+                                    if speaker_result.voice_embedding.is_some() { "Yes" } else { "No" },
+                                    speaker_result.voice_embedding.as_ref().map(|v| v.len()).unwrap_or(0));
+                                eprintln!("[SPEAKER] Reference audio: {} (samples: {})", 
+                                    if speaker_result.reference_audio.is_some() { "Yes" } else { "No" },
+                                    speaker_result.reference_audio.as_ref().map(|a| a.len()).unwrap_or(0));
+                                
+                                // 设置当前说话者ID（用于VAD自适应调整）
+                                self.set_vad_current_speaker(Some(&speaker_result.speaker_id));
+                                eprintln!("[SPEAKER] ⏱️  Speaker identification completed in {}ms", speaker_ms);
+                                eprintln!("[SPEAKER] ==============================================");
+                                (Some(speaker_result), Some(speaker_ms))
+                            }
+                            Err(e) => {
+                                eprintln!("[SPEAKER] ❌ Identification failed after {}ms: {}", speaker_ms, e);
+                                eprintln!("[SPEAKER] ==============================================");
+                                (None, Some(speaker_ms))
+                            }
+                        }
+                    } else {
+                        (None, None)
+                    };
+                    
+                    let speaker_id = speaker_result.as_ref().map(|r| r.speaker_id.clone());
+                    let _voice_embedding = speaker_result.as_ref().and_then(|r| r.voice_embedding.clone());
+                    let reference_audio = speaker_result.as_ref().and_then(|r| r.reference_audio.clone());
+                    
+                    // 立即开始 ASR 转录（使用已累积的音频）
+                    // 注意：在检测到边界后立即开始处理，不等待后续音频输入
+                    // 这样可以实现流式处理：用户说完话后立即开始翻译，无需等待完整音频
+                    // 对于手机端 AEC（声学回响消除）场景，这可以显著减少延迟
+                    let asr_start = Instant::now();
+                    eprintln!("[ASR] 🚀 Starting transcription immediately after boundary detection...");
+                    let asr_result = whisper_asr.infer_on_boundary().await?;
+                    let asr_ms = asr_start.elapsed().as_millis() as u64;
+                    eprintln!("[ASR] ✅ Transcription completed in {}ms", asr_ms);
+                    
+                    // 打印 ASR 结果
+                    if let Some(ref partial) = asr_result.partial {
+                        eprintln!("[ASR] 📝 Partial transcript: \"{}\" (confidence: {:.2})", partial.text, partial.confidence);
+                    }
+                    if let Some(ref final_transcript) = asr_result.final_transcript {
+                        eprintln!("[ASR] ✅ Final transcript: \"{}\" (language: {}, speaker_id: {:?})", 
+                                 final_transcript.text, final_transcript.language, final_transcript.speaker_id);
+                    }
+                    
+                    // 3.5. 过滤无意义的 ASR 结果（在进入翻译/TTS 之前）
+                    if let Some(ref final_transcript) = asr_result.final_transcript {
+                        if Self::is_meaningless_transcript(&final_transcript.text) {
+                            eprintln!("[ASR] ⛔ Filtered meaningless transcript: \"{}\" (skipping translation/TTS)", final_transcript.text);
+                            // 直接返回，不进入后续处理
+                            return Ok(Some(ProcessResult {
+                                asr: asr_result,
+                                emotion: None,
+                                translation: None,
+                                tts: None,
+                            }));
+                        }
+                    }
+                    
+                    // 4. 发布 ASR 最终结果事件（包含 speaker_id）
+                    // 4.1. 更新语速（如果启用了自适应VAD）
+                    if let Some(ref final_transcript) = asr_result.final_transcript {
+                        if let Some(ref sid) = speaker_id {
+                            // 计算音频时长（从ASR缓冲区获取）
+                            let audio_frames = whisper_asr.get_accumulated_frames()
+                                .unwrap_or_else(|_| vec![]);
+                            if !audio_frames.is_empty() {
+                                let total_samples: usize = audio_frames.iter().map(|f| f.data.len()).sum();
+                                let sample_rate = audio_frames[0].sample_rate;
+                                let audio_duration_ms = (total_samples as f32 / sample_rate as f32 * 1000.0) as u64;
+                                
+                                // 更新VAD中的说话者语速
+                                self.update_vad_speaker_speech_rate(sid, &final_transcript.text, audio_duration_ms);
+                            }
+                        }
+                        
+                        // 更新 final_transcript 的 speaker_id
+                        let mut transcript_with_speaker = final_transcript.clone();
+                        transcript_with_speaker.speaker_id = speaker_id.clone();
+                        self.publish_asr_final_event(&transcript_with_speaker, vad_result.frame.timestamp_ms).await?;
+                    }
+                    
+                    // 5. 如果 ASR 返回最终结果，进行 Emotion 分析、Persona 个性化，然后触发 NMT 翻译
+                    let (emotion_result, translation_result, tts_result, _nmt_ms, _tts_ms) = if let Some(ref final_transcript) = asr_result.final_transcript {
+                        // 5.1. Emotion 情感分析
+                        let emotion_result = self.analyze_emotion(final_transcript, vad_result.frame.timestamp_ms).await.ok();
+                        
+                        // 5.2. 应用 Persona 个性化
+                        let personalized_transcript = self.personalize_transcript(final_transcript).await?;
+                        
+                        // 5.3. 立即开始翻译（流式处理：ASR 完成后立即翻译，不等待）
+                        // 这样可以实现：用户说完话 → 立即开始翻译 → 立即开始 TTS → 立即听到第一段话
+                        // 对于手机端 AEC 场景，这可以显著减少端到端延迟
+                        let mut personalized_with_speaker = personalized_transcript;
+                        personalized_with_speaker.speaker_id = speaker_id.clone();
+                        // 计算原始音频时长（用于后续计算每个 segment 的语速）
+                        let source_audio_duration_ms = if let Some(ref _final_transcript) = asr_result.final_transcript {
+                            let audio_frames = whisper_asr.get_accumulated_frames()
+                                .unwrap_or_else(|_| vec![]);
+                            if !audio_frames.is_empty() {
+                                let total_samples: usize = audio_frames.iter().map(|f| f.data.len()).sum();
+                                let sample_rate = audio_frames[0].sample_rate;
+                                Some((total_samples as f32 / sample_rate as f32 * 1000.0) as u64)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        
+                        let nmt_start = Instant::now();
+                        eprintln!("[NMT] 🚀 Starting translation immediately after ASR...");
+                        let mut translation_result = self.translate_and_publish(&personalized_with_speaker, vad_result.frame.timestamp_ms).await.ok();
+                        
+                        // 将原始音频信息添加到翻译结果中（用于计算每个 segment 的语速）
+                        if let Some(ref mut translation) = translation_result {
+                            if let Some(ref final_transcript) = asr_result.final_transcript {
+                                translation.source_audio_duration_ms = source_audio_duration_ms;
+                                translation.source_text = Some(final_transcript.text.clone());
+                            }
+                        }
+                        
+                        let nmt_ms = nmt_start.elapsed().as_millis() as u64;
+                        eprintln!("[NMT] ✅ Translation completed in {}ms", nmt_ms);
+                        
+                        // 5.4. 立即开始 TTS 合成（流式处理：翻译完成后立即合成）
+                        // 这样用户可以在说完话后立即听到第一段翻译结果
+                        let (tts_result, tts_ms, yourtts_ms) = if let Some(ref translation) = translation_result {
+                            let tts_start = Instant::now();
+                            eprintln!("[TTS] 🚀 Starting synthesis immediately after translation...");
+                            match self.synthesize_and_publish(translation, vad_result.frame.timestamp_ms, reference_audio.clone()).await {
+                                Ok((result, yt_ms)) => {
+                                    let tts_ms = tts_start.elapsed().as_millis() as u64;
+                                    eprintln!("[TTS] Synthesis completed in {}ms (audio size: {} bytes)", tts_ms, result.audio.len());
+                                    (Some(result), tts_ms, yt_ms)
+                                }
+                                Err(e) => {
+                                    let tts_ms = tts_start.elapsed().as_millis() as u64;
+                                    eprintln!("[TTS] Synthesis failed in {}ms: {}", tts_ms, e);
+                                    (None, tts_ms, None)
+                                }
+                            }
+                        } else {
+                            eprintln!("[TTS] Skipped (no translation result)");
+                            (None, 0, None)
+                        };
+                        
+                        // 性能日志记录
+                        let total_ms = total_start.elapsed().as_millis() as u64;
+                        eprintln!("[PERF] ===== Pipeline timing summary =====");
+                        if let Some(se_ms) = speaker_embedding_ms {
+                            eprintln!("[PERF] Speaker Embedding: {}ms", se_ms);
+                        }
+                        eprintln!("[PERF] ASR:                {}ms", asr_ms);
+                        eprintln!("[PERF] NMT:                {}ms", nmt_ms);
+                        eprintln!("[PERF] TTS:                {}ms", tts_ms);
+                        eprintln!("[PERF] Total:              {}ms", total_ms);
+                        eprintln!("[PERF] Note: Adaptive VAD overhead < 0.2ms (not shown separately)");
+                        if let Some(yt_ms) = yourtts_ms {
+                            eprintln!("[PERF] YourTTS:            {}ms", yt_ms);
+                        }
+                        eprintln!("[PERF] Total:              {}ms", total_ms);
+                        eprintln!("[PERF] =====================================");
+                        
+                        if let Some(ref logger) = self.perf_logger {
+                            let config = self.config.current().await.ok();
+                            let src_lang = final_transcript.language.clone();
+                            let tgt_lang = config.as_ref().map(|c| c.target_language.clone()).unwrap_or_else(|| "zh".to_string());
+                            
+                            let mut perf_log = PerformanceLog::new(
+                                request_id.clone(),
+                                src_lang,
+                                tgt_lang,
+                                asr_ms,
+                                nmt_ms,
+                                tts_ms,
+                                total_ms,
+                                translation_result.is_some(),
+                            );
+                            
+                            if let Some(ref translation) = translation_result {
+                                perf_log.check_suspect_translation(&final_transcript.text, &translation.translated_text);
+                            }
+                            
+                            logger.log(&perf_log);
+                        }
+                        
+                        (emotion_result, translation_result, tts_result, nmt_ms, tts_ms)
+                    } else {
+                        (None, None, None, 0, 0)
+                    };
+                    
+                    return Ok(Some(ProcessResult {
+                        asr: asr_result,
+                        emotion: emotion_result,
+                        translation: translation_result,
+                        tts: tts_result,
+                    }));
+                } else {
+                    // 未检测到边界，检查是否需要输出部分结果（如果启用流式推理）
+                    if whisper_asr.is_streaming_enabled() {
+                        if let Some(partial) = whisper_asr.infer_partial(vad_result.frame.timestamp_ms).await? {
+                            // 发布 ASR 部分结果事件
+                            self.publish_asr_partial_event(&partial, vad_result.frame.timestamp_ms).await?;
+                            
+                            return Ok(Some(ProcessResult {
+                                asr: AsrResult {
+                                    partial: Some(partial),
+                                    final_transcript: None,
+                                },
+                                emotion: None,
+                                translation: None,
+                                tts: None,
+                            }));
+                        }
+                    }
+                    // 不需要输出部分结果，返回 None
+                    return Ok(None);
+                }
+            } else {
+                // 如果不是 WhisperAsrStreaming，使用原来的 infer 方法
+                // 在移动 frame 之前保存需要的信息
+                let frame_timestamp = vad_result.frame.timestamp_ms;
+                let frame_data_len = vad_result.frame.data.len();
+                let frame_sample_rate = vad_result.frame.sample_rate;
+                let asr_result = self.asr.infer(crate::asr_streaming::AsrRequest {
+                    frame: vad_result.frame,
+                    language_hint: language_hint.clone(),
+                }).await?;
+                
+                // 打印 ASR 结果
+                if let Some(ref partial) = asr_result.partial {
+                    eprintln!("[ASR] 📝 Partial transcript: \"{}\" (confidence: {:.2})", partial.text, partial.confidence);
+                }
+                if let Some(ref final_transcript) = asr_result.final_transcript {
+                    eprintln!("[ASR] ✅ Final transcript: \"{}\" (language: {}, speaker_id: {:?})", 
+                             final_transcript.text, final_transcript.language, final_transcript.speaker_id);
+                }
+                
+                // 过滤无意义的 ASR 结果（在进入翻译/TTS 之前）
+                if let Some(ref final_transcript) = asr_result.final_transcript {
+                    if Self::is_meaningless_transcript(&final_transcript.text) {
+                        eprintln!("[ASR] ⛔ Filtered meaningless transcript: \"{}\" (skipping translation/TTS)", final_transcript.text);
+                        // 直接返回，不进入后续处理
+                        return Ok(Some(ProcessResult {
+                            asr: asr_result,
+                            emotion: None,
+                            translation: None,
+                            tts: None,
+                        }));
+                    }
+                }
+                
+                // 如果检测到边界且有最终结果，进行 Emotion 分析、Persona 个性化，然后触发翻译
+                if vad_result.is_boundary {
+                    if let Some(ref final_transcript) = asr_result.final_transcript {
+                        self.publish_asr_final_event(final_transcript, frame_timestamp).await?;
+                        
+                        // Emotion 情感分析
+                        let emotion_result = self.analyze_emotion(final_transcript, frame_timestamp).await.ok();
+                        
+                        // 应用 Persona 个性化
+                        let personalized_transcript = self.personalize_transcript(final_transcript).await?;
+                        
+                        // 计算原始音频时长（用于后续计算每个 segment 的语速）
+                        let source_audio_duration_ms = {
+                            Some((frame_data_len as f32 / frame_sample_rate as f32 * 1000.0) as u64)
+                        };
+                        
+                        // 使用个性化后的 transcript 进行翻译
+                        let mut translation_result = self.translate_and_publish(&personalized_transcript, frame_timestamp).await.ok();
+                        
+                        // 将原始音频信息添加到翻译结果中（用于计算每个 segment 的语速）
+                        if let Some(ref mut translation) = translation_result {
+                            if let Some(ref final_transcript) = asr_result.final_transcript {
+                                translation.source_audio_duration_ms = source_audio_duration_ms;
+                                translation.source_text = Some(final_transcript.text.clone());
+                            }
+                        }
+                        
+                        // 如果翻译成功，进行 TTS 合成
+                        let tts_result = if let Some(ref translation) = translation_result {
+                            self.synthesize_and_publish(translation, frame_timestamp, None).await.ok().map(|(chunk, _)| chunk)
+                        } else {
+                            None
+                        };
+                        
+                        return Ok(Some(ProcessResult {
+                            asr: asr_result,
+                            emotion: emotion_result,
+                            translation: translation_result,
+                            tts: tts_result,
+                        }));
+                    }
+                }
+                
+                // 如果有部分结果，发布事件
+                if let Some(ref partial) = asr_result.partial {
+                    self.publish_asr_partial_event(partial, frame_timestamp).await?;
+                }
+                
+                return Ok(Some(ProcessResult {
+                    asr: asr_result,
+                    emotion: None,
+                    translation: None,
+                    tts: None,
+                }));
+            }
+        }
+    }
+
+    /// 处理音频帧（连续输入输出模式）
+    /// 
+    /// 在此模式下：
+    /// 1. 将音频帧添加到缓冲区
+    /// 2. 通过 VAD 检测边界
+    /// 3. 如果检测到边界，异步处理当前片段（不阻塞音频接收）
+    /// 4. 继续接收新的音频输入
+    async fn process_audio_frame_continuous(
+        &self,
+        frame: crate::types::AudioFrame,
+        language_hint: Option<String>,
+    ) -> EngineResult<Option<ProcessResult>> {
+        // 获取音频缓冲管理器
+        let buffer = self.audio_buffer.as_ref()
+            .ok_or_else(|| EngineError::new("Audio buffer not initialized in continuous mode"))?;
+        
+        // 保存 frame 的 timestamp（在移动之前）
+        let current_frame_timestamp = frame.timestamp_ms;
+        
+        // 1. 将帧添加到缓冲区
+        match buffer.push_frame(frame.clone()).await {
+            Ok(()) => {
+                // 正常添加
+            }
+            Err(e) => {
+                // 缓冲区溢出，强制截断
+                eprintln!("[VAD] Buffer overflow detected, forcing boundary: {}", e);
+                // 继续执行下面的边界检测逻辑
+            }
+        }
+        
+        // 2. VAD 检测
+        let vad_result = self.vad.detect(frame).await?;
+        
+        // 3. 如果检测到边界，提交当前缓冲区
+        if vad_result.is_boundary {
+            // 检查最小片段时长
+            if !buffer.check_min_duration().await {
+                // 片段太短，继续累积
+                eprintln!("[VAD] Segment too short, continuing accumulation");
+                return Ok(None);
+            }
+            
+            // 获取当前缓冲区的所有帧
+            let frames = buffer.take_current_buffer().await;
+            
+            if frames.is_empty() {
+                return Ok(None);
+            }
+            
+            // 切换到下一个缓冲区（继续接收新音频）
+            buffer.swap_buffers().await;
+            
+            // 合并所有帧为单个音频数据
+            let merged_audio = merge_frames(&frames);
+            
+            // 创建合并后的 AudioFrame
+            let merged_frame = crate::types::AudioFrame {
+                sample_rate: frames[0].sample_rate,
+                channels: frames[0].channels,
+                data: merged_audio,
+                timestamp_ms: frames[0].timestamp_ms,
+            };
+            
+            // 识别说话者（如果启用了说话者识别）
+            let boundary_timestamp = frames.last().map(|f| f.timestamp_ms).unwrap_or(current_frame_timestamp);
+            let (speaker_result, speaker_embedding_ms) = if let Some(ref identifier) = self.speaker_identifier {
+                let speaker_start = Instant::now();
+                eprintln!("[SPEAKER] ===== Speaker Identification Started =====");
+                eprintln!("[SPEAKER] Boundary timestamp: {}ms", boundary_timestamp);
+                
+                // 计算输入音频的总时长
+                let total_samples: usize = frames.iter().map(|f| f.data.len()).sum();
+                let sample_rate = frames.first().map(|f| f.sample_rate).unwrap_or(16000);
+                let total_duration_ms = (total_samples as f32 / sample_rate as f32 * 1000.0) as u64;
+                let total_duration_sec = total_samples as f32 / sample_rate as f32;
+                eprintln!("[SPEAKER] Input audio: {} frames, {} samples, {:.2}s ({:.0}ms) at {}Hz", 
+                         frames.len(), total_samples, total_duration_sec, total_duration_ms, sample_rate);
+                
+                let result = identifier.identify_speaker(&frames, boundary_timestamp).await;
+                let speaker_ms = speaker_start.elapsed().as_millis() as u64;
+                
+                match result {
+                    Ok(speaker_result) => {
+                        eprintln!("[SPEAKER] ✅ Identified speaker: {} (is_new: {}, confidence: {:.2})", 
+                            speaker_result.speaker_id, speaker_result.is_new_speaker, speaker_result.confidence);
+                        eprintln!("[SPEAKER] Voice embedding: {} (dim: {})", 
+                            if speaker_result.voice_embedding.is_some() { "Yes" } else { "No" },
+                            speaker_result.voice_embedding.as_ref().map(|v| v.len()).unwrap_or(0));
+                        eprintln!("[SPEAKER] Reference audio: {} (samples: {})", 
+                            if speaker_result.reference_audio.is_some() { "Yes" } else { "No" },
+                            speaker_result.reference_audio.as_ref().map(|a| a.len()).unwrap_or(0));
+                        eprintln!("[SPEAKER] ⏱️  Speaker identification completed in {}ms", speaker_ms);
+                        eprintln!("[SPEAKER] ==============================================");
+                        
+                        // 设置当前说话者ID（用于VAD自适应调整）
+                        self.set_vad_current_speaker(Some(&speaker_result.speaker_id));
+                        
+                        (Some(speaker_result), Some(speaker_ms))
+                    }
+                    Err(e) => {
+                        eprintln!("[SPEAKER] ❌ Identification failed after {}ms: {}", speaker_ms, e);
+                        eprintln!("[SPEAKER] ==============================================");
+                        (None, Some(speaker_ms))
+                    }
+                }
+            } else {
+                eprintln!("[SPEAKER] Speaker identification disabled");
+                (None, None)
+            };
+            
+            let speaker_id = speaker_result.as_ref().map(|r| r.speaker_id.clone());
+            let voice_embedding = speaker_result.as_ref().and_then(|r| r.voice_embedding.clone());
+            let reference_audio = speaker_result.as_ref().and_then(|r| r.reference_audio.clone());
+            
+            // 异步处理当前片段（不阻塞音频接收）
+            // 克隆所有需要的组件用于异步任务
+            let engine_clone = self.clone();
+            let language_hint_clone = language_hint.clone();
+            
+            eprintln!("[CONTINUOUS] Processing segment asynchronously (frame count: {}, duration: {}ms, speaker_id: {:?})...", 
+                frames.len(), 
+                frames.last().map(|f| f.timestamp_ms - frames[0].timestamp_ms).unwrap_or(0),
+                speaker_id
+            );
+            
+            tokio::spawn(async move {
+                let _result = engine_clone.process_audio_segment(
+                    merged_frame,
+                    language_hint_clone,
+                    speaker_id,
+                    voice_embedding,
+                    reference_audio,
+                    speaker_embedding_ms,
+                ).await;
+            });
+            
+            // 立即返回，继续接收新音频
+            return Ok(None);
+        }
+        
+        // 4. 未检测到边界，继续累积
+        Ok(None)
+    }
+    
+    /// 处理音频片段（ASR → NMT → TTS）
+    /// 
+    /// 这是从连续处理模式中分离出来的方法，用于异步处理音频片段
+    async fn process_audio_segment(
+        &self,
+        frame: crate::types::AudioFrame,
+        language_hint: Option<String>,
+        speaker_id: Option<String>,
+        _voice_embedding: Option<Vec<f32>>,
+        reference_audio: Option<Vec<f32>>,
+        speaker_embedding_ms: Option<u64>,
+    ) -> EngineResult<Option<ProcessResult>> {
+        // 使用原有的 process_audio_frame 逻辑，但需要先通过 VAD 检测
+        // 由于我们已经有了完整的音频片段，这里需要特殊处理
+        
+        // 性能日志：记录总耗时
+        let total_start = Instant::now();
+        let request_id = Uuid::new_v4().to_string();
+        
+        // 对于连续模式，我们需要将整个片段传递给 ASR
+        // 这里简化处理：将整个片段作为一个边界帧处理
+        let asr_ptr = Arc::as_ptr(&self.asr);
+        let whisper_asr_ptr = asr_ptr as *const WhisperAsrStreaming;
+        
+        unsafe {
+            let whisper_asr_ref = whisper_asr_ptr.as_ref();
+            if let Some(whisper_asr) = whisper_asr_ref {
+                // 设置语言
+                if let Some(ref lang_hint) = language_hint {
+                    let normalized_lang = if lang_hint.starts_with("zh") {
+                        Some("zh".to_string())
+                    } else if lang_hint.starts_with("en") {
+                        Some("en".to_string())
+                    } else {
+                        Some(lang_hint.clone())
+                    };
+                    if let Err(e) = whisper_asr.set_language(normalized_lang) {
+                        eprintln!("[ASR] Warning: Failed to set language: {}", e);
+                    }
+                }
+                
+                // 将整个片段添加到 ASR（这里需要将片段分割成多个帧）
+                // 简化：直接使用 infer 方法处理整个片段
+                let asr_start = Instant::now();
+                eprintln!("[ASR] Starting transcription (continuous mode)...");
+                
+                // 使用 infer 方法处理整个片段
+                let frame_clone = frame.clone();
+                let asr_result = self.asr.infer(crate::asr_streaming::AsrRequest {
+                    frame: frame_clone,
+                    language_hint: language_hint.clone(),
+                }).await?;
+                
+                let asr_ms = asr_start.elapsed().as_millis() as u64;
+                eprintln!("[ASR] Transcription completed in {}ms", asr_ms);
+                
+                // 打印 ASR 结果
+                if let Some(ref partial) = asr_result.partial {
+                    eprintln!("[ASR] 📝 Partial transcript: \"{}\" (confidence: {:.2})", partial.text, partial.confidence);
+                }
+                if let Some(ref final_transcript) = asr_result.final_transcript {
+                    eprintln!("[ASR] ✅ Final transcript: \"{}\" (language: {}, speaker_id: {:?})", 
+                             final_transcript.text, final_transcript.language, final_transcript.speaker_id);
+                }
+                
+                // 发布 ASR 最终结果事件
+                if let Some(mut final_transcript) = asr_result.final_transcript.clone() {
+                    // 设置说话者 ID（如果已识别）
+                    if final_transcript.speaker_id.is_none() {
+                        final_transcript.speaker_id = speaker_id.clone();
+                    }
+                    
+                    // 更新语速（如果启用了自适应VAD）
+                    if let Some(ref sid) = speaker_id {
+                        // 计算音频时长
+                        let total_samples = frame.data.len();
+                        let sample_rate = frame.sample_rate;
+                        let audio_duration_ms = (total_samples as f32 / sample_rate as f32 * 1000.0) as u64;
+                        
+                        // 更新VAD中的说话者语速
+                        self.update_vad_speaker_speech_rate(sid, &final_transcript.text, audio_duration_ms);
+                    }
+                    
+                    let timestamp = frame.timestamp_ms;
+                    self.publish_asr_final_event(&final_transcript, timestamp).await?;
+                    
+                    // 继续处理：Emotion → Persona → NMT → TTS
+                    let emotion_result = self.analyze_emotion(&final_transcript, timestamp).await.ok();
+                    let personalized_transcript = self.personalize_transcript(&final_transcript).await?;
+                    
+                    // 计算原始音频时长（用于后续计算每个 segment 的语速）
+                    let source_audio_duration_ms = {
+                        let total_samples = frame.data.len();
+                        let sample_rate = frame.sample_rate;
+                        Some((total_samples as f32 / sample_rate as f32 * 1000.0) as u64)
+                    };
+                    
+                    let nmt_start = Instant::now();
+                    eprintln!("[NMT] Starting translation (continuous mode, speaker_id: {:?})...", personalized_transcript.speaker_id);
+                    let mut translation_result = self.translate_and_publish(&personalized_transcript, timestamp).await.ok();
+                    
+                    // 将原始音频信息添加到翻译结果中（用于计算每个 segment 的语速）
+                    if let Some(ref mut translation) = translation_result {
+                        if let Some(ref final_transcript) = asr_result.final_transcript {
+                            translation.source_audio_duration_ms = source_audio_duration_ms;
+                            translation.source_text = Some(final_transcript.text.clone());
+                        }
+                    }
+                    
+                    let nmt_ms = nmt_start.elapsed().as_millis() as u64;
+                    eprintln!("[NMT] Translation completed in {}ms", nmt_ms);
+                    
+                    let (tts_result, tts_ms, yourtts_ms) = if let Some(ref translation) = translation_result {
+                        let tts_start = Instant::now();
+                        eprintln!("[TTS] ===== TTS Synthesis Started =====");
+                        eprintln!("[TTS] Text: '{}'", translation.translated_text);
+                        eprintln!("[TTS] Speaker ID: {:?}", translation.speaker_id);
+                        eprintln!("[TTS] Reference audio: {} (samples: {})", 
+                            if reference_audio.is_some() { "Yes" } else { "No" },
+                            reference_audio.as_ref().map(|a| a.len()).unwrap_or(0));
+                        match self.synthesize_and_publish(translation, timestamp, reference_audio.clone()).await {
+                            Ok((result, yourtts_time)) => {
+                                let tts_ms = tts_start.elapsed().as_millis() as u64;
+                                eprintln!("[TTS] ✅ Synthesis completed in {}ms (audio size: {} bytes)", tts_ms, result.audio.len());
+                                eprintln!("[TTS] ==========================================");
+                                (Some(result), tts_ms, yourtts_time)
+                            }
+                            Err(e) => {
+                                let tts_ms = tts_start.elapsed().as_millis() as u64;
+                                eprintln!("[TTS] ❌ Synthesis failed in {}ms: {}", tts_ms, e);
+                                eprintln!("[TTS] ==========================================");
+                                (None, tts_ms, None)
+                            }
+                        }
+                    } else {
+                        eprintln!("[TTS] Skipped (no translation result)");
+                        (None, 0, None)
+                    };
+                    
+                    // 性能日志
+                    let total_ms = total_start.elapsed().as_millis() as u64;
+                    eprintln!("[PERF] ===== Continuous mode timing summary =====");
+                    eprintln!("[PERF] ASR:                {}ms", asr_ms);
+                    if let Some(se_ms) = speaker_embedding_ms {
+                        eprintln!("[PERF] Speaker Embedding: {}ms", se_ms);
+                    }
+                    eprintln!("[PERF] NMT:                {}ms", nmt_ms);
+                    eprintln!("[PERF] TTS:                {}ms", tts_ms);
+                    if let Some(yt_ms) = yourtts_ms {
+                        eprintln!("[PERF] YourTTS:            {}ms", yt_ms);
+                    }
+                    eprintln!("[PERF] Total:              {}ms", total_ms);
+                    eprintln!("[PERF] ===========================================");
+                    
+                    if let Some(ref logger) = self.perf_logger {
+                        let config = self.config.current().await.ok();
+                        let src_lang = final_transcript.language.clone();
+                        let tgt_lang = config.as_ref().map(|c| c.target_language.clone()).unwrap_or_else(|| "zh".to_string());
+                        
+                        let mut perf_log = PerformanceLog::new(
+                            request_id.clone(),
+                            src_lang,
+                            tgt_lang,
+                            asr_ms,
+                            nmt_ms,
+                            tts_ms,
+                            total_ms,
+                            translation_result.is_some(),
+                        );
+                        
+                        if let Some(ref translation) = translation_result {
+                            perf_log.check_suspect_translation(&final_transcript.text, &translation.translated_text);
+                        }
+                        
+                        logger.log(&perf_log);
+                    }
+                    
+                    // 更新 ASR 结果中的 speaker_id
+                    let mut asr_result_with_speaker = asr_result;
+                    if let Some(ref mut final_t) = asr_result_with_speaker.final_transcript {
+                        final_t.speaker_id = speaker_id.clone();
+                    }
+                    
+                    return Ok(Some(ProcessResult {
+                        asr: asr_result_with_speaker,
+                        emotion: emotion_result,
+                        translation: translation_result,
+                        tts: tts_result,
+                    }));
+                }
+            }
+        }
+        
+        Ok(None)
+    }
+
+    /// 分析情感
+    async fn analyze_emotion(
+        &self,
+        transcript: &StableTranscript,
+        timestamp_ms: u64,
+    ) -> EngineResult<EmotionResponse> {
+        // 构造 Emotion 请求（根据 Emotion_Adapter_Spec.md）
+        let request = EmotionRequest {
+            text: transcript.text.clone(),
+            lang: transcript.language.clone(),
+        };
+        
+        // 执行情感分析
+        let response = self.emotion.analyze(request).await?;
+        
+        // 发布 Emotion 事件
+        self.publish_emotion_event(&response, timestamp_ms).await?;
+        
+        Ok(response)
+    }
+
+    /// 应用 Persona 个性化
+    async fn personalize_transcript(
+        &self,
+        transcript: &StableTranscript,
+    ) -> EngineResult<StableTranscript> {
+        // 从配置中获取 PersonaContext（简化版：使用默认值）
+        // TODO: 后续可以从用户配置或数据库获取真实的 PersonaContext
+        let context = PersonaContext {
+            user_id: "default_user".to_string(),
+            tone: "formal".to_string(),  // 默认使用正式语调
+            culture: transcript.language.clone(),
+        };
+        
+        // 应用个性化
+        self.persona.personalize(transcript.clone(), context).await
+    }
+
+    /// 翻译并发布事件
+    async fn translate_and_publish(
+        &self,
+        transcript: &StableTranscript,
+        timestamp_ms: u64,
+    ) -> EngineResult<TranslationResponse> {
+        // 1. 获取目标语言（从配置中，使用 .ok() 避免阻塞）
+        // ⚠️ 优化：如果配置获取失败，使用默认值而不是阻塞整个流程
+        let target_language = self.config.current().await
+            .map(|c| c.target_language)
+            .unwrap_or_else(|_| {
+                eprintln!("[NMT] ⚠️  Failed to get config, using default target_language: zh");
+                "zh".to_string()
+            });
+        
+        // 2. 构造翻译请求（传递 speaker_id）
+        let translation_request = TranslationRequest {
+            transcript: PartialTranscript {
+                text: transcript.text.clone(),
+                confidence: 1.0,  // 最终转录的置信度
+                is_final: true,
+            },
+            target_language: target_language.clone(),
+            wait_k: None,
+            speaker_id: transcript.speaker_id.clone(),  // 传递 speaker_id
+        };
+        
+        // 3. 执行翻译
+        let mut translation_response = self.nmt.translate(translation_request).await?;
+        
+        // 3.1. 确保 speaker_id 被传递到 TranslationResponse
+        if translation_response.speaker_id.is_none() {
+            translation_response.speaker_id = transcript.speaker_id.clone();
+        }
+        eprintln!("[NMT] Raw translation result: '{}'", translation_response.translated_text);
+        
+        // 4. 应用翻译质量检查
+        if let Some(ref checker) = self.quality_checker {
+            let before_check = translation_response.translated_text.clone();
+            let checked_text = checker.check_and_fix(
+                &transcript.text,
+                &translation_response.translated_text,
+                &target_language,
+            );
+            if before_check != checked_text {
+                eprintln!("[NMT] After quality check: '{}' (was: '{}')", checked_text, before_check);
+            }
+            translation_response.translated_text = checked_text;
+        }
+        
+        // 5. 应用文本后处理
+        if let Some(ref processor) = self.post_processor {
+            let before_process = translation_response.translated_text.clone();
+            let processed_text = processor.process(&translation_response.translated_text, &target_language);
+            if before_process != processed_text {
+                eprintln!("[NMT] After post-processing: '{}' (was: '{}')", processed_text, before_process);
+            }
+            translation_response.translated_text = processed_text;
+        }
+        
+        eprintln!("[NMT] Final translation: '{}'", translation_response.translated_text);
+        
+        // 6. 发布翻译事件
+        self.publish_translation_event(&translation_response, timestamp_ms).await?;
+        
+        Ok(translation_response)
+    }
+
+    /// 发布 ASR 部分结果事件
+    async fn publish_asr_partial_event(
+        &self,
+        partial: &PartialTranscript,
+        timestamp_ms: u64,
+    ) -> EngineResult<()> {
+        let event = CoreEvent {
+            topic: EventTopic("AsrPartial".to_string()),
+            payload: json!({
+                "text": partial.text,
+                "confidence": partial.confidence,
+                "is_final": partial.is_final,
+            }),
+            timestamp_ms,
+        };
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
+
+    /// 发布 ASR 最终结果事件
+    async fn publish_asr_final_event(
+        &self,
+        final_transcript: &StableTranscript,
+        timestamp_ms: u64,
+    ) -> EngineResult<()> {
+        let event = CoreEvent {
+            topic: EventTopic("AsrFinal".to_string()),
+            payload: json!({
+                "text": final_transcript.text,
+                "speaker_id": final_transcript.speaker_id,
+                "language": final_transcript.language,
+            }),
+            timestamp_ms,
+        };
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
+
+    /// 发布 Emotion 事件
+    async fn publish_emotion_event(
+        &self,
+        emotion: &EmotionResponse,
+        timestamp_ms: u64,
+    ) -> EngineResult<()> {
+        let event = CoreEvent {
+            topic: EventTopic("Emotion".to_string()),
+            payload: json!({
+                "primary": emotion.primary,
+                "intensity": emotion.intensity,
+                "confidence": emotion.confidence,
+            }),
+            timestamp_ms,
+        };
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
+
+    /// 发布翻译事件
+    async fn publish_translation_event(
+        &self,
+        translation: &TranslationResponse,
+        timestamp_ms: u64,
+    ) -> EngineResult<()> {
+        let event = CoreEvent {
+            topic: EventTopic("Translation".to_string()),
+            payload: json!({
+                "translated_text": translation.translated_text,
+                "is_stable": translation.is_stable,
+            }),
+            timestamp_ms,
+        };
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
+
+    /// TTS 合成并发布事件
+    /// 
+    /// 返回 (TtsStreamChunk, YourTTS耗时)
+    async fn synthesize_and_publish(
+        &self,
+        translation: &TranslationResponse,
+        timestamp_ms: u64,
+        reference_audio: Option<Vec<f32>>,
+    ) -> EngineResult<(TtsStreamChunk, Option<u64>)> {
+        // 如果启用增量播放，使用增量合成方法
+        if self.tts_incremental_enabled {
+            return self.synthesize_and_publish_incremental(translation, timestamp_ms, reference_audio).await;
+        }
+
+        // 原有的一次性合成逻辑
+        // 1. 获取目标语言（用于 TTS locale）
+        // ⚠️ 优化：如果配置获取失败，使用默认值而不是阻塞整个流程
+        let target_language = self.config.current().await
+            .map(|c| c.target_language)
+            .unwrap_or_else(|_| {
+                eprintln!("[TTS] ⚠️  Failed to get config, using default target_language: zh");
+                "zh".to_string()
+            });
+        
+        // 2. 对中文文本进行预处理：将小数转换为中文读法
+        let processed_text = if target_language.starts_with("zh") {
+            Self::convert_decimals_to_chinese(&translation.translated_text)
+        } else {
+            translation.translated_text.clone()
+        };
+        
+        // 3. 使用传入的 reference_audio（用于 zero-shot TTS）
+        eprintln!("[TTS] Reference audio: {} (samples: {})", 
+            if reference_audio.is_some() { "Yes" } else { "No" },
+            reference_audio.as_ref().map(|a| a.len()).unwrap_or(0));
+        
+        // 4. 选择 voice（如果启用了说话者音色映射）
+        // 如果有 reference_audio，优先使用 zero-shot TTS（voice 可以为空）
+        // 否则使用预定义的 voice
+        let voice = if reference_audio.is_none() {
+            if let Some(ref speaker_id) = translation.speaker_id {
+                if let Some(ref mapper) = self.speaker_voice_mapper {
+                    let assigned_voice = mapper.get_or_assign_voice(speaker_id).await;
+                    eprintln!("[TTS] Assigned voice: '{}' for speaker: {}", assigned_voice, speaker_id);
+                    assigned_voice
+                } else {
+                    eprintln!("[TTS] No voice mapper, using empty voice");
+                    String::new()
+                }
+            } else {
+                eprintln!("[TTS] No speaker_id, using empty voice");
+                String::new()
+            }
+        } else {
+            // 使用 zero-shot TTS，voice 可以为空
+            eprintln!("[TTS] Using zero-shot TTS mode (reference audio provided)");
+            String::new()
+        };
+        
+        // 5. 构造 TTS 请求
+        eprintln!("[TTS] Constructing TTS request: text='{}', voice='{}', locale='{}'", 
+            if processed_text.len() > 50 { &processed_text[..50] } else { &processed_text },
+            voice, target_language);
+        
+        // 5.1. 获取说话者的语速（如果启用了自适应VAD）
+        let speech_rate = if let Some(ref speaker_id) = translation.speaker_id {
+            self.get_vad_speaker_speech_rate(speaker_id)
+        } else {
+            None
+        };
+        
+        if let Some(rate) = speech_rate {
+            eprintln!("[TTS] Using speaker speech rate: {:.2} chars/s for speaker: {}", 
+                     rate, translation.speaker_id.as_ref().unwrap_or(&"unknown".to_string()));
+        }
+        
+        let tts_request = TtsRequest {
+            text: processed_text,
+            voice,
+            locale: target_language.clone(),
+            reference_audio,
+            speaker: translation.speaker_id.clone(),
+            speech_rate,
+        };
+        
+        // 6. 执行 TTS 合成
+        let tts_synth_start = Instant::now();
+        eprintln!("[TTS] Calling TTS service...");
+        eprintln!("[TTS] Request details: reference_audio={}, speaker={:?}, voice='{}'", 
+                 if tts_request.reference_audio.is_some() { 
+                     format!("Yes ({} samples)", tts_request.reference_audio.as_ref().map(|a| a.len()).unwrap_or(0))
+                 } else { 
+                     "No".to_string() 
+                 },
+                 tts_request.speaker,
+                 tts_request.voice);
+        
+        // 检查是否使用 YourTTS
+        let is_yourtts = self.tts_service_url.as_ref()
+            .map(|url| url.contains("5004") || url.contains("yourtts"))
+            .unwrap_or(false);
+        if is_yourtts {
+            eprintln!("[TTS] ✅ Using YourTTS service (zero-shot TTS with reference audio support)");
+        } else {
+            eprintln!("[TTS] ⚠️  Using non-YourTTS service (Piper or other), reference audio will NOT be used!");
+        }
+        
+        let tts_chunk = self.tts.synthesize(tts_request).await?;
+        let tts_synth_ms = tts_synth_start.elapsed().as_millis() as u64;
+        eprintln!("[TTS] TTS service call completed in {}ms", tts_synth_ms);
+        
+        // 6. 发布 TTS 事件（包含 speaker_id 信息）
+        self.publish_tts_event(&tts_chunk, timestamp_ms).await?;
+        
+        // 如果使用 YourTTS，记录 YourTTS 的耗时（从日志中提取或使用总耗时）
+        // 注意：YourTTS 的耗时已经在 yourtts_http.rs 中记录，这里我们使用总耗时作为近似值
+        // 如果 TTS 服务是 YourTTS，则返回耗时；否则返回 None
+        let yourtts_ms = if self.tts_service_url.as_ref()
+            .map(|url| url.contains("5004") || url.contains("yourtts"))
+            .unwrap_or(false) {
+            Some(tts_synth_ms)
+        } else {
+            None
+        };
+        
+        Ok((tts_chunk, yourtts_ms))
+    }
+
+    /// TTS 增量合成并发布事件
+    /// 
+    /// 将文本分割成短句，每个短句合成完成后立即发布（或缓冲后发布）
+    /// 
+    /// 返回 (TtsStreamChunk, YourTTS耗时)
+    async fn synthesize_and_publish_incremental(
+        &self,
+        translation: &TranslationResponse,
+        timestamp_ms: u64,
+        reference_audio: Option<Vec<f32>>,
+    ) -> EngineResult<(TtsStreamChunk, Option<u64>)> {
+        // 1. 获取目标语言（用于 TTS locale）
+        // ⚠️ 优化：如果配置获取失败，使用默认值而不是阻塞整个流程
+        let target_language = self.config.current().await
+            .map(|c| c.target_language)
+            .unwrap_or_else(|_| {
+                eprintln!("[TTS] ⚠️  Failed to get config, using default target_language: zh");
+                "zh".to_string()
+            });
+        
+        // 2. 分割文本为短句（使用带停顿类型的分段）
+        let segmenter = self.text_segmenter.as_ref()
+            .ok_or_else(|| EngineError::new("Text segmenter not initialized".to_string()))?;
+        
+        eprintln!("[TTS] Input text for segmentation: '{}'", translation.translated_text);
+        
+        // 尝试使用带停顿类型的分段（如果支持）
+        let segments_with_pause = if segmenter.split_on_comma {
+            let segments = segmenter.segment_with_pause_type(&translation.translated_text);
+            eprintln!("[TTS] Segmented into {} parts:", segments.len());
+            for (i, seg) in segments.iter().enumerate() {
+                eprintln!("[TTS]   Segment {}: '{}' (pause_type: {:?})", i + 1, seg.text, seg.pause_type);
+            }
+            segments
+        } else {
+            // 向后兼容：使用旧的分段方法
+            let segments = segmenter.segment(&translation.translated_text);
+            eprintln!("[TTS] Segmented into {} parts (legacy method):", segments.len());
+            for (i, text) in segments.iter().enumerate() {
+                eprintln!("[TTS]   Segment {}: '{}'", i + 1, text);
+            }
+            segments
+                .into_iter()
+                .map(|text| {
+                    let pause_type = if text.ends_with('.') 
+                        || text.ends_with('!') 
+                        || text.ends_with('?')
+                        || text.ends_with('。')
+                        || text.ends_with('！')
+                        || text.ends_with('？') {
+                        crate::text_segmentation::PauseType::SentenceEnd
+                    } else {
+                        crate::text_segmentation::PauseType::None
+                    };
+                    crate::text_segmentation::TextSegment { text, pause_type }
+                })
+                .collect()
+        };
+        
+        if segments_with_pause.is_empty() {
+            return Err(EngineError::new("No segments to synthesize".to_string()));
+        }
+
+        // 3. 准备阶段：预先准备所有 TTS 请求参数（包括异步的 voice 获取）
+        let tts_incremental_start = Instant::now();
+        
+        // 3.1. 预先获取 voice（如果需要，且只获取一次）
+        let use_reference_audio = reference_audio.clone();
+        let common_voice = if use_reference_audio.is_none() {
+            if let Some(ref speaker_id) = translation.speaker_id {
+                if let Some(ref mapper) = self.speaker_voice_mapper {
+                    mapper.get_or_assign_voice(speaker_id).await
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+        
+        // 3.2. 计算每个 segment 的独立语速
+        let segment_speech_rates: Vec<Option<f32>> = if let (Some(source_duration_ms), Some(source_text)) = 
+            (translation.source_audio_duration_ms, translation.source_text.clone()) {
+            let source_text_len = source_text.chars().count() as f32;
+            let source_duration_sec = source_duration_ms as f32 / 1000.0;
+            let overall_speech_rate = if source_duration_sec > 0.0 {
+                source_text_len / source_duration_sec
+            } else {
+                0.0
+            };
+            
+            // ⚠️ 重要：语速应该基于原始输入文本和音频时长，而不是翻译后的文本
+            // 翻译后的文本长度可能完全不同，直接用翻译文本计算语速会导致错误
+            // 方法：根据翻译文本的 segment 长度比例，估算其在原始输入中的对应时长
+            let total_translated_chars = translation.translated_text.chars().count() as f32;
+            segments_with_pause.iter().map(|seg| {
+                let segment_chars = seg.text.chars().count() as f32;
+                if total_translated_chars > 0.0 && source_duration_sec > 0.0 {
+                    // 计算这个 segment 在翻译文本中的比例
+                    let segment_ratio = segment_chars / total_translated_chars;
+                    // 假设翻译文本的 segment 比例与原始文本的 segment 比例相似
+                    // 因此这个 segment 对应的原始音频时长 = 总时长 * 比例
+                    let estimated_segment_duration_sec = source_duration_sec * segment_ratio;
+                    // ⚠️ 关键修正：使用翻译文本的字符数和原始音频时长计算语速
+                    // 这样 TTS 输出会匹配原始输入的语速
+                    let segment_speech_rate = if estimated_segment_duration_sec > 0.0 {
+                        segment_chars / estimated_segment_duration_sec
+                    } else {
+                        overall_speech_rate
+                    };
+                    Some(segment_speech_rate)
+                } else {
+                    None
+                }
+            }).collect()
+        } else {
+            segments_with_pause.iter().map(|_| {
+                if let Some(ref speaker_id) = translation.speaker_id {
+                    self.get_vad_speaker_speech_rate(speaker_id)
+                } else {
+                    None
+                }
+            }).collect()
+        };
+        
+        // 3.3. 创建所有 segment 的并行处理任务
+        eprintln!("[TTS] ⚡ Starting parallel synthesis of {} segments...", segments_with_pause.len());
+        let segment_futures: Vec<_> = segments_with_pause.iter().enumerate().map(|(idx, segment)| {
+            let is_last = idx == segments_with_pause.len() - 1;
+            let segment_text = segment.text.clone();
+            let segment_pause_type = segment.pause_type;
+            
+            // 预处理文本
+            let processed_text = if target_language.starts_with("zh") {
+                Self::convert_decimals_to_chinese(&segment_text)
+            } else {
+                segment_text.clone()
+            };
+            
+            // 获取语速
+            let speech_rate = segment_speech_rates.get(idx)
+                .and_then(|rate| *rate)
+                .or_else(|| {
+                    if let Some(ref speaker_id) = translation.speaker_id {
+                        self.get_vad_speaker_speech_rate(speaker_id)
+                    } else {
+                        None
+                    }
+                });
+            
+            // 构造 TTS 请求
+            let tts_request = TtsRequest {
+                text: processed_text.clone(),
+                voice: common_voice.clone(),
+                locale: target_language.clone(),
+                reference_audio: use_reference_audio.clone(),
+                speaker: translation.speaker_id.clone(),
+                speech_rate,
+            };
+            
+            // 记录日志
+            if let Some(rate) = speech_rate {
+                eprintln!("[TTS] ⚡ Queueing segment {:2} for parallel synthesis: '{}' (speech_rate: {:.2} chars/s)", 
+                    idx + 1, segment_text, rate);
+            } else {
+                eprintln!("[TTS] ⚡ Queueing segment {:2} for parallel synthesis: '{}'", idx + 1, segment_text);
+            }
+            
+            // 创建异步任务：合成 + 增强
+            let tts_clone = Arc::clone(&self.tts);
+            let fallback_tts_clone = self.fallback_tts.as_ref().map(Arc::clone);
+            let enhancer_clone = self.audio_enhancer.as_ref().map(Arc::clone);
+            
+            async move {
+                let segment_tts_start = Instant::now();
+                
+                // 合成音频（带回退机制）
+                let mut chunk = match tts_clone.synthesize(tts_request.clone()).await {
+                    Ok(chunk) => chunk,
+                    Err(e) => {
+                        // 检查是否是语言不支持的错误
+                        let error_msg = e.to_string().to_lowercase();
+                        let is_language_error = error_msg.contains("language") || 
+                                                error_msg.contains("not in the available languages") ||
+                                                error_msg.contains("不支持") ||
+                                                error_msg.contains("dict_keys");
+                        
+                        if is_language_error {
+                            eprintln!("[TTS] ⚠️  Segment {:2} failed due to unsupported language, trying fallback TTS...", idx + 1);
+                            // 如果有回退 TTS，尝试使用它（不传递 reference_audio，因为 Piper 不支持）
+                            // 但保留语速信息，确保输出语速匹配输入
+                            if let Some(ref fallback) = fallback_tts_clone {
+                                let mut fallback_request = tts_request.clone();
+                                fallback_request.reference_audio = None;  // Piper 不支持 reference_audio
+                                // 语速信息已保留在 tts_request 中，会传递给 Piper
+                                
+                                eprintln!("[TTS] ⚡ Fallback: Using Piper TTS with speech_rate={:?}", fallback_request.speech_rate);
+                                
+                                match fallback.synthesize(fallback_request).await {
+                                    Ok(fallback_chunk) => {
+                                        eprintln!("[TTS] ✅ Segment {:2} fallback TTS succeeded", idx + 1);
+                                        fallback_chunk
+                                    }
+                                    Err(fallback_err) => {
+                                        eprintln!("[TTS] ❌ Segment {:2} fallback TTS also failed: {}", idx + 1, fallback_err);
+                                        return Err(fallback_err);
+                                    }
+                                }
+                            } else {
+                                eprintln!("[TTS] ❌ No fallback TTS available, segment {:2} failed", idx + 1);
+                                return Err(e);
+                            }
+                        } else {
+                            eprintln!("[TTS] ❌ Segment {:2} synthesis failed: {}", idx + 1, e);
+                            return Err(e);
+                        }
+                    }
+                };
+                
+                let segment_tts_ms = segment_tts_start.elapsed().as_millis() as u64;
+                
+                // 应用音频增强
+                if let Some(ref enhancer) = enhancer_clone {
+                    let pause_type = if segment_pause_type != crate::text_segmentation::PauseType::None {
+                        Some(segment_pause_type)
+                    } else {
+                        None
+                    };
+                    
+                    match enhancer.enhance_audio_with_pause_type(
+                        &chunk.audio,
+                        idx == 0,  // is_first
+                        is_last,   // is_last
+                        pause_type,
+                    ).await {
+                        Ok(enhanced_audio) => {
+                            chunk.audio = enhanced_audio;
+                            eprintln!("[TTS] ✅ Segment {:2} completed in {}ms: '{}' (audio_size: {} bytes)", 
+                                idx + 1, segment_tts_ms, segment_text, chunk.audio.len());
+                        }
+                        Err(e) => {
+                            eprintln!("[TTS] ⚠️  Segment {:2} enhancement failed: {}, using original audio", idx + 1, e);
+                        }
+                    }
+                } else {
+                    eprintln!("[TTS] ✅ Segment {:2} completed in {}ms: '{}' (audio_size: {} bytes)", 
+                        idx + 1, segment_tts_ms, segment_text, chunk.audio.len());
+                }
+                
+                Ok((idx, chunk, segment_tts_ms, is_last))
+            }
+        }).collect();
+        
+        // 3.4. 并行执行所有任务并等待完成
+        eprintln!("[TTS] ⚡ Executing {} segments in parallel...", segment_futures.len());
+        let segment_results = join_all(segment_futures).await;
+        
+        // 3.5. 按顺序处理结果（保持播放顺序）
+        let mut ordered_chunks = Vec::new();
+        let mut total_yourtts_ms = 0u64;
+        let mut yourtts_call_count = 0u64;
+        
+        // 收集所有结果（包含索引，用于排序）
+        let mut results_with_idx: Vec<_> = Vec::new();
+        for result in segment_results {
+            results_with_idx.push(result?);
+        }
+        
+        // 按索引排序以确保顺序
+        results_with_idx.sort_by_key(|(idx, _, _, _)| *idx);
+        
+        // 按顺序处理每个结果
+        let mut current_timestamp = timestamp_ms;
+        for (idx, mut chunk, segment_tts_ms, is_last) in results_with_idx {
+            // 累计 YourTTS 耗时
+            if self.tts_service_url.as_ref()
+                .map(|url| url.contains("5004") || url.contains("yourtts"))
+                .unwrap_or(false) {
+                total_yourtts_ms += segment_tts_ms;
+                yourtts_call_count += 1;
+            }
+            
+            // 设置时间戳和 is_last 标志
+            chunk.timestamp_ms = current_timestamp;
+            chunk.is_last = is_last;
+            
+            // 立即发布（buffer_sentences == 0）
+            if self.tts_buffer_sentences == 0 {
+                self.publish_tts_event(&chunk, current_timestamp).await?;
+                eprintln!("[TTS] 📤 Published segment {:2} immediately (timestamp: {}ms)", idx + 1, current_timestamp);
+            }
+            
+            // 保存到 ordered_chunks（用于合并和缓冲模式）
+            ordered_chunks.push(chunk);
+            
+            // 更新时间戳
+            current_timestamp += 100; // 每个短句间隔 100ms
+        }
+        
+        // 3.6. 缓冲模式：发布剩余的短句（如果需要）
+        if self.tts_buffer_sentences > 0 {
+            for (idx, chunk) in ordered_chunks.iter().enumerate() {
+                self.publish_tts_event(chunk, chunk.timestamp_ms).await?;
+                eprintln!("[TTS] 📤 Published segment {:2} from buffer (timestamp: {}ms)", idx + 1, chunk.timestamp_ms);
+            }
+        }
+        
+        // 3.7. 合并所有 chunks 的音频数据，返回完整的音频
+        let mut merged_audio = Vec::new();
+        for chunk in &ordered_chunks {
+            merged_audio.extend_from_slice(&chunk.audio);
+        }
+        
+        let tts_incremental_total_ms = tts_incremental_start.elapsed().as_millis() as u64;
+        eprintln!("[TTS] ⚡ Parallel synthesis completed: {} segments in {}ms (avg: {:.1}ms/segment)", 
+            ordered_chunks.len(), 
+            tts_incremental_total_ms,
+            if ordered_chunks.len() > 0 { tts_incremental_total_ms as f32 / ordered_chunks.len() as f32 } else { 0.0 });
+        eprintln!("[TTS] Total audio size: {} bytes", merged_audio.len());
+        
+        // 创建合并后的 chunk 用于返回
+        let merged_chunk = if let Some(first_chunk) = ordered_chunks.first() {
+            TtsStreamChunk {
+                audio: merged_audio,
+                timestamp_ms: first_chunk.timestamp_ms,
+                is_last: true,
+            }
+        } else {
+            return Err(EngineError::new("No chunks to merge".to_string()));
+        };
+        
+        // 如果使用 YourTTS，记录 YourTTS 的耗时
+        let yourtts_ms = if self.tts_service_url.as_ref()
+            .map(|url| url.contains("5004") || url.contains("yourtts"))
+            .unwrap_or(false) {
+            if yourtts_call_count > 0 {
+                Some(total_yourtts_ms)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        
+        if let Some(yt_ms) = yourtts_ms {
+            eprintln!("[TTS] YourTTS total time: {}ms ({} calls, avg: {:.1}ms per call)", 
+                yt_ms, yourtts_call_count, if yourtts_call_count > 0 { yt_ms as f64 / yourtts_call_count as f64 } else { 0.0 });
+        }
+        
+        // 返回合并后的 chunk
+        Ok((merged_chunk, yourtts_ms))
+    }
+
+    /// 检查 ASR 转录文本是否为无意义的文本（应该被过滤，不进入翻译/TTS）
+    /// 
+    /// 过滤规则：
+    /// - 包含 "(Titled by ...)"、"字幕:..." 等字幕信息
+    /// - 包含视频结尾常见字幕，如 "謝謝大家收看"、"谢谢大家观看" 等
+    /// - 包含其他无意义的模式
+    /// 
+    /// 返回 true 表示应该过滤掉，不进入后续处理
+    fn is_meaningless_transcript(text: &str) -> bool {
+        let text_lower = text.to_lowercase();
+        let text_trimmed = text.trim();
+        
+        // 完整的无意义文本列表（精确匹配）
+        let exact_matches = vec![
+            "謝謝大家收看",
+            "谢谢大家收看",
+            "謝謝大家觀看",
+            "谢谢大家观看",
+            "謝謝觀看",
+            "谢谢观看",
+            "感謝收看",
+            "感谢收看",
+            "thank you for watching",
+            "thanks for watching",
+        ];
+        
+        // 检查精确匹配（不区分大小写）
+        for pattern in &exact_matches {
+            if text_trimmed.eq_ignore_ascii_case(pattern) {
+                return true;
+            }
+        }
+        
+        // 无意义模式列表（部分匹配，不区分大小写）
+        let meaningless_patterns = vec![
+            "titled by",
+            "title:",
+            "字幕:",
+            "subtitle:",
+            "source:",
+            "author:",
+            "translated by",
+        ];
+        
+        // 检查是否包含任何无意义模式
+        for pattern in meaningless_patterns {
+            if text_lower.contains(pattern) {
+                // 进一步检查：确认是在括号或方括号内的模式
+                // 这样可以避免误判正常文本
+                let pattern_pos = text_lower.find(pattern);
+                if let Some(pos) = pattern_pos {
+                    // 检查前后是否有括号（简单检查，避免复杂解析）
+                    let before = if pos > 0 { &text_lower[..pos] } else { "" };
+                    let after = if pos + pattern.len() < text_lower.len() { &text_lower[pos + pattern.len()..] } else { "" };
+                    
+                    // 检查前面是否有开括号，后面是否有闭括号
+                    let has_open_bracket = before.chars().rev().take(10).any(|c| matches!(c, '(' | '[' | '（'));
+                    let has_close_bracket = after.chars().take(50).any(|c| matches!(c, ')' | ']' | '）'));
+                    
+                    // 如果模式在括号内，判定为无意义
+                    if has_open_bracket || has_close_bracket {
+                        return true;
+                    }
+                }
+            }
+        }
+        
+        false
+    }
+
+    /// 将中文文本中的小数转换为中文读法
+    /// 
+    /// 例如："版本1.4" -> "版本一点四"
+    ///      "价格3.14" -> "价格三点一四"
+    ///      "版本1.0" -> "版本一点零"
+    fn convert_decimals_to_chinese(text: &str) -> String {
+        let mut result = String::new();
+        let mut chars = text.chars().peekable();
+        
+        while let Some(ch) = chars.next() {
+            if ch.is_ascii_digit() {
+                // 开始读取数字
+                let mut num_str = String::new();
+                num_str.push(ch);
+                
+                // 检查下一个字符是否是小数点
+                let mut has_decimal = false;
+                if let Some(&'.') = chars.peek() {
+                    chars.next(); // 跳过小数点
+                    has_decimal = true;
+                    num_str.push('.');
+                    
+                    // 读取小数点后的数字
+                    while let Some(&next_ch) = chars.peek() {
+                        if next_ch.is_ascii_digit() {
+                            num_str.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    // 继续读取整数部分
+                    while let Some(&next_ch) = chars.peek() {
+                        if next_ch.is_ascii_digit() {
+                            num_str.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                
+                // 如果是小数，转换为中文读法
+                if has_decimal && num_str.contains('.') {
+                    let parts: Vec<&str> = num_str.split('.').collect();
+                    if parts.len() == 2 {
+                        // 转换整数部分
+                        let int_part = parts[0];
+                        let mut chinese_num = String::new();
+                        for digit_char in int_part.chars() {
+                            if let Some(digit) = digit_char.to_digit(10) {
+                                chinese_num.push_str(match digit {
+                                    0 => "零",
+                                    1 => "一",
+                                    2 => "二",
+                                    3 => "三",
+                                    4 => "四",
+                                    5 => "五",
+                                    6 => "六",
+                                    7 => "七",
+                                    8 => "八",
+                                    9 => "九",
+                                    _ => "",
+                                });
+                            }
+                        }
+                        
+                        // 添加"点"
+                        chinese_num.push_str("点");
+                        
+                        // 转换小数部分
+                        for digit_char in parts[1].chars() {
+                            if let Some(digit) = digit_char.to_digit(10) {
+                                chinese_num.push_str(match digit {
+                                    0 => "零",
+                                    1 => "一",
+                                    2 => "二",
+                                    3 => "三",
+                                    4 => "四",
+                                    5 => "五",
+                                    6 => "六",
+                                    7 => "七",
+                                    8 => "八",
+                                    9 => "九",
+                                    _ => "",
+                                });
+                            }
+                        }
+                        
+                        result.push_str(&chinese_num);
+                        continue;
+                    }
+                }
+                
+                // 如果不是小数，保持原样
+                result.push_str(&num_str);
+            } else {
+                result.push(ch);
+            }
+        }
+        
+        result
+    }
+
+    /// 更新VAD中的说话者语速（用于自适应调整）
+    fn update_vad_speaker_speech_rate(&self, speaker_id: &str, text: &str, audio_duration_ms: u64) {
+        // 尝试将 VAD 转换为 SileroVad
+        let vad_ptr = Arc::as_ptr(&self.vad);
+        let silero_vad_ptr = vad_ptr as *const crate::vad::SileroVad;
+        
+        unsafe {
+            if let Some(silero_vad) = silero_vad_ptr.as_ref() {
+                silero_vad.update_speaker_speech_rate(speaker_id, text, audio_duration_ms);
+            }
+        }
+    }
+    
+    /// 获取说话者的语速（用于传递给TTS）
+    fn get_vad_speaker_speech_rate(&self, speaker_id: &str) -> Option<f32> {
+        // 尝试将 VAD 转换为 SileroVad
+        let vad_ptr = Arc::as_ptr(&self.vad);
+        let silero_vad_ptr = vad_ptr as *const crate::vad::SileroVad;
+        
+        unsafe {
+            if let Some(silero_vad) = silero_vad_ptr.as_ref() {
+                silero_vad.get_speaker_speech_rate(speaker_id)
+            } else {
+                None
+            }
+        }
+    }
+    
+    /// 设置VAD的当前说话者ID（用于自适应调整）
+    fn set_vad_current_speaker(&self, speaker_id: Option<&str>) {
+        // 尝试将 VAD 转换为 SileroVad
+        let vad_ptr = Arc::as_ptr(&self.vad);
+        let silero_vad_ptr = vad_ptr as *const crate::vad::SileroVad;
+        
+        unsafe {
+            if let Some(silero_vad) = silero_vad_ptr.as_ref() {
+                silero_vad.set_current_speaker(speaker_id);
+            }
+        }
+    }
+    
+    /// 发布 TTS 事件
+    async fn publish_tts_event(
+        &self,
+        tts_chunk: &TtsStreamChunk,
+        timestamp_ms: u64,
+    ) -> EngineResult<()> {
+        let event = CoreEvent {
+            topic: EventTopic("Tts".to_string()),
+            payload: json!({
+                "audio_length": tts_chunk.audio.len(),
+                "timestamp_ms": tts_chunk.timestamp_ms,
+                "is_last": tts_chunk.is_last,
+            }),
+            timestamp_ms,
+        };
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
+}
+
+/// 处理结果（包含 ASR、Emotion、NMT 和 TTS 结果）
+#[derive(Debug, Clone)]
+pub struct ProcessResult {
+    pub asr: AsrResult,
+    pub emotion: Option<EmotionResponse>,
+    pub translation: Option<TranslationResponse>,
+    pub tts: Option<TtsStreamChunk>,
+}
