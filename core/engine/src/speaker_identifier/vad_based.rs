@@ -78,6 +78,7 @@ impl SpeakerIdentifier for VadBasedSpeakerIdentifier {
                 confidence: 0.8,  // 中等置信度（基于规则的判断）
                 voice_embedding: None,  // VAD 模式不提取音色特征
                 reference_audio: None,  // VAD 模式不保存参考音频
+                estimated_gender: None,  // VAD 模式不估计性别
             });
         }
         
@@ -132,6 +133,7 @@ impl SpeakerIdentifier for VadBasedSpeakerIdentifier {
             confidence,
             voice_embedding: None,  // VAD 模式不提取音色特征
             reference_audio: None,  // VAD 模式不保存参考音频
+            estimated_gender: None,  // VAD 模式不估计性别
         })
     }
     

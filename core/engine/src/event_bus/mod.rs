@@ -1,7 +1,11 @@
+mod channel;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::error::EngineResult;
+
+pub use channel::ChannelEventBus;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoreEvent {
@@ -10,7 +14,7 @@ pub struct CoreEvent {
     pub timestamp_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct EventTopic(pub String);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

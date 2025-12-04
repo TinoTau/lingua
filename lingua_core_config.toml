@@ -4,7 +4,17 @@ url = "http://127.0.0.1:5008"
 [tts]
 url = "http://127.0.0.1:5005/tts"
 
+[asr]
+url = "http://127.0.0.1:6006"
+
+[speaker_embedding]
+url = "http://127.0.0.1:5003"
+
+[yourtts]
+url = "http://127.0.0.1:5004"
+
 [engine]
 port = 9000
 whisper_model_path = "models/asr/whisper-base"
+silero_vad_model_path = "models/vad/silero/silero_vad_official.onnx"
 

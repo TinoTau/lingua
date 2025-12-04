@@ -50,6 +50,7 @@ impl NmtIncremental for MarianNmtStub {
             speaker_id: None,
             source_text: None,
             source_audio_duration_ms: None,
+            source_language: None,  // Stub 无法提供源语言信息
             quality_metrics: None,
         })
     }

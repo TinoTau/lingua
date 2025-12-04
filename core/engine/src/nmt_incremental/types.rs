@@ -16,6 +16,7 @@ pub struct TranslationResponse {
     pub speaker_id: Option<String>,
     pub source_text: Option<String>,
     pub source_audio_duration_ms: Option<u64>,
+    pub source_language: Option<String>,  // 源语言（用于语速换算）
     pub quality_metrics: Option<TranslationQualityMetrics>,
 }
 

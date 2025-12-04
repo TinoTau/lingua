@@ -77,6 +77,7 @@ impl NmtIncremental for NmtClientAdapter {
             speaker_id: None,
             source_text: None,
             source_audio_duration_ms: None,
+            source_language: None,  // HTTP 服务可能无法提供源语言信息
             quality_metrics: None,
             is_stable: true, // HTTP 服务总是返回稳定结果
         })

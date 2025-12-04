@@ -33,6 +33,7 @@ mod tests {
             speaker_id: Some("speaker1".to_string()),
             source_audio_duration_ms: None,
             source_text: None,
+            source_language: None,  // 测试中不需要源语言信息
             quality_metrics,
         }
     }

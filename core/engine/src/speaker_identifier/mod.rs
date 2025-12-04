@@ -35,6 +35,10 @@ pub struct SpeakerIdentificationResult {
     /// 如果为 None，表示未保存参考音频
     /// 如果为 Some，表示已保存参考音频（可用于 zero-shot TTS）
     pub reference_audio: Option<Vec<f32>>,
+    /// 估计的性别（用于选择默认音色，可选）
+    /// 如果为 None，表示无法估计性别
+    /// 如果为 Some，值为 "male"、"female" 或 "unknown"
+    pub estimated_gender: Option<String>,
 }
 
 /// 说话者识别器配置

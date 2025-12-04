@@ -33,6 +33,12 @@ pub struct EmbeddingBasedSpeakerIdentifier {
     speaker_embeddings: Arc<RwLock<HashMap<String, Vec<f32>>>>,
     /// 下一个说话者 ID 的计数器
     next_speaker_id: Arc<RwLock<u32>>,
+    /// 每个说话者的参考音频片段列表（用于合并）
+    /// Key: speaker_id, Value: Vec<参考音频片段>
+    /// 当累积到足够长度时，会合并成一个更长的参考音频
+    speaker_reference_audio_segments: Arc<RwLock<HashMap<String, Vec<Vec<f32>>>>>,
+    /// 合并参考音频的最小总长度（样本数，16kHz，约 10 秒）
+    min_merged_audio_samples: usize,
 }
 
 impl EmbeddingBasedSpeakerIdentifier {
@@ -57,6 +63,8 @@ impl EmbeddingBasedSpeakerIdentifier {
             similarity_threshold,
             speaker_embeddings: Arc::new(RwLock::new(HashMap::new())),
             next_speaker_id: Arc::new(RwLock::new(1)),
+            speaker_reference_audio_segments: Arc::new(RwLock::new(HashMap::new())),
+            min_merged_audio_samples: 160000,  // 16kHz * 10秒 = 160000 样本
         })
     }
     
@@ -161,10 +169,19 @@ impl EmbeddingBasedSpeakerIdentifier {
     ) -> Option<(String, f32)> {
         let embeddings = self.speaker_embeddings.read().await;
         
+        if embeddings.is_empty() {
+            eprintln!("[SpeakerIdentifier] 📊 No existing speakers in database");
+            return None;
+        }
+        
+        eprintln!("[SpeakerIdentifier] 📊 Comparing with {} existing speaker(s)...", embeddings.len());
+        
         let mut best_match: Option<(String, f32)> = None;
+        let mut all_similarities: Vec<(String, f32)> = Vec::new();
         
         for (speaker_id, speaker_embedding) in embeddings.iter() {
             let similarity = Self::cosine_similarity(embedding, speaker_embedding);
+            all_similarities.push((speaker_id.clone(), similarity));
             
             if let Some((_, best_sim)) = best_match {
                 if similarity > best_sim {
@@ -173,6 +190,16 @@ impl EmbeddingBasedSpeakerIdentifier {
             } else {
                 best_match = Some((speaker_id.clone(), similarity));
             }
+        }
+        
+        // 打印所有相似度值（用于调试）
+        eprintln!("[SpeakerIdentifier] 📊 Similarity scores:");
+        for (sid, sim) in all_similarities.iter() {
+            eprintln!("[SpeakerIdentifier]   - {}: {:.4}", sid, sim);
+        }
+        
+        if let Some((best_id, best_sim)) = best_match.as_ref() {
+            eprintln!("[SpeakerIdentifier] 🎯 Best match: {} (similarity: {:.4})", best_id, best_sim);
         }
         
         best_match
@@ -210,6 +237,7 @@ impl SpeakerIdentifier for EmbeddingBasedSpeakerIdentifier {
                 confidence: 0.5,  // 默认置信度较低
                 voice_embedding: None,  // 没有 embedding
                 reference_audio: None,  // 音频太短，不适合作为参考
+                estimated_gender: extract_result.estimated_gender,  // 保存性别信息
             });
         }
         
@@ -219,12 +247,37 @@ impl SpeakerIdentifier for EmbeddingBasedSpeakerIdentifier {
         let most_similar = self.find_most_similar_speaker(&embedding).await;
         
         // 4. 判断是否为新说话者
+        // 策略：
+        // - 如果相似度 >= 0.6：直接匹配（高置信度）
+        // - 如果相似度在 0.4-0.6 之间：匹配并更新 embedding（使用加权平均，提高稳定性）
+        // - 如果相似度 < 0.4：创建新说话者
         let (speaker_id, is_new_speaker, confidence) = if let Some((existing_id, similarity)) = most_similar {
+            eprintln!("[SpeakerIdentifier] 🔍 Found most similar speaker: {} (similarity: {:.3}, threshold: {:.3})", 
+                     existing_id, similarity, self.similarity_threshold);
             if similarity >= self.similarity_threshold {
-                // 相似度足够高，认为是同一说话者
+                // 相似度足够高（>= 0.6），直接匹配
+                eprintln!("[SpeakerIdentifier] ✅ Matched existing speaker: {} (similarity: {:.3} >= {:.3})", 
+                         existing_id, similarity, self.similarity_threshold);
+                (existing_id, false, similarity)
+            } else if similarity >= 0.4 {
+                // 相似度中等（0.4-0.6），匹配并更新 embedding（使用加权平均）
+                eprintln!("[SpeakerIdentifier] ⚠️  Medium similarity: {:.3} (0.4 <= {:.3} < {:.3}), matching and updating embedding", 
+                         similarity, similarity, self.similarity_threshold);
+                let mut embeddings = self.speaker_embeddings.write().await;
+                if let Some(existing_embedding) = embeddings.get_mut(&existing_id) {
+                    // 使用加权平均更新 embedding（新 embedding 权重 0.3，旧 embedding 权重 0.7）
+                    // 这样可以平滑 embedding，提高稳定性
+                    for (i, new_val) in embedding.iter().enumerate() {
+                        if i < existing_embedding.len() {
+                            existing_embedding[i] = existing_embedding[i] * 0.7 + new_val * 0.3;
+                        }
+                    }
+                    eprintln!("[SpeakerIdentifier] 📊 Updated embedding for speaker '{}' (weighted average: 0.7 old + 0.3 new)", existing_id);
+                }
                 (existing_id, false, similarity)
             } else {
-                // 相似度不够，认为是新说话者
+                // 相似度太低（< 0.4），认为是新说话者
+                eprintln!("[SpeakerIdentifier] ⚠️  Similarity too low: {:.3} < 0.4, creating new speaker", similarity);
                 let new_id = self.generate_speaker_id().await;
                 let mut embeddings = self.speaker_embeddings.write().await;
                 embeddings.insert(new_id.clone(), embedding.clone());
@@ -232,6 +285,7 @@ impl SpeakerIdentifier for EmbeddingBasedSpeakerIdentifier {
             }
         } else {
             // 没有已有说话者，创建第一个
+            eprintln!("[SpeakerIdentifier] 🆕 No existing speakers found, creating first speaker");
             let new_id = self.generate_speaker_id().await;
             let mut embeddings = self.speaker_embeddings.write().await;
             embeddings.insert(new_id.clone(), embedding.clone());
@@ -239,16 +293,58 @@ impl SpeakerIdentifier for EmbeddingBasedSpeakerIdentifier {
         };
         
         // 5. 保存参考音频（用于 zero-shot TTS）
+        // 策略：如果是同一说话者，累积多个音频片段；如果是新说话者，使用当前片段
         let reference_audio = if !audio_segment.is_empty() {
             // 合并音频帧作为参考音频
-            let mut merged = Vec::new();
+            let mut current_audio = Vec::new();
             for frame in audio_segment {
-                merged.extend_from_slice(&frame.data);
+                current_audio.extend_from_slice(&frame.data);
             }
-            Some(merged)
+            
+            if !is_new_speaker {
+                // 同一说话者：累积音频片段
+                let mut segments = self.speaker_reference_audio_segments.write().await;
+                let segments_list = segments.entry(speaker_id.clone()).or_insert_with(Vec::new);
+                segments_list.push(current_audio.clone());
+                
+                // 计算累积的总长度
+                let total_samples: usize = segments_list.iter().map(|seg| seg.len()).sum();
+                eprintln!("[SpeakerIdentifier] 📊 Accumulating reference audio for speaker '{}': {} segments, {} samples ({:.2}s @ 16kHz)", 
+                         speaker_id, segments_list.len(), total_samples, total_samples as f32 / 16000.0);
+                
+                // 如果累积的音频足够长，合并所有片段
+                if total_samples >= self.min_merged_audio_samples {
+                    eprintln!("[SpeakerIdentifier] 🔗 Merging {} reference audio segments for speaker '{}' (total: {:.2}s)", 
+                             segments_list.len(), speaker_id, total_samples as f32 / 16000.0);
+                    let merged: Vec<f32> = segments_list.iter().flat_map(|seg| seg.iter().cloned()).collect();
+                    // 清空片段列表，使用合并后的音频
+                    segments_list.clear();
+                    segments_list.push(merged.clone());
+                    // 标记为已合并，需要更新 YourTTS 缓存
+                    eprintln!("[SpeakerIdentifier] ✅ Merged reference audio ready for speaker '{}' ({} samples, {:.2}s) - should update YourTTS cache", 
+                             speaker_id, merged.len(), merged.len() as f32 / 16000.0);
+                    Some(merged)
+                } else {
+                    // 累积的音频还不够长，使用当前片段（但会在后续合并）
+                    Some(current_audio)
+                }
+            } else {
+                // 新说话者：使用当前片段，并初始化片段列表
+                let mut segments = self.speaker_reference_audio_segments.write().await;
+                segments.insert(speaker_id.clone(), vec![current_audio.clone()]);
+                eprintln!("[SpeakerIdentifier] 🆕 New speaker '{}': initializing reference audio ({} samples, {:.2}s @ 16kHz)", 
+                         speaker_id, current_audio.len(), current_audio.len() as f32 / 16000.0);
+                Some(current_audio)
+            }
         } else {
             None
         };
+        
+        // 获取估计的性别信息（即使音频足够长，也保存性别信息用于选择默认音色）
+        let estimated_gender = extract_result.estimated_gender;
+        if let Some(ref gender) = estimated_gender {
+            eprintln!("[SpeakerIdentifier] 👤 Estimated gender: {} (will use for default voice selection if needed)", gender);
+        }
         
         Ok(SpeakerIdentificationResult {
             speaker_id,
@@ -256,14 +352,17 @@ impl SpeakerIdentifier for EmbeddingBasedSpeakerIdentifier {
             confidence,
             voice_embedding: Some(embedding),  // 返回提取的 embedding 用于 Voice Cloning
             reference_audio,
+            estimated_gender,  // 保存性别信息，用于选择默认音色
         })
     }
     
     async fn reset(&self) -> EngineResult<()> {
         let mut embeddings = self.speaker_embeddings.write().await;
         let mut counter = self.next_speaker_id.write().await;
+        let mut segments = self.speaker_reference_audio_segments.write().await;
         
         embeddings.clear();
+        segments.clear();
         *counter = 1;
         
         Ok(())

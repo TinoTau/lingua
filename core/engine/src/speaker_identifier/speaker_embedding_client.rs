@@ -144,10 +144,11 @@ impl SpeakerEmbeddingClient {
                   total_ms, request_ms, parse_ms);
         eprintln!("[SpeakerEmbedding] ================================================");
 
+        // 即使音频足够长，也保存估计的性别信息（用于选择默认音色）
         Ok(ExtractEmbeddingResult {
             embedding: Some(embedding),
             use_default: false,
-            estimated_gender: None,
+            estimated_gender: result.estimated_gender,  // 保存性别信息，即使音频足够长
         })
     }
 

@@ -15,10 +15,204 @@ use crate::error::EngineResult;
 use crate::types::AudioFrame;
 use crate::vad::{DetectionOutcome, VoiceActivityDetector, BoundaryType};
 
-// 导入拆分的模块
-use super::config::SileroVadConfig;
-use super::adaptive_state::SpeakerAdaptiveState;
-use super::feedback::VadFeedbackType;
+/// Silero VAD 配置
+#[derive(Clone)]
+pub struct SileroVadConfig {
+    /// 模型文件路径
+    pub model_path: String,
+    /// 采样率（Silero VAD 要求 16kHz）
+    pub sample_rate: u32,
+    /// 帧大小（512 samples @ 16kHz = 32ms）
+    pub frame_size: usize,
+    /// 静音阈值（0.0-1.0），低于此值认为是静音
+    pub silence_threshold: f32,
+    /// 最小静音时长（毫秒），超过此时长才判定为自然停顿
+    pub min_silence_duration_ms: u64,
+    /// 是否启用自适应调整（按用户）
+    #[allow(dead_code)]
+    pub adaptive_enabled: bool,
+    /// 自适应调整的最小样本数（每个用户至少需要这么多样本才开始调整）
+    #[allow(dead_code)]
+    pub adaptive_min_samples: usize,
+    /// 自适应调整的速率（每次调整的幅度，0.0-1.0）
+    #[allow(dead_code)]
+    pub adaptive_rate: f32,
+    /// 基础阈值范围（语速自适应输出的基础范围，毫秒）
+    #[allow(dead_code)]
+    pub base_threshold_min_ms: u64,
+    /// 基础阈值范围（语速自适应输出的基础范围，毫秒）
+    #[allow(dead_code)]
+    pub base_threshold_max_ms: u64,
+    /// Delta 偏移量范围（质量反馈偏移量，毫秒）
+    #[allow(dead_code)]
+    pub delta_min_ms: i64,
+    /// Delta 偏移量范围（质量反馈偏移量，毫秒）
+    #[allow(dead_code)]
+    pub delta_max_ms: i64,
+    /// 最终阈值范围（实际使用的有效范围，毫秒）
+    #[allow(dead_code)]
+    pub final_threshold_min_ms: u64,
+    /// 最终阈值范围（实际使用的有效范围，毫秒）
+    #[allow(dead_code)]
+    pub final_threshold_max_ms: u64,
+    /// 最小话语时长（防止半句话被切掉，毫秒）
+    #[allow(dead_code)]
+    pub min_utterance_ms: u64,
+}
+
+impl Default for SileroVadConfig {
+    fn default() -> Self {
+        Self {
+            model_path: "models/vad/silero/silero_vad.onnx".to_string(),
+            sample_rate: 16000,
+            frame_size: 512,  // 32ms @ 16kHz
+            silence_threshold: 0.2,  // 降低阈值，提高语音检测灵敏度（从 0.5 降到 0.2）
+            min_silence_duration_ms: 300,  // 基础阈值（从500ms降低到300ms以更快响应）
+            adaptive_enabled: true,  // 默认启用自适应
+            adaptive_min_samples: 1,  // 至少1个样本（降低以更快开始调整）
+            adaptive_rate: 0.4,  // 每次调整40%（提高调整速度，更快适应语速变化）
+            base_threshold_min_ms: 200,  // 基础阈值范围：200-600ms（从400-800ms降低，更快响应短句）
+            base_threshold_max_ms: 600,
+            delta_min_ms: -200,  // Delta 偏移量范围：-200 ~ +200ms（质量反馈，降低范围）
+            delta_max_ms: 200,
+            final_threshold_min_ms: 200,  // 最终阈值范围：200-800ms（从300-1000ms降低，更快响应）
+            final_threshold_max_ms: 800,
+            min_utterance_ms: 1000,  // 最小话语时长：1000ms（降低以防止过度等待）
+        }
+    }
+}
+
+/// 每个说话者的自适应状态
+struct SpeakerAdaptiveState {
+    /// 语速历史（字符/秒）
+    speech_rate_history: VecDeque<f32>,
+    /// 基础阈值（由语速自适应生成，毫秒）
+    base_threshold_ms: u64,
+    /// Delta 偏移量（由质量反馈生成，毫秒）
+    delta_ms: i64,
+    /// 样本数量
+    sample_count: usize,
+}
+
+impl SpeakerAdaptiveState {
+    fn new(base_duration_ms: u64) -> Self {
+        eprintln!("[SileroVad] 🆕 Initialized SpeakerAdaptiveState with base_duration_ms={}ms", base_duration_ms);
+        Self {
+            speech_rate_history: VecDeque::with_capacity(20),  // 保留最近20个样本
+            base_threshold_ms: base_duration_ms,
+            delta_ms: 0,  // 初始 delta 为 0
+            sample_count: 0,
+        }
+    }
+    
+    /// 更新语速并调整阈值
+    /// 
+    /// 使用更精细的语速调整策略：
+    /// - 根据语速动态计算阈值倍数（连续函数，而非分段函数）
+    /// - 快语速 → 更短的阈值（说话者句子之间停顿短）
+    /// - 慢语速 → 更长的阈值（说话者可能在句子中间思考停顿）
+    fn update_speech_rate(&mut self, speech_rate: f32, config: &SileroVadConfig) {
+        self.speech_rate_history.push_back(speech_rate);
+        if self.speech_rate_history.len() > 20 {
+            self.speech_rate_history.pop_front();
+        }
+        self.sample_count += 1;
+        
+        // 如果样本数不足，使用基础阈值
+        // 但即使样本数不足，也允许使用当前语速进行快速调整（降低延迟）
+        let history_len = self.speech_rate_history.len();
+        let avg_speech_rate = if history_len > 0 {
+            // 使用指数加权移动平均（EWMA），最近的值权重更高
+            let alpha = 0.5; // 提高平滑因子（从0.3到0.5），更重视最近的值，响应更快
+            let mut weighted_sum = 0.0;
+            let mut weight_sum = 0.0;
+            for (i, &rate) in self.speech_rate_history.iter().enumerate() {
+                let weight = (1.0_f32 - alpha).powi((history_len - i - 1) as i32);
+                weighted_sum += rate * weight;
+                weight_sum += weight;
+            }
+            weighted_sum / weight_sum
+        } else {
+            speech_rate
+        };
+        
+        // 即使样本数不足，也允许进行快速调整（使用当前语速）
+        // 这样可以更快地响应语速变化，减少多个短句被合并的情况
+        
+        // 根据语速动态计算阈值倍数（使用连续函数，而非分段函数）
+        // 语速范围：0-20 字符/秒（正常范围：3-12 字符/秒）
+        // 目标：快语速（> 8 字符/秒）→ 更短的阈值，慢语速（< 4 字符/秒）→ 更长的阈值
+        // 
+        // 使用 sigmoid 函数实现平滑过渡：
+        // multiplier = 1.0 + (0.5 - sigmoid((rate - 6.0) / 2.0)) * 0.4
+        // 这样：
+        // - 语速 = 2 字符/秒 → multiplier ≈ 1.4（延长40%）
+        // - 语速 = 6 字符/秒 → multiplier ≈ 1.0（保持原值）
+        // - 语速 = 10 字符/秒 → multiplier ≈ 0.6（缩短40%）
+        let sigmoid = |x: f32| -> f32 {
+            1.0 / (1.0 + (-x).exp())
+        };
+        
+        // 将语速映射到 [-2, 2] 范围（sigmoid 的有效范围）
+        let normalized_rate = (avg_speech_rate - 6.0) / 2.0;
+        let sigmoid_value = sigmoid(normalized_rate);
+        
+        // 计算倍数：1.0 + (0.5 - sigmoid_value) * 0.4
+        // 当 sigmoid_value = 0.5（语速 = 6）时，multiplier = 1.0
+        // 当 sigmoid_value < 0.5（语速 < 6，慢语速）时，multiplier > 1.0
+        // 当 sigmoid_value > 0.5（语速 > 6，快语速）时，multiplier < 1.0
+        let multiplier = 1.0 + (0.5 - sigmoid_value) * 0.4;
+        
+        // 限制倍数范围：0.5 - 1.5（避免过度调整）
+        let multiplier = multiplier.clamp(0.5, 1.5);
+        
+        // 应用调整（使用平滑更新）- 只调整 base_threshold
+        let base_threshold_center = (config.base_threshold_min_ms + config.base_threshold_max_ms) / 2;
+        let target_base = (base_threshold_center as f32 * multiplier) as u64;
+        let old_base = self.base_threshold_ms;
+        let adjustment = (target_base as f32 - self.base_threshold_ms as f32) * config.adaptive_rate;
+        self.base_threshold_ms = ((self.base_threshold_ms as f32 + adjustment) as u64)
+            .clamp(config.base_threshold_min_ms, config.base_threshold_max_ms);
+        
+        // 记录阈值调整（仅在阈值变化较大时记录，避免日志过多）
+        let change_ratio = if old_base > 0 {
+            (self.base_threshold_ms as f32 - old_base as f32) / old_base as f32
+        } else {
+            0.0
+        };
+        if change_ratio.abs() > 0.1 {  // 变化超过10%时记录
+            let effective = self.get_effective_threshold(config);
+            eprintln!("[SileroVad] 🔧 Base threshold adjusted: {}ms -> {}ms (target={}ms, multiplier={:.2}x, avg_rate={:.2} chars/s, effective={}ms, change={:.1}%)", 
+                     old_base, self.base_threshold_ms, target_base, multiplier, avg_speech_rate, effective, change_ratio * 100.0);
+        }
+    }
+    
+    /// 获取有效阈值（base + delta，限制在最终范围内）
+    fn get_effective_threshold(&self, config: &SileroVadConfig) -> u64 {
+        let effective = (self.base_threshold_ms as i64 + self.delta_ms) as u64;
+        effective.clamp(config.final_threshold_min_ms, config.final_threshold_max_ms)
+    }
+    
+    /// 获取当前调整后的阈值（兼容旧接口）
+    fn get_adjusted_duration(&self, config: &SileroVadConfig) -> u64 {
+        // 即使样本数不足，也使用调整后的阈值（如果已经调整过）
+        // 这样可以更快地响应语速变化，减少多个短句被合并的情况
+        if self.sample_count == 0 {
+            config.min_silence_duration_ms
+        } else {
+            self.get_effective_threshold(config)
+        }
+    }
+    
+    /// 获取平均语速
+    fn get_avg_speech_rate(&self) -> Option<f32> {
+        if self.speech_rate_history.is_empty() {
+            None
+        } else {
+            Some(self.speech_rate_history.iter().sum::<f32>() / self.speech_rate_history.len() as f32)
+        }
+    }
+}
 
 /// Silero VAD 实现
 pub struct SileroVad {
@@ -719,6 +913,15 @@ impl SileroVad {
     }
 }
 
+/// VAD反馈类型（用于自适应阈值调整）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VadFeedbackType {
+    /// 边界过长：检测到音频输入但ASR长时间无输出，需要降低阈值
+    BoundaryTooLong,
+    /// 边界过短：ASR识别结果混乱、被过滤、或NMT翻译异常，需要提高阈值
+    BoundaryTooShort,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,8 +981,8 @@ mod tests {
         
         // 现在应该使用调整后的阈值
         let adjusted = state.get_adjusted_duration(&config);
-        assert!(adjusted >= config.adaptive_min_duration_ms);
-        assert!(adjusted <= config.adaptive_max_duration_ms);
+        assert!(adjusted >= config.final_threshold_min_ms);
+        assert!(adjusted <= config.final_threshold_max_ms);
     }
     
     #[test]
@@ -788,12 +991,14 @@ mod tests {
         assert_eq!(config.sample_rate, 16000);
         assert_eq!(config.frame_size, 512);
         assert_eq!(config.silence_threshold, 0.2);  // 更新为新的默认值
-        assert_eq!(config.min_silence_duration_ms, 600);
+        assert_eq!(config.min_silence_duration_ms, 300);
         assert!(config.adaptive_enabled);
-        assert_eq!(config.adaptive_min_samples, 3);
-        assert_eq!(config.adaptive_rate, 0.1);
-        assert_eq!(config.adaptive_min_duration_ms, 300);
-        assert_eq!(config.adaptive_max_duration_ms, 1200);
+        assert_eq!(config.adaptive_min_samples, 1);
+        assert_eq!(config.adaptive_rate, 0.4);
+        assert_eq!(config.base_threshold_min_ms, 200);
+        assert_eq!(config.base_threshold_max_ms, 600);
+        assert_eq!(config.final_threshold_min_ms, 200);
+        assert_eq!(config.final_threshold_max_ms, 800);
     }
     
     /// 创建测试用的语音音频帧

@@ -1,8 +1,5 @@
 mod time_based_vad;
 mod silero_vad;
-mod config;
-mod adaptive_state;
-mod feedback;
 
 #[cfg(test)]
 mod vad_feedback_test;
@@ -14,10 +11,7 @@ use crate::error::EngineResult;
 use crate::types::AudioFrame;
 
 pub use time_based_vad::TimeBasedVad;
-pub use silero_vad::SileroVad;
-pub use config::SileroVadConfig;
-// SpeakerAdaptiveState is crate-private, not exported
-pub use feedback::VadFeedbackType;
+pub use silero_vad::{SileroVad, SileroVadConfig, VadFeedbackType};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectionOutcome {

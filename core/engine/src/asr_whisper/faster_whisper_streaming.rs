@@ -482,15 +482,29 @@ impl AsrStreaming for FasterWhisperAsrStreaming {
             config_guard.clone()
         };
 
+        // 3. 如果流式推理未启用，但缓冲区有数据，直接调用 infer_on_boundary 进行处理
+        // 这样可以支持连续模式：当 VAD 检测到边界时，直接调用 infer() 也能工作
         if !config.enabled {
-            // 流式推理未启用，返回空结果
+            // 检查缓冲区是否有数据
+            let buffer_size = {
+                let buffer = self.audio_buffer.lock()
+                    .map_err(|e| EngineError::new(format!("Failed to lock audio buffer: {}", e)))?;
+                buffer.len()
+            };
+            
+            // 如果缓冲区有数据，直接进行推理（用于连续模式）
+            if buffer_size > 0 {
+                return self.infer_on_boundary().await;
+            }
+            
+            // 否则返回空结果
             return Ok(AsrResult {
                 partial: None,
                 final_transcript: None,
             });
         }
 
-        // 3. 检查是否应该输出部分结果
+        // 4. 检查是否应该输出部分结果
         let current_timestamp_ms = request.frame.timestamp_ms;
         let should_update = current_timestamp_ms.saturating_sub(config.last_partial_update_ms)
             >= (config.partial_update_interval_seconds * 1000.0) as u64;
@@ -502,14 +516,14 @@ impl AsrStreaming for FasterWhisperAsrStreaming {
             });
         }
 
-        // 4. 更新上次更新时间
+        // 5. 更新上次更新时间
         {
             let mut config_guard = self.streaming_config.lock()
                 .map_err(|e| EngineError::new(format!("Failed to lock streaming config: {}", e)))?;
             config_guard.last_partial_update_ms = current_timestamp_ms;
         }
 
-        // 5. 执行推理（这里可以调用 infer_on_boundary 的逻辑，但返回部分结果）
+        // 6. 执行推理（这里可以调用 infer_on_boundary 的逻辑，但返回部分结果）
         // 注意：流式推理的部分结果输出需要更复杂的实现，这里简化处理
         Ok(AsrResult {
             partial: None,

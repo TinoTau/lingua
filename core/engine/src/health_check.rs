@@ -86,6 +86,7 @@ impl HealthChecker {
     pub async fn check_tts_service(&self, base_url: &str) -> ServiceHealth {
         // 从 URL 中提取基础 URL（去掉路径部分）
         // 例如: http://127.0.0.1:5005/tts -> http://127.0.0.1:5005
+        // 例如: http://127.0.0.1:5004 -> http://127.0.0.1:5004 (YourTTS 没有路径)
         let base = if let Some(protocol_pos) = base_url.find("://") {
             let after_protocol = &base_url[protocol_pos + 3..];
             if let Some(path_start) = after_protocol.find('/') {
@@ -103,6 +104,7 @@ impl HealthChecker {
         } else {
             format!("{}/health", base)
         };
+        eprintln!("[HealthCheck] TTS service URL: {}, base: {}, health check URL: {}", base_url, base, health_url_str);
         let health_url = reqwest::Url::parse(&health_url_str)
             .unwrap_or_else(|_| reqwest::Url::parse("http://127.0.0.1:5005/health").unwrap());
         match self.http.get(health_url.clone()).send().await {

@@ -3,12 +3,13 @@ use std::sync::Arc;
 use std::io::Cursor;
 use std::time::Instant;
 use axum::{
-    extract::{ws::WebSocketUpgrade, State},
+    extract::{ws::{WebSocketUpgrade, WebSocket, Message}, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::Response,
     routing::{get, post},
     Json, Router,
 };
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
@@ -21,10 +22,12 @@ use core_engine::types::AudioFrame;
 use core_engine::health_check::HealthChecker;
 use core_engine::emotion_adapter::EmotionStub;
 use core_engine::persona_adapter::PersonaStub;
-use core_engine::event_bus::{EventBus, CoreEvent, EventTopic, EventSubscription};
-use core_engine::vad::{VoiceActivityDetector, DetectionOutcome};
+use core_engine::event_bus::{EventBus, CoreEvent, EventTopic, EventSubscription, ChannelEventBus};
+use core_engine::vad::{VoiceActivityDetector, DetectionOutcome, SileroVad};
 use core_engine::cache_manager::CacheManager;
 use core_engine::telemetry::{TelemetrySink, TelemetryDatum};
+use core_engine::speaker_identifier::SpeakerIdentifierMode;
+use core_engine::tts_streaming::YourTtsHttpConfig;
 use async_trait::async_trait;
 
 /// 运行时配置（从 TOML 文件加载）
@@ -32,6 +35,12 @@ use async_trait::async_trait;
 struct RuntimeConfig {
     nmt: NmtConfig,
     tts: TtsConfig,
+    #[serde(default)]
+    asr: Option<AsrConfig>,
+    #[serde(default)]
+    speaker_embedding: Option<SpeakerEmbeddingConfig>,
+    #[serde(default)]
+    yourtts: Option<YourTtsConfig>,
     engine: EngineRuntimeConfig,
 }
 
@@ -46,9 +55,25 @@ struct TtsConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct AsrConfig {
+    url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SpeakerEmbeddingConfig {
+    url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct YourTtsConfig {
+    url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct EngineRuntimeConfig {
     port: u16,
     whisper_model_path: Option<String>,
+    silero_vad_model_path: Option<String>,
 }
 
 /// S2S 请求（整句翻译）
@@ -87,6 +112,7 @@ struct AppState {
     engine: Arc<CoreEngine>,
     config: RuntimeConfig,
     simple_config: Arc<SimpleConfig>,  // 用于动态更新语言配置
+    event_bus: Arc<ChannelEventBus>,  // 事件总线（用于 WebSocket 订阅）
 }
 
 // 简单的默认实现
@@ -218,18 +244,28 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("[INFO]   TTS URL: {}", runtime_config.tts.url);
     eprintln!("[INFO]   Engine Port: {}", runtime_config.engine.port);
 
+    // 2.5. 初始化 ASR 过滤器配置（必须在创建 CoreEngine 之前）
+    let _ = core_engine::asr_filters::config::init_config_from_file();
+    eprintln!("[INFO] ASR filter config initialized");
+
     // 3. 创建 SimpleConfig（用于动态更新语言）
     let simple_config = Arc::new(SimpleConfig::new("en".to_string(), "zh".to_string()));
     
-    // 4. 初始化 CoreEngine
-    let engine = initialize_engine(&runtime_config, simple_config.clone()).await?;
+    // 4. 初始化事件总线（使用 ChannelEventBus 以支持真正的发布/订阅）
+    let event_bus = Arc::new(ChannelEventBus::new());
+    event_bus.start().await
+        .map_err(|e| anyhow::anyhow!("Failed to start event bus: {}", e))?;
+    
+    // 5. 初始化 CoreEngine
+    let engine = initialize_engine(&runtime_config, simple_config.clone(), event_bus.clone()).await?;
     eprintln!("[INFO] CoreEngine initialized successfully");
 
-    // 5. 启动 HTTP 服务器
+    // 6. 启动 HTTP 服务器
     let app_state = AppState {
         engine: Arc::new(engine),
         config: runtime_config.clone(),
         simple_config: simple_config.clone(),
+        event_bus: event_bus.clone(),
     };
 
     let app = Router::new()
@@ -249,36 +285,109 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// 初始化 CoreEngine
-async fn initialize_engine(config: &RuntimeConfig, simple_config: Arc<SimpleConfig>) -> EngineResult<CoreEngine> {
+async fn initialize_engine(
+    config: &RuntimeConfig, 
+    simple_config: Arc<SimpleConfig>,
+    event_bus: Arc<ChannelEventBus>,
+) -> EngineResult<CoreEngine> {
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     
-    // 确定 Whisper 模型路径
-    let whisper_model_path = config.engine.whisper_model_path.clone()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| crate_root.join("models/asr/whisper-base"));
+    // 1. 初始化 SileroVad
+    // 注意：配置文件中的路径可以是绝对路径或相对路径
+    // - 绝对路径：直接使用（例如：D:\Programs\github\lingua\core\engine\models\vad\silero\silero_vad_official.onnx）
+    // - 相对路径：从 crate_root 解析（例如：models/vad/silero/silero_vad_official.onnx）
+    let silero_vad_model_path = config.engine.silero_vad_model_path.clone()
+        .map(|p| {
+            let path = PathBuf::from(&p);
+            // 如果是绝对路径，直接使用；否则从 crate_root 解析
+            if path.is_absolute() {
+                path
+            } else {
+                // 相对路径：从 crate_root 解析
+                // 注意：Rust 的 PathBuf::join() 会自动处理路径分隔符（/ 和 \）
+                crate_root.join(&p)
+            }
+        })
+        .unwrap_or_else(|| crate_root.join("models/vad/silero/silero_vad_official.onnx"));
+    
+    eprintln!("[INFO] Crate root: {}", crate_root.display());
+    eprintln!("[INFO] SileroVad model path from config: {:?}", config.engine.silero_vad_model_path);
+    eprintln!("[INFO] Resolved SileroVad model path: {} (exists: {})", 
+              silero_vad_model_path.display(), 
+              silero_vad_model_path.exists());
+    
+    let vad: Arc<dyn VoiceActivityDetector> = if silero_vad_model_path.exists() {
+        eprintln!("[INFO] Initializing SileroVad from: {}", silero_vad_model_path.display());
+        Arc::new(SileroVad::new(&silero_vad_model_path)
+            .map_err(|e| core_engine::error::EngineError::new(format!("Failed to initialize SileroVad: {}", e)))?) as Arc<dyn VoiceActivityDetector>
+    } else {
+        eprintln!("[WARN] SileroVad model not found at: {}, using SimpleVad", silero_vad_model_path.display());
+        eprintln!("[WARN] Crate root: {}", crate_root.display());
+        Arc::new(SimpleVad) as Arc<dyn VoiceActivityDetector>
+    };
 
-    // 构建 CoreEngine
-    let engine = CoreEngineBuilder::new()
-        .event_bus(Arc::new(SimpleEventBus))
-        .vad(Arc::new(SimpleVad))
-        .asr_with_default_whisper()
-        .map_err(|e| core_engine::error::EngineError::new(format!("Failed to initialize ASR: {}", e)))?
-        .nmt_with_m2m100_http_client(Some(&config.nmt.url))
-        .map_err(|e| core_engine::error::EngineError::new(format!("Failed to initialize NMT: {}", e)))?
-        .emotion(Arc::new(EmotionStub))
-        .persona(Arc::new(PersonaStub))
-        .tts_with_piper_http(core_engine::tts_streaming::PiperHttpConfig {
+    // 2. 初始化 ASR（优先使用 faster-whisper，否则使用本地 whisper-rs）
+    let mut builder = CoreEngineBuilder::new()
+        .event_bus(event_bus.clone() as Arc<dyn EventBus>)
+        .vad(vad);
+    
+    if let Some(ref asr_config) = config.asr {
+        eprintln!("[INFO] Initializing Faster-Whisper ASR: {}", asr_config.url);
+        builder = builder.asr_with_faster_whisper(asr_config.url.clone(), 30)
+            .map_err(|e| core_engine::error::EngineError::new(format!("Failed to initialize Faster-Whisper ASR: {}", e)))?;
+    } else {
+        eprintln!("[WARN] ASR config not found, using default Whisper");
+        builder = builder.asr_with_default_whisper()
+            .map_err(|e| core_engine::error::EngineError::new(format!("Failed to initialize ASR: {}", e)))?;
+    }
+
+    // 3. 初始化 NMT
+    builder = builder.nmt_with_m2m100_http_client(Some(&config.nmt.url))
+        .map_err(|e| core_engine::error::EngineError::new(format!("Failed to initialize NMT: {}", e)))?;
+
+    // 4. 初始化 TTS（优先使用 YourTTS，否则使用 Piper TTS）
+    if let Some(ref yourtts_config) = config.yourtts {
+        eprintln!("[INFO] Initializing YourTTS: {}", yourtts_config.url);
+        builder = builder.tts_with_yourtts_http(YourTtsHttpConfig {
+            endpoint: yourtts_config.url.clone(),
+            timeout_ms: 30000,
+        })
+        .map_err(|e| core_engine::error::EngineError::new(format!("Failed to initialize YourTTS: {}", e)))?;
+    } else {
+        eprintln!("[WARN] YourTTS config not found, using Piper TTS");
+        builder = builder.tts_with_piper_http(core_engine::tts_streaming::PiperHttpConfig {
             endpoint: config.tts.url.clone(),
             default_voice: "zh_CN-huayan-medium".to_string(),
             timeout_ms: 8000,
         })
-        .map_err(|e| core_engine::error::EngineError::new(format!("Failed to initialize TTS: {}", e)))?
+        .map_err(|e| core_engine::error::EngineError::new(format!("Failed to initialize TTS: {}", e)))?;
+    }
+
+    // 5. 初始化说话者识别（如果配置了 Speaker Embedding 服务）
+    if let Some(ref speaker_config) = config.speaker_embedding {
+        eprintln!("[INFO] Initializing Speaker Identification: {}", speaker_config.url);
+        builder = builder.with_speaker_identification(
+            SpeakerIdentifierMode::EmbeddingBased {
+                service_url: Some(speaker_config.url.clone()),
+                similarity_threshold: 0.6,  // 提高阈值：0.6 表示 60% 相似度才认为是同一说话者（0.3 太低导致同一说话者被识别为多个）
+            }
+        )
+        .map_err(|e| core_engine::error::EngineError::new(format!("Failed to initialize Speaker Identification: {}", e)))?;
+    } else {
+        eprintln!("[WARN] Speaker Embedding config not found, speaker identification disabled");
+    }
+
+    // 6. 构建 CoreEngine
+    let engine = builder
+        .emotion(Arc::new(EmotionStub))
+        .persona(Arc::new(PersonaStub))
         .config(simple_config.clone() as Arc<dyn ConfigManager>)
         .cache(Arc::new(SimpleCache))
         .telemetry(Arc::new(SimpleTelemetry))
         .with_post_processing(None, true)
         .with_tts_incremental_playback(true, 0, 50)
         .with_audio_enhancement(core_engine::tts_audio_enhancement::AudioEnhancementConfig::default())
+        .with_continuous_mode(true, 5000, 200)  // 启用连续模式以支持 WebSocket 流式处理 (max_buffer=5s, min_segment=200ms)
         .build()
         .map_err(|e| core_engine::error::EngineError::new(format!("Failed to build engine: {}", e)))?;
 
@@ -374,7 +483,7 @@ async fn s2s_handler(
             }
         }
     }
-
+    
     // 5. 处理最后一帧，应该触发边界检测和完整推理
     if final_result.is_none() {
         if let Some(last_frame) = audio_frames.last() {
@@ -516,10 +625,216 @@ fn parse_wav_to_frames(wav_data: &[u8]) -> anyhow::Result<Vec<AudioFrame>> {
 /// WebSocket 流式翻译端点
 async fn stream_handler(
     ws: WebSocketUpgrade,
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> Response {
-    // TODO: 实现 WebSocket 流式处理
-    ws.on_upgrade(|_socket| async move {
-        // WebSocket 处理逻辑
+    ws.on_upgrade(move |socket| async move {
+        handle_socket(socket, state).await;
     })
+}
+
+async fn handle_socket(socket: WebSocket, state: AppState) {
+    eprintln!("[WebSocket] ✅ Client connected");
+
+    // 分离 WebSocket 的发送端和接收端
+    let (sender, mut receiver) = socket.split();
+    
+    // 使用 Arc<Mutex<>> 包装 sender，以便在多个任务中共享
+    let sender = Arc::new(tokio::sync::Mutex::new(sender));
+    
+    let mut src_lang = "en".to_string(); // 默认源语言
+    let mut tgt_lang = "zh".to_string(); // 默认目标语言
+    let mut frame_count = 0u64;
+    
+    // 订阅 TTS 事件，用于接收增量音频输出
+    let mut tts_receiver_from_bus = state.event_bus.subscribe_receiver(EventTopic("Tts".to_string()));
+    eprintln!("[WebSocket] 📡 Subscribed to TTS events");
+    
+    // 启动任务：从事件总线接收 TTS 事件，按 timestamp_ms 排序后发送到 WebSocket
+    let sender_for_tts = Arc::clone(&sender);
+    tokio::spawn(async move {
+        let mut pending_events: Vec<CoreEvent> = Vec::new();
+        let mut next_expected_timestamp = 0u64;
+        
+        while let Some(event) = tts_receiver_from_bus.recv().await {
+            pending_events.push(event);
+            
+            // 按 timestamp_ms 排序
+            pending_events.sort_by_key(|e| e.timestamp_ms);
+            
+            // 发送所有可以发送的事件（按顺序）
+            while let Some(pos) = pending_events.iter().position(|e| e.timestamp_ms >= next_expected_timestamp) {
+                let event = pending_events.remove(pos);
+                next_expected_timestamp = event.timestamp_ms + 1;  // 更新期望的时间戳
+                
+                // 解析事件 payload
+                if let Some(audio_base64) = event.payload.get("audio").and_then(|v| v.as_str()) {
+                    let response_json = serde_json::json!({
+                        "type": "tts_chunk",
+                        "audio": audio_base64,
+                        "timestamp_ms": event.timestamp_ms,
+                        "is_last": event.payload.get("is_last").and_then(|v| v.as_bool()).unwrap_or(false),
+                    });
+                    
+                    let mut sender_guard = sender_for_tts.lock().await;
+                    if let Err(e) = sender_guard.send(Message::Text(response_json.to_string())).await {
+                        eprintln!("[WebSocket] ❌ Failed to send TTS event: {}", e);
+                        return;
+                    }
+                    drop(sender_guard); // 显式释放锁
+                    
+                    eprintln!("[WebSocket] 📤 Sent TTS chunk (timestamp: {}ms, is_last: {}, audio_size: {} chars)", 
+                        event.timestamp_ms,
+                        event.payload.get("is_last").and_then(|v| v.as_bool()).unwrap_or(false),
+                        audio_base64.len());
+                }
+            }
+        }
+    });
+
+    while let Some(msg) = receiver.next().await {
+        let msg = match msg {
+            Ok(msg) => msg,
+                            Err(e) => {
+                eprintln!("[WebSocket] ❌ Error receiving message: {}", e);
+                return;
+            }
+        };
+
+        match msg {
+            Message::Text(text) => {
+                // 尝试解析为 JSON（配置或音频帧）
+                if let Ok(json_msg) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if json_msg["type"] == "config" {
+                        // 处理配置消息
+                        if let Some(lang) = json_msg["src_lang"].as_str() {
+                            src_lang = lang.to_string();
+                        }
+                        if let Some(lang) = json_msg["tgt_lang"].as_str() {
+                            tgt_lang = lang.to_string();
+                        }
+                        state.simple_config.set_source_language(src_lang.clone()).await;
+                        state.simple_config.set_target_language(tgt_lang.clone()).await;
+                        eprintln!("[WebSocket] ⚙️ Config updated: src={}, tgt={}", src_lang, tgt_lang);
+                    } else if json_msg["type"] == "audio_frame" {
+                        // 处理音频帧
+                        if let (Some(base64_audio), Some(timestamp_ms), Some(sample_rate), Some(channels)) = (
+                            json_msg["data"].as_str(),
+                            json_msg["timestamp_ms"].as_u64(),
+                            json_msg["sample_rate"].as_u64(),
+                            json_msg["channels"].as_u64(),
+                        ) {
+                            frame_count += 1;
+                            
+                            // 解码 base64 音频数据
+                            let audio_data = match general_purpose::STANDARD.decode(base64_audio) {
+                                Ok(data) => data,
+                    Err(e) => {
+                                    eprintln!("[WebSocket] ❌ Failed to decode base64 audio (frame #{}): {}", frame_count, e);
+                                    continue;
+                                }
+                            };
+
+                            // 将 16-bit PCM 转换为 f32
+                            let pcm_data: Vec<i16> = audio_data
+                    .chunks_exact(2)
+                                .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+                    .collect();
+                            let float_data: Vec<f32> = pcm_data.into_iter().map(|s| s as f32 / 32768.0).collect();
+                
+                // 计算音频统计信息
+                            let max_amplitude = float_data.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+                            let rms = (float_data.iter().map(|x| x * x).sum::<f32>() / float_data.len() as f32).sqrt();
+
+                            let audio_frame = AudioFrame {
+                                sample_rate: sample_rate as u32,
+                                channels: channels as u8,
+                                data: float_data,
+                                timestamp_ms,
+                            };
+
+                            // 每 50 帧输出一次日志，避免日志过多
+                            if frame_count % 50 == 0 {
+                                eprintln!("[WebSocket] 📥 Received audio frame #{}: {}Hz {}ch, {} samples ({}ms), max={:.4}, rms={:.4}", 
+                                    frame_count, sample_rate, channels, audio_frame.data.len(), 
+                                    timestamp_ms, max_amplitude, rms);
+                            }
+
+                            // 处理音频帧（如果启用了连续模式，会自动使用连续处理逻辑）
+                            match state.engine.process_audio_frame(audio_frame, Some(src_lang.clone())).await {
+                    Ok(Some(result)) => {
+                                    // 发送 ASR 转录、NMT 翻译和 TTS 音频
+                                    let tts_audio_base64 = result.tts.as_ref().and_then(|t| {
+                                        if t.audio.is_empty() {
+                                            eprintln!("[WebSocket] ⚠️ TTS audio is empty!");
+                                            None
+                                        } else {
+                                            eprintln!("[WebSocket] 📤 Sending TTS audio: {} bytes (base64: {} chars)", 
+                                                t.audio.len(), 
+                                                general_purpose::STANDARD.encode(&t.audio).len());
+                                            Some(general_purpose::STANDARD.encode(&t.audio))
+                                        }
+                                    });
+                                    
+                                    let response_json = serde_json::json!({
+                                        "transcript": result.asr.final_transcript.as_ref().map(|t| t.text.clone()),
+                                        "translation": result.translation.as_ref().map(|t| t.translated_text.clone()),
+                                        "audio": tts_audio_base64,
+                                    });
+                                    
+                                    eprintln!("[WebSocket] 📤 Sending response: transcript={:?}, translation={:?}, audio={}", 
+                                        result.asr.final_transcript.as_ref().map(|t| t.text.as_str()),
+                                        result.translation.as_ref().map(|t| t.translated_text.as_str()),
+                                        if tts_audio_base64.is_some() { "Yes" } else { "No" });
+                                    
+                                    let mut sender_guard = sender.lock().await;
+                                    if let Err(e) = sender_guard.send(Message::Text(response_json.to_string())).await {
+                                        eprintln!("[WebSocket] ❌ Failed to send response: {}", e);
+                                        drop(sender_guard);
+                                        break;
+                                    }
+                                    drop(sender_guard); // 显式释放锁
+                                    }
+                                    Ok(None) => {
+                                    // 没有最终结果，继续处理
+                                    eprintln!("[WebSocket] ⏳ 处理中，暂无最终结果");
+                                    }
+                                    Err(e) => {
+                                    eprintln!("[WebSocket] ❌ Error processing audio frame #{}: {}", frame_count, e);
+                                }
+                            }
+                        } else {
+                            eprintln!("[WebSocket] ⚠️ Invalid audio_frame message format (frame #{})", frame_count);
+                        }
+                    } else {
+                        eprintln!("[WebSocket] ⚠️ Unknown message type: {}", json_msg["type"]);
+                    }
+                } else {
+                    eprintln!("[WebSocket] ⚠️ Failed to parse JSON message");
+                }
+            }
+            Message::Binary(data) => {
+                eprintln!("[WebSocket] 📦 Received binary message: {} bytes", data.len());
+            }
+            Message::Ping(payload) => {
+                let mut sender_guard = sender.lock().await;
+                if let Err(e) = sender_guard.send(Message::Pong(payload)).await {
+                    eprintln!("[WebSocket] ❌ Failed to send Pong: {}", e);
+                    drop(sender_guard);
+                    break;
+                }
+                drop(sender_guard); // 显式释放锁
+            }
+            Message::Pong(_) => {
+                // 不做处理
+            }
+            Message::Close(close_frame) => {
+                eprintln!("[WebSocket] 🔌 Client disconnected (frames received: {})", frame_count);
+                if let Some(frame) = close_frame {
+                    eprintln!("[WebSocket] Close frame: code={:?}, reason={:?}", frame.code, frame.reason);
+                }
+                break;
+            }
+        }
+    }
+    eprintln!("[WebSocket] 👋 Connection closed (total frames: {})", frame_count);
 }

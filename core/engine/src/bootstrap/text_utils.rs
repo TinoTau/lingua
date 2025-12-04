@@ -298,5 +298,69 @@ impl super::core::CoreEngine {
         
         result
     }
+
+    /// 根据估计的性别获取默认音色名称（用于 TTS voice 参数）
+    /// 
+    /// # Arguments
+    /// * `estimated_gender` - 估计的性别（"male"、"female" 或 "unknown"）
+    /// 
+    /// # Returns
+    /// 返回默认音色名称
+    pub(crate) fn get_default_voice_by_gender(estimated_gender: Option<&String>) -> String {
+        match estimated_gender {
+            Some(gender) => {
+                match gender.to_lowercase().as_str() {
+                    "male" | "m" => {
+                        eprintln!("[TTS] 🎤 Using default male voice (estimated gender: {})", gender);
+                        "male".to_string()  // 可以根据实际 TTS 服务调整
+                    }
+                    "female" | "f" => {
+                        eprintln!("[TTS] 🎤 Using default female voice (estimated gender: {})", gender);
+                        "female".to_string()  // 可以根据实际 TTS 服务调整
+                    }
+                    _ => {
+                        eprintln!("[TTS] 🎤 Using default neutral voice (estimated gender: {})", gender);
+                        "neutral".to_string()  // 未知性别使用中性音色
+                    }
+                }
+            }
+            None => {
+                eprintln!("[TTS] 🎤 Using default neutral voice (no gender information)");
+                "neutral".to_string()  // 没有性别信息，使用中性音色
+            }
+        }
+    }
+
+    /// 根据估计的性别获取默认说话者 ID（用于 YourTTS speaker 参数）
+    /// 
+    /// # Arguments
+    /// * `estimated_gender` - 估计的性别（"male"、"female" 或 "unknown"）
+    /// 
+    /// # Returns
+    /// 返回默认说话者 ID
+    pub(crate) fn get_default_speaker_by_gender(estimated_gender: Option<&String>) -> String {
+        match estimated_gender {
+            Some(gender) => {
+                match gender.to_lowercase().as_str() {
+                    "male" | "m" => {
+                        eprintln!("[TTS] 🎤 Using default male speaker (estimated gender: {})", gender);
+                        "default_male".to_string()
+                    }
+                    "female" | "f" => {
+                        eprintln!("[TTS] 🎤 Using default female speaker (estimated gender: {})", gender);
+                        "default_female".to_string()
+                    }
+                    _ => {
+                        eprintln!("[TTS] 🎤 Using default neutral speaker (estimated gender: {})", gender);
+                        "default_speaker".to_string()  // 未知性别使用通用默认
+                    }
+                }
+            }
+            None => {
+                eprintln!("[TTS] 🎤 Using default neutral speaker (no gender information)");
+                "default_speaker".to_string()  // 没有性别信息，使用通用默认
+            }
+        }
+    }
 }
 

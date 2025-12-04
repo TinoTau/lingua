@@ -58,9 +58,14 @@ impl CoreEngine {
         tts_chunk: &TtsStreamChunk,
         timestamp_ms: u64,
     ) -> EngineResult<()> {
+        // 将音频数据编码为 base64，以便在事件中传输
+        use base64::{Engine as _, engine::general_purpose};
+        let audio_base64 = general_purpose::STANDARD.encode(&tts_chunk.audio);
+        
         let event = CoreEvent {
             topic: EventTopic("Tts".to_string()),
             payload: json!({
+                "audio": audio_base64,  // 包含完整的音频数据（base64 编码）
                 "audio_length": tts_chunk.audio.len(),
                 "timestamp_ms": tts_chunk.timestamp_ms,
                 "is_last": tts_chunk.is_last,

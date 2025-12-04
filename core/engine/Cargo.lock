@@ -1146,6 +1146,7 @@ dependencies = [
  "axum",
  "base64 0.21.7",
  "futures",
+ "futures-util",
  "hound",
  "ndarray",
  "ort",

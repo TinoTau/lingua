@@ -165,6 +165,7 @@ impl NmtIncremental for M2M100NmtOnnx {
             speaker_id: None,
             source_text: None,
             source_audio_duration_ms: None,
+            source_language: None,  // M2M100 可能无法提供源语言信息
             quality_metrics: None,
             is_stable: request.wait_k.is_none() || request.wait_k == Some(0),
         })

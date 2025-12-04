@@ -17,8 +17,13 @@ mod tests {
             adaptive_enabled: true,
             adaptive_min_samples: 1,
             adaptive_rate: 0.4,
-            adaptive_min_duration_ms: 400,
-            adaptive_max_duration_ms: 800,
+            base_threshold_min_ms: 400,
+            base_threshold_max_ms: 600,
+            delta_min_ms: -200,
+            delta_max_ms: 200,
+            final_threshold_min_ms: 400,
+            final_threshold_max_ms: 800,
+            min_utterance_ms: 1000,
         }
     }
     
@@ -32,8 +37,8 @@ mod tests {
         let config = create_test_config();
         assert!(config.adaptive_enabled, "自适应应该启用");
         assert_eq!(config.min_silence_duration_ms, 400, "基础阈值应该是400ms");
-        assert_eq!(config.adaptive_min_duration_ms, 400, "最小阈值应该是400ms");
-        assert_eq!(config.adaptive_max_duration_ms, 800, "最大阈值应该是800ms");
+        assert_eq!(config.final_threshold_min_ms, 400, "最小阈值应该是400ms");
+        assert_eq!(config.final_threshold_max_ms, 800, "最大阈值应该是800ms");
     }
     
     /// 测试 adjust_threshold_by_feedback - BoundaryTooLong
@@ -42,10 +47,10 @@ mod tests {
         let config = create_test_config();
         
         // 测试配置范围
-        assert!(config.adaptive_min_duration_ms <= config.adaptive_max_duration_ms,
+        assert!(config.final_threshold_min_ms <= config.final_threshold_max_ms,
                 "最小阈值应该小于等于最大阈值");
-        assert!(config.min_silence_duration_ms >= config.adaptive_min_duration_ms,
-                "基础阈值应该大于等于最小阈值");
+        assert!(config.base_threshold_min_ms <= config.base_threshold_max_ms,
+                "基础阈值范围应该有效");
     }
     
     /// 测试 VadFeedbackType 枚举

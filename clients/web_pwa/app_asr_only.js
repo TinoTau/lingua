@@ -185,6 +185,9 @@ class LinguaAsrOnlyApp {
     }
 
     stopRecording() {
+        // 先设置 isRecording = false，防止继续发送音频帧
+        this.isRecording = false;
+        
         if (this.processorNode) {
             this.processorNode.disconnect();
             this.processorNode = null;
@@ -196,11 +199,10 @@ class LinguaAsrOnlyApp {
         }
 
         if (this.websocket) {
+            // 关闭 WebSocket 连接
             this.websocket.close();
             this.websocket = null;
         }
-
-        this.isRecording = false;
 
         // 更新 UI
         this.updateStatus('idle', '已停止录音');
