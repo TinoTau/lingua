@@ -234,6 +234,33 @@ impl TtsStreaming for YourTtsHttp {
         };
         eprintln!("[YourTTS] Text: '{}' (locale={})", text_preview, request.locale);
         
+        // 检查文本是否包含中文字符
+        let contains_chinese = request.text.chars().any(|c| {
+            let code = c as u32;
+            (0x4E00..=0x9FFF).contains(&code) ||  // CJK Unified Ideographs
+            (0x3400..=0x4DBF).contains(&code) ||  // CJK Extension A
+            (0x20000..=0x2A6DF).contains(&code)   // CJK Extension B
+        });
+        
+        // 如果文本包含中文，但：
+        // 1. 没有 reference_audio（zero-shot TTS）
+        // 2. 没有 speaker_id（查找缓存的 reference_audio）
+        // 3. 语言设置为 "en"（多人模式回退）
+        // 则 YourTTS 无法处理，应该返回错误
+        if contains_chinese {
+            let has_reference_audio = request.reference_audio.is_some();
+            let has_speaker_id = request.speaker_id.is_some();
+            let is_multi_user_mode = request.speaker_id.as_ref()
+                .map(|s| s.starts_with("default_"))
+                .unwrap_or(false);
+            
+            if is_multi_user_mode || (!has_reference_audio && !has_speaker_id) {
+                return Err(EngineError::new(format!(
+                    "YourTTS does not support Chinese text. Text contains Chinese characters but no reference audio is available for zero-shot TTS. Please use a TTS service that supports Chinese (e.g., Piper TTS)."
+                )));
+            }
+        }
+        
         // 准备请求体
         // 优先使用 speaker_id（查找服务端缓存的 reference_audio）
         // 如果没有 speaker_id，使用 reference_audio 进行 zero-shot TTS
@@ -276,7 +303,18 @@ impl TtsStreaming for YourTtsHttp {
             } else {
                 None
             },
-            language: Some(request.locale.clone()),
+            // 多人模式下，如果使用 default_male/default_female，且目标语言是中文，
+            // YourTTS 不支持中文，需要将语言设置为 None 或使用支持的语言
+            // 注意：YourTTS 模型只支持 en, fr-fr, pt-br
+            language: if request.speaker_id.as_ref().map(|s| s.starts_with("default_")).unwrap_or(false) 
+                && request.locale.starts_with("zh") {
+                // 多人模式 + 中文：YourTTS 不支持，设置为 None 让服务端使用默认处理
+                // 或者设置为 "en" 作为回退
+                eprintln!("[YourTTS] ⚠️  Multi-user mode with Chinese target language detected. YourTTS doesn't support Chinese, using 'en' as fallback");
+                Some("en".to_string())
+            } else {
+                Some(request.locale.clone())
+            },
             speech_rate: request.speech_rate,
         };
         

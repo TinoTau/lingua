@@ -12,6 +12,7 @@ class LinguaRealtimeApp {
         this.logEntries = [];
         this.audioWorkletNode = null;
         this.processorNode = null;
+        this.speakerMode = 'single_user';  // 默认单人模式
 
         this.init();
     }
@@ -24,11 +25,18 @@ class LinguaRealtimeApp {
             this.serviceUrl = e.target.value;
         });
 
+        // 绑定模式切换按钮
+        document.getElementById('btnModeSingle').addEventListener('click', () => this.setSpeakerMode('single_user'));
+        document.getElementById('btnModeMulti').addEventListener('click', () => this.setSpeakerMode('multi_user'));
+
         // 检查浏览器支持
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
             this.showError('您的浏览器不支持音频录制功能。请使用 Chrome、Firefox 或 Edge 浏览器。');
             document.getElementById('btnStart').disabled = true;
         }
+
+        // 加载当前模式
+        this.loadSpeakerMode();
     }
 
     async startRecording() {
@@ -290,6 +298,72 @@ class LinguaRealtimeApp {
         if (logEl) {
             logEl.textContent = this.logEntries.join('\n');
             logEl.scrollTop = logEl.scrollHeight;
+        }
+    }
+
+    async loadSpeakerMode() {
+        try {
+            const response = await fetch(`${this.serviceUrl}/config/speaker-mode`);
+            if (response.ok) {
+                const data = await response.json();
+                this.speakerMode = data.mode;
+                this.updateModeUI();
+                this.logMessage(`已加载说话者模式: ${data.mode === 'single_user' ? '单人模式' : '多人模式'}`);
+            }
+        } catch (error) {
+            console.warn('无法加载说话者模式:', error);
+            this.logMessage('无法加载说话者模式，使用默认值: 单人模式', 'warn');
+        }
+    }
+
+    async setSpeakerMode(mode) {
+        if (this.speakerMode === mode) {
+            return;  // 已经是该模式，无需切换
+        }
+
+        try {
+            this.logMessage(`正在切换说话者模式到: ${mode === 'single_user' ? '单人模式' : '多人模式'}...`);
+            
+            const response = await fetch(`${this.serviceUrl}/config/speaker-mode`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ mode: mode })
+            });
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(`HTTP ${response.status}: ${errorText}`);
+            }
+
+            const data = await response.json();
+            if (data.success) {
+                this.speakerMode = data.current_mode;
+                this.updateModeUI();
+                this.logMessage(data.message);
+            } else {
+                this.logMessage(`切换失败: ${data.message}`, 'error');
+            }
+        } catch (error) {
+            console.error('切换说话者模式失败:', error);
+            this.logMessage(`切换说话者模式失败: ${error.message}`, 'error');
+        }
+    }
+
+    updateModeUI() {
+        const btnSingle = document.getElementById('btnModeSingle');
+        const btnMulti = document.getElementById('btnModeMulti');
+        const modeStatus = document.getElementById('modeStatus');
+
+        if (this.speakerMode === 'single_user') {
+            btnSingle.classList.add('active');
+            btnMulti.classList.remove('active');
+            modeStatus.textContent = '当前: 单人模式';
+        } else {
+            btnSingle.classList.remove('active');
+            btnMulti.classList.add('active');
+            modeStatus.textContent = '当前: 多人模式';
         }
     }
 }

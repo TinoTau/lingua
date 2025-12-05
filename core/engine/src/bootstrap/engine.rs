@@ -1662,14 +1662,57 @@ impl CoreEngine {
         //    如果缓存中没有，服务端会使用默认音色（不阻塞合成）
         // 2. 如果没有 speaker_id 但有 reference_audio，使用 reference_audio
         // 3. 如果都没有，使用 speaker 参数（预定义音色）
-        let use_speaker_id = translation.speaker_id.is_some();
+        // 
+        // 多人模式特殊处理：
+        // - 多人模式下，speaker_id 是 default_male/default_female/default_speaker
+        // - 这些 speaker_id 不应该传递给 YourTTS（因为 YourTTS 会查找缓存的 reference_audio）
+        // - 应该使用 speaker 参数（从 voice 字段映射），让 YourTTS 使用预定义的音色
+        let is_multi_user_mode = translation.speaker_id.as_ref()
+            .map(|s| s.starts_with("default_"))
+            .unwrap_or(false);
+        
+        let use_speaker_id = translation.speaker_id.is_some() && !is_multi_user_mode;
         let has_reference_audio = reference_audio.is_some();
+        
+        // 在多人模式下，从 voice 字段获取 speaker 参数
+        // 如果使用 YourTTS，需要使用 YourTTS 的预定义 speaker 名称（如 "male-en-5", "female-en-5"）
+        // 而不是从 speaker_voice_mapper 获取的 voice（那是给 Piper TTS 用的）
+        let is_yourtts = self.tts_service_url.as_ref()
+            .map(|url| url.contains("5004") || url.contains("yourtts"))
+            .unwrap_or(false);
+        
+        let speaker_for_request = if is_multi_user_mode {
+            if is_yourtts {
+                // 多人模式 + YourTTS：使用 YourTTS 的预定义 speaker
+                Some(Self::get_yourtts_speaker_by_gender(estimated_gender.as_ref()))
+            } else {
+                // 多人模式 + Piper TTS：使用从 voice 字段映射的 speaker
+                if !voice.is_empty() {
+                    Some(voice.clone())
+                } else {
+                    // 如果 voice 为空，根据性别选择默认音色
+                    Some(Self::get_default_voice_by_gender(estimated_gender.as_ref()))
+                }
+            }
+        } else if !use_speaker_id && !has_reference_audio {
+            if is_yourtts {
+                Some(Self::get_yourtts_speaker_by_gender(estimated_gender.as_ref()))
+            } else {
+                Some(Self::get_default_speaker_by_gender(estimated_gender.as_ref()))
+            }
+        } else {
+            None
+        };
         
         let tts_request = TtsRequest {
             text: processed_text,
-            voice,
+            voice: voice.clone(),  // 克隆 voice，因为后面可能还需要使用
             locale: target_language.clone(),
-            speaker_id: translation.speaker_id.clone(),  // 总是传递 speaker_id（如果存在）
+            speaker_id: if is_multi_user_mode {
+                None  // 多人模式下不传递 speaker_id，使用 speaker 参数
+            } else {
+                translation.speaker_id.clone()  // 单人模式下传递 speaker_id
+            },
             reference_audio: if !use_speaker_id {
                 reference_audio  // 只有在没有 speaker_id 时才传递 reference_audio
             } else {
@@ -1680,12 +1723,7 @@ impl CoreEngine {
             } else {
                 None
             },
-            speaker: if !use_speaker_id && !has_reference_audio {
-                // 如果没有 speaker_id 和 reference_audio，根据性别选择默认音色
-                Some(Self::get_default_speaker_by_gender(estimated_gender.as_ref()))
-            } else {
-                None
-            },
+            speaker: speaker_for_request,
             speech_rate,
         };
         
@@ -1717,7 +1755,36 @@ impl CoreEngine {
             eprintln!("[TTS] ⚠️  Using non-YourTTS service (Piper or other), reference audio will NOT be used!");
         }
         
-        let tts_chunk = self.tts.synthesize(tts_request).await?;
+        // 尝试使用主 TTS 服务，如果失败且是语言不支持的错误，使用 fallback TTS
+        let tts_chunk = match self.tts.synthesize(tts_request.clone()).await {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                // 检查是否是语言不支持的错误（YourTTS 不支持中文）
+                let error_msg = e.to_string().to_lowercase();
+                let is_language_error = error_msg.contains("does not support chinese") ||
+                                        error_msg.contains("language") || 
+                                        error_msg.contains("not in the available languages") ||
+                                        error_msg.contains("不支持") ||
+                                        error_msg.contains("dict_keys") ||
+                                        error_msg.contains("dimension out of range");
+                
+                if is_language_error && self.fallback_tts.is_some() {
+                    eprintln!("[TTS] ⚠️  TTS failed due to unsupported language, trying fallback TTS...");
+                    if let Some(ref fallback_tts) = self.fallback_tts {
+                        let mut fallback_request = tts_request.clone();
+                        fallback_request.reference_audio = None;  // Piper 不支持 reference_audio
+                        fallback_request.speaker_id = None;  // Piper 不支持 speaker_id
+                        fallback_request.voice_embedding = None;  // Piper 不支持 voice_embedding
+                        eprintln!("[TTS] ⚡ Fallback: Using Piper TTS with speech_rate={:?}", fallback_request.speech_rate);
+                        fallback_tts.synthesize(fallback_request).await?
+                    } else {
+                        return Err(e);
+                    }
+                } else {
+                    return Err(e);
+                }
+            }
+        };
         let tts_synth_ms = tts_synth_start.elapsed().as_millis() as u64;
         eprintln!("[TTS] TTS service call completed in {}ms", tts_synth_ms);
         
@@ -1932,30 +1999,67 @@ impl CoreEngine {
                 });
             
             // 构造 TTS 请求
-            // 优先使用 speaker_id（如果已注册），否则使用 reference_audio
-            let use_speaker_id = translation.speaker_id.is_some();
+            // 多人模式特殊处理：
+            // - 多人模式下，speaker_id 是 default_male/default_female/default_speaker
+            // - 这些 speaker_id 不应该传递给 YourTTS（因为 YourTTS 会查找缓存的 reference_audio）
+            // - 应该使用 speaker 参数（从 voice 字段映射），让 YourTTS 使用预定义的音色
+            let is_multi_user_mode = translation.speaker_id.as_ref()
+                .map(|s| s.starts_with("default_"))
+                .unwrap_or(false);
+            
+            let use_speaker_id = translation.speaker_id.is_some() && !is_multi_user_mode;
+            let has_reference_audio = reference_audio.is_some();
+            
+            // 在多人模式下，从 voice 字段获取 speaker 参数
+            // 如果使用 YourTTS，需要使用 YourTTS 的预定义 speaker 名称（如 "male-en-5", "female-en-5"）
+            // 而不是从 speaker_voice_mapper 获取的 voice（那是给 Piper TTS 用的）
+            let is_yourtts = self.tts_service_url.as_ref()
+                .map(|url| url.contains("5004") || url.contains("yourtts"))
+                .unwrap_or(false);
+            
+            let speaker_for_request = if is_multi_user_mode {
+                if is_yourtts {
+                    // 多人模式 + YourTTS：使用 YourTTS 的预定义 speaker
+                    Some(Self::get_yourtts_speaker_by_gender(estimated_gender.as_ref()))
+                } else {
+                    // 多人模式 + Piper TTS：使用从 voice 字段映射的 speaker
+                    if !common_voice.is_empty() {
+                        Some(common_voice.clone())
+                    } else {
+                        // 如果 voice 为空，根据性别选择默认音色
+                        Some(Self::get_default_voice_by_gender(estimated_gender.as_ref()))
+                    }
+                }
+            } else if !use_speaker_id && !has_reference_audio {
+                if is_yourtts {
+                    Some(Self::get_yourtts_speaker_by_gender(estimated_gender.as_ref()))
+                } else {
+                    Some(Self::get_default_speaker_by_gender(estimated_gender.as_ref()))
+                }
+            } else {
+                None
+            };
             
             let tts_request = TtsRequest {
                 text: processed_text.clone(),
                 voice: common_voice.clone(),
                 locale: target_language.clone(),
-                speaker_id: translation.speaker_id.clone(),  // 总是传递 speaker_id（如果存在）
+                speaker_id: if is_multi_user_mode {
+                    None  // 多人模式下不传递 speaker_id，使用 speaker 参数
+                } else {
+                    translation.speaker_id.clone()  // 单人模式下传递 speaker_id
+                },
                 reference_audio: if !use_speaker_id {
-                    use_reference_audio.clone()  // 只有在没有 speaker_id 时才传递 reference_audio
+                    reference_audio.clone()  // 只有在没有 speaker_id 时才传递 reference_audio
                 } else {
                     None  // 如果有 speaker_id，不传递 reference_audio（使用缓存的）
                 },
-                voice_embedding: if !use_speaker_id {
+                voice_embedding: if !use_speaker_id && has_reference_audio {
                     use_voice_embedding.clone()  // 只有在使用 reference_audio 时才传递 voice_embedding
                 } else {
                     None
                 },
-                speaker: if !use_speaker_id && use_reference_audio.is_none() {
-                    // 如果没有 speaker_id 和 reference_audio，根据性别选择默认音色
-                    Some(Self::get_default_speaker_by_gender(estimated_gender.as_ref()))
-                } else {
-                    None
-                },
+                speaker: speaker_for_request,
                 speech_rate,
             };
             
@@ -1979,12 +2083,14 @@ impl CoreEngine {
                 let mut chunk = match tts_clone.synthesize(tts_request.clone()).await {
                     Ok(chunk) => chunk,
                     Err(e) => {
-                        // 检查是否是语言不支持的错误
+                        // 检查是否是语言不支持的错误（YourTTS 不支持中文）
                         let error_msg = e.to_string().to_lowercase();
-                        let is_language_error = error_msg.contains("language") || 
+                        let is_language_error = error_msg.contains("does not support chinese") ||
+                                                error_msg.contains("language") || 
                                                 error_msg.contains("not in the available languages") ||
                                                 error_msg.contains("不支持") ||
-                                                error_msg.contains("dict_keys");
+                                                error_msg.contains("dict_keys") ||
+                                                error_msg.contains("dimension out of range");
                         
                         if is_language_error {
                             eprintln!("[TTS] ⚠️  Segment {:2} failed due to unsupported language, trying fallback TTS...", idx + 1);
@@ -1993,6 +2099,8 @@ impl CoreEngine {
                             if let Some(ref fallback) = fallback_tts_clone {
                                 let mut fallback_request = tts_request.clone();
                                 fallback_request.reference_audio = None;  // Piper 不支持 reference_audio
+                                fallback_request.speaker_id = None;  // Piper 不支持 speaker_id
+                                fallback_request.voice_embedding = None;  // Piper 不支持 voice_embedding
                                 // 语速信息已保留在 tts_request 中，会传递给 Piper
                                 
                                 eprintln!("[TTS] ⚡ Fallback: Using Piper TTS with speech_rate={:?}", fallback_request.speech_rate);

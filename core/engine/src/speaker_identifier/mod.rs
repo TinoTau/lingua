@@ -41,6 +41,15 @@ pub struct SpeakerIdentificationResult {
     pub estimated_gender: Option<String>,
 }
 
+/// 基于 Embedding 的识别模式
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum EmbeddingBasedMode {
+    /// 单人模式：所有语音视为同一用户，合并不足7秒的音频到10秒左右，持续优化音色
+    SingleUser,
+    /// 多人模式：仅区分男女，使用默认的男声或女声
+    MultiUser,
+}
+
 /// 说话者识别器配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SpeakerIdentifierMode {
@@ -62,6 +71,10 @@ pub enum SpeakerIdentifierMode {
         service_url: Option<String>,
         /// 相似度阈值（0.0-1.0），超过此值认为是同一说话者
         similarity_threshold: f32,
+        /// 识别模式：单人模式或多人模式
+        /// - 单人模式：所有语音视为同一用户，合并不足7秒的音频到10秒左右，持续优化音色
+        /// - 多人模式：仅区分男女，使用默认的男声或女声
+        mode: EmbeddingBasedMode,
     },
 }
 

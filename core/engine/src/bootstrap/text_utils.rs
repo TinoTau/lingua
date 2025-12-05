@@ -362,5 +362,37 @@ impl super::core::CoreEngine {
             }
         }
     }
+    
+    /// 根据估计的性别获取 YourTTS 的预定义 speaker 名称
+    /// 
+    /// # Arguments
+    /// * `estimated_gender` - 估计的性别（"male"、"female" 或 "unknown"）
+    /// 
+    /// # Returns
+    /// 返回 YourTTS 的预定义 speaker 名称（"male-en-5"、"female-en-5" 或 "female-en-5" 作为默认）
+    pub(crate) fn get_yourtts_speaker_by_gender(estimated_gender: Option<&String>) -> String {
+        match estimated_gender {
+            Some(gender) => {
+                match gender.to_lowercase().as_str() {
+                    "male" | "m" => {
+                        eprintln!("[TTS] 🎤 Using YourTTS male speaker: 'male-en-5' (estimated gender: {})", gender);
+                        "male-en-5".to_string()
+                    }
+                    "female" | "f" => {
+                        eprintln!("[TTS] 🎤 Using YourTTS female speaker: 'female-en-5' (estimated gender: {})", gender);
+                        "female-en-5".to_string()
+                    }
+                    _ => {
+                        eprintln!("[TTS] 🎤 Using YourTTS default speaker: 'female-en-5' (estimated gender: {})", gender);
+                        "female-en-5".to_string()  // 未知性别使用女性作为默认
+                    }
+                }
+            }
+            None => {
+                eprintln!("[TTS] 🎤 Using YourTTS default speaker: 'female-en-5' (no gender information)");
+                "female-en-5".to_string()  // 没有性别信息，使用女性作为默认
+            }
+        }
+    }
 }
 

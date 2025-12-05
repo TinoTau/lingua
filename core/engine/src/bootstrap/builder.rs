@@ -579,16 +579,26 @@ impl CoreEngineBuilder {
                     max_same_speaker_interval_ms,
                 ))
             }
-            SpeakerIdentifierMode::EmbeddingBased { service_url, similarity_threshold } => {
+            SpeakerIdentifierMode::EmbeddingBased { service_url, similarity_threshold, mode } => {
                 Arc::new(EmbeddingBasedSpeakerIdentifier::new(
                     service_url,
                     similarity_threshold,
+                    mode,
                 )?)
             }
         };
         
         self.speaker_identifier = Some(identifier);
         Ok(self)
+    }
+    
+    /// 直接设置已创建的说话者识别器（用于动态切换模式）
+    pub fn with_speaker_identifier_custom(
+        mut self,
+        identifier: Arc<dyn SpeakerIdentifier>,
+    ) -> Self {
+        self.speaker_identifier = Some(identifier);
+        self
     }
 
     pub fn build(self) -> EngineResult<CoreEngine> {

@@ -26,7 +26,7 @@ use core_engine::event_bus::{EventBus, CoreEvent, EventTopic, EventSubscription,
 use core_engine::vad::{VoiceActivityDetector, DetectionOutcome, SileroVad};
 use core_engine::cache_manager::CacheManager;
 use core_engine::telemetry::{TelemetrySink, TelemetryDatum};
-use core_engine::speaker_identifier::SpeakerIdentifierMode;
+use core_engine::speaker_identifier::{SpeakerIdentifierMode, EmbeddingBasedMode, EmbeddingBasedSpeakerIdentifier};
 use core_engine::tts_streaming::YourTtsHttpConfig;
 use async_trait::async_trait;
 
@@ -113,6 +113,8 @@ struct AppState {
     config: RuntimeConfig,
     simple_config: Arc<SimpleConfig>,  // 用于动态更新语言配置
     event_bus: Arc<ChannelEventBus>,  // 事件总线（用于 WebSocket 订阅）
+    speaker_mode: Arc<RwLock<EmbeddingBasedMode>>,  // 当前说话者识别模式
+    speaker_identifier: Option<Arc<EmbeddingBasedSpeakerIdentifier>>,  // 说话者识别器引用（用于动态切换模式）
 }
 
 // 简单的默认实现
@@ -256,8 +258,8 @@ async fn main() -> anyhow::Result<()> {
     event_bus.start().await
         .map_err(|e| anyhow::anyhow!("Failed to start event bus: {}", e))?;
     
-    // 5. 初始化 CoreEngine
-    let engine = initialize_engine(&runtime_config, simple_config.clone(), event_bus.clone()).await?;
+    // 5. 初始化 CoreEngine 和 Speaker Identifier
+    let (engine, speaker_identifier) = initialize_engine(&runtime_config, simple_config.clone(), event_bus.clone()).await?;
     eprintln!("[INFO] CoreEngine initialized successfully");
 
     // 6. 启动 HTTP 服务器
@@ -266,12 +268,16 @@ async fn main() -> anyhow::Result<()> {
         config: runtime_config.clone(),
         simple_config: simple_config.clone(),
         event_bus: event_bus.clone(),
+        speaker_mode: Arc::new(RwLock::new(EmbeddingBasedMode::SingleUser)),  // 默认单人模式
+        speaker_identifier,  // 说话者识别器引用（用于动态切换模式）
     };
 
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/s2s", post(s2s_handler))
         .route("/stream", get(stream_handler))
+        .route("/config/speaker-mode", get(get_speaker_mode))
+        .route("/config/speaker-mode", post(set_speaker_mode))
         .layer(CorsLayer::permissive())
         .with_state(app_state);
 
@@ -285,11 +291,12 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// 初始化 CoreEngine
+/// 返回 (CoreEngine, Option<Arc<EmbeddingBasedSpeakerIdentifier>>)
 async fn initialize_engine(
     config: &RuntimeConfig, 
     simple_config: Arc<SimpleConfig>,
     event_bus: Arc<ChannelEventBus>,
-) -> EngineResult<CoreEngine> {
+) -> EngineResult<(CoreEngine, Option<Arc<EmbeddingBasedSpeakerIdentifier>>)> {
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     
     // 1. 初始化 SileroVad
@@ -364,18 +371,25 @@ async fn initialize_engine(
     }
 
     // 5. 初始化说话者识别（如果配置了 Speaker Embedding 服务）
-    if let Some(ref speaker_config) = config.speaker_embedding {
+    // 创建 identifier 并保存引用，然后让 builder 使用同一个实例
+    let speaker_identifier_ref: Option<Arc<EmbeddingBasedSpeakerIdentifier>> = if let Some(ref speaker_config) = config.speaker_embedding {
         eprintln!("[INFO] Initializing Speaker Identification: {}", speaker_config.url);
-        builder = builder.with_speaker_identification(
-            SpeakerIdentifierMode::EmbeddingBased {
-                service_url: Some(speaker_config.url.clone()),
-                similarity_threshold: 0.6,  // 提高阈值：0.6 表示 60% 相似度才认为是同一说话者（0.3 太低导致同一说话者被识别为多个）
-            }
-        )
-        .map_err(|e| core_engine::error::EngineError::new(format!("Failed to initialize Speaker Identification: {}", e)))?;
+        // 创建 identifier 并保存引用
+        let identifier = EmbeddingBasedSpeakerIdentifier::new(
+            Some(speaker_config.url.clone()),
+            0.4,
+            core_engine::speaker_identifier::EmbeddingBasedMode::SingleUser,
+        )?;
+        let identifier_arc = Arc::new(identifier);
+        // 将 identifier 转换为 trait 对象用于 builder
+        let identifier_for_builder: Arc<dyn core_engine::speaker_identifier::SpeakerIdentifier> = identifier_arc.clone();
+        // 直接设置到 builder，使用同一个实例（这样模式切换才能生效）
+        builder = builder.with_speaker_identifier_custom(identifier_for_builder);
+        Some(identifier_arc)
     } else {
         eprintln!("[WARN] Speaker Embedding config not found, speaker identification disabled");
-    }
+        None
+    };
 
     // 6. 构建 CoreEngine
     let engine = builder
@@ -395,7 +409,10 @@ async fn initialize_engine(
     engine.boot().await
         .map_err(|e| core_engine::error::EngineError::new(format!("Failed to boot engine: {}", e)))?;
 
-    Ok(engine)
+    // 从 engine 中获取 speaker_identifier（如果是 EmbeddingBasedSpeakerIdentifier）
+    // 由于无法从 trait 对象直接获取具体类型，我们需要在创建时就保存引用
+    // 这里我们使用之前创建的 identifier_arc（如果存在）
+    Ok((engine, speaker_identifier_ref))
 }
 
 /// 健康检查端点
@@ -837,4 +854,84 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     }
     eprintln!("[WebSocket] 👋 Connection closed (total frames: {})", frame_count);
+}
+
+/// 获取当前说话者识别模式
+#[derive(Debug, Serialize)]
+struct SpeakerModeResponse {
+    mode: String,  // "single_user" 或 "multi_user"
+}
+
+/// 设置说话者识别模式请求
+#[derive(Debug, Deserialize)]
+struct SetSpeakerModeRequest {
+    mode: String,  // "single_user" 或 "multi_user"
+}
+
+/// 设置说话者识别模式响应
+#[derive(Debug, Serialize)]
+struct SetSpeakerModeResponse {
+    success: bool,
+    message: String,
+    current_mode: String,
+}
+
+/// 获取当前说话者识别模式
+async fn get_speaker_mode(State(state): State<AppState>) -> Json<SpeakerModeResponse> {
+    let mode = state.speaker_mode.read().await;
+    let mode_str = match *mode {
+        EmbeddingBasedMode::SingleUser => "single_user",
+        EmbeddingBasedMode::MultiUser => "multi_user",
+    };
+    Json(SpeakerModeResponse {
+        mode: mode_str.to_string(),
+    })
+}
+
+/// 设置说话者识别模式
+async fn set_speaker_mode(
+    State(state): State<AppState>,
+    Json(request): Json<SetSpeakerModeRequest>,
+) -> Result<Json<SetSpeakerModeResponse>, StatusCode> {
+    let new_mode = match request.mode.as_str() {
+        "single_user" => EmbeddingBasedMode::SingleUser,
+        "multi_user" => EmbeddingBasedMode::MultiUser,
+        _ => {
+            return Ok(Json(SetSpeakerModeResponse {
+                success: false,
+                message: format!("无效的模式: {}. 有效值: single_user, multi_user", request.mode),
+                current_mode: {
+                    let current = state.speaker_mode.read().await;
+                    match *current {
+                        EmbeddingBasedMode::SingleUser => "single_user".to_string(),
+                        EmbeddingBasedMode::MultiUser => "multi_user".to_string(),
+                    }
+                },
+            }));
+        }
+    };
+    
+    {
+        let mut mode = state.speaker_mode.write().await;
+        *mode = new_mode;
+    }
+    
+    let mode_str = match new_mode {
+        EmbeddingBasedMode::SingleUser => "single_user",
+        EmbeddingBasedMode::MultiUser => "multi_user",
+    };
+    
+    // 如果存在 speaker_identifier，直接调用其 set_mode 方法（动态切换，数据保留）
+    if let Some(ref identifier) = state.speaker_identifier {
+        identifier.set_mode(new_mode).await;
+        eprintln!("[CONFIG] 说话者识别模式已动态更新为: {} (数据已保留，不会清空另一种模式的记录)", mode_str);
+    } else {
+        eprintln!("[CONFIG] 说话者识别模式已更新为: {} (但未找到 identifier，可能需要重启引擎)", mode_str);
+    }
+    
+    Ok(Json(SetSpeakerModeResponse {
+        success: true,
+        message: format!("模式已更新为: {}. 数据已保留，切换模式不会清空另一种模式的记录", mode_str),
+        current_mode: mode_str.to_string(),
+    }))
 }

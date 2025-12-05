@@ -115,6 +115,34 @@
             cursor: not-allowed;
         }
 
+        .btn-mode {
+            padding: 8px 16px;
+            border: 2px solid #e0e0e0;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            background: white;
+            color: #555;
+            transition: all 0.3s;
+        }
+
+        .btn-mode:hover:not(:disabled) {
+            border-color: #667eea;
+            color: #667eea;
+        }
+
+        .btn-mode.active {
+            background: #667eea;
+            color: white;
+            border-color: #667eea;
+        }
+
+        .btn-mode:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
         .status {
             text-align: center;
             padding: 15px;
@@ -237,6 +265,14 @@
                     <option value="ja">日本語</option>
                     <option value="ko">한국어</option>
                 </select>
+            </div>
+            <div class="config-row">
+                <label>说话者模式:</label>
+                <div style="display: flex; align-items: center; gap: 10px; flex: 1;">
+                    <button id="btnModeSingle" class="btn-mode active" data-mode="single_user">单人模式</button>
+                    <button id="btnModeMulti" class="btn-mode" data-mode="multi_user">多人模式</button>
+                    <span id="modeStatus" style="font-size: 12px; color: #666; margin-left: auto;">当前: 单人模式</span>
+                </div>
             </div>
         </div>
 

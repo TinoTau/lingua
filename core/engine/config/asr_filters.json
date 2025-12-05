@@ -5,7 +5,14 @@
     "filter_empty": true,
     "filter_brackets": true,
     "single_char_fillers": [
-      "嗯", "啊", "呃", "额", "哦", "噢", "诶", "欸"
+      "嗯",
+      "啊",
+      "呃",
+      "额",
+      "哦",
+      "噢",
+      "诶",
+      "欸"
     ],
     "exact_matches": [
       "謝謝大家收看",
@@ -30,7 +37,8 @@
       "打赏支持明镜与点点栏目",
       "打賞支持明鏡與點點欄目",
       "中文字幕志愿者 杨栋梁",
-      "中文字幕志願者 楊棟樑"
+      "中文字幕志願者 楊棟樑",
+      "本期视频就分享到这里,感谢观看,下次见!"
     ],
     "contains_patterns": [
       "謝謝大家收看",
@@ -52,15 +60,26 @@
     ],
     "all_contains_patterns": [
       {
-        "patterns": ["点赞", "转发", "打赏"],
+        "patterns": [
+          "点赞",
+          "转发",
+          "打赏"
+        ],
         "description": "视频推广文本组合"
       },
       {
-        "patterns": ["點讚", "轉發", "打賞"],
+        "patterns": [
+          "點讚",
+          "轉發",
+          "打賞"
+        ],
         "description": "视频推广文本组合（繁体）"
       },
       {
-        "patterns": ["字幕", "j chong"],
+        "patterns": [
+          "字幕",
+          "j chong"
+        ],
         "description": "字幕制作者信息"
       }
     ],
@@ -112,4 +131,3 @@
     "subtitle_volunteer_min_length": 8
   }
 }
-
